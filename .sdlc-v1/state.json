@@ -1,0 +1,55 @@
+{
+  "features": {
+    "F-001": {
+      "branch": "codex/design",
+      "created_at": "2026-10-19T14:45:03Z",
+      "engineering_context_ref": ".sdlc-v1/context/F-001.engineering.md",
+      "id": "F-001",
+      "release": {
+        "at": null,
+        "commit": null,
+        "status": "pending"
+      },
+      "requirement_id": "REQ-001",
+      "review": {
+        "at": null,
+        "by": null,
+        "decision": "pending"
+      },
+      "status": "in_progress",
+      "tasks": {
+        "T-001": {
+          "depends_on": [],
+          "id": "T-001",
+          "status": "done",
+          "title": "实现可运行 SELC 与简单双宿主套件闭环",
+          "updated_at": "2026-10-19T18:36:52Z"
+        }
+      },
+      "updated_at": "2026-10-19T18:36:52Z",
+      "validation": {
+        "at": null,
+        "command": null,
+        "commit": null,
+        "result": "pending"
+      }
+    }
+  },
+  "requirements": {
+    "REQ-001": {
+      "created_at": "2026-10-17T12:07:28Z",
+      "depends_on": [],
+      "description": "",
+      "domain": "skill-lifecycle",
+      "feature_id": "F-001",
+      "id": "REQ-001",
+      "priority": "P1",
+      "product_context_ref": ".sdlc-v1/context/REQ-001.product.md",
+      "status": "in_delivery",
+      "title": "Skill Evolving Life Cycle 的创建、观测与迭代方案",
+      "updated_at": "2026-10-19T18:36:52Z"
+    }
+  },
+  "state_format": "sdlc-lightweight-state-v1",
+  "state_version": 3
+}
