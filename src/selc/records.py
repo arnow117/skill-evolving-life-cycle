@@ -5,12 +5,16 @@ from __future__ import annotations
 import sqlite3
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
 from . import SCHEMA_VERSION
 from .errors import SelcError
 from .util import json_hash, read_json, write_json
+
+
+WRITER_PROTOCOL_VERSION = 2
 
 
 def utc_now() -> str:
@@ -27,10 +31,15 @@ def open_database(project_root: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     database = sqlite3.connect(path)
     database.row_factory = sqlite3.Row
+    _register_writer_protocol(database)
     database.execute("PRAGMA foreign_keys = ON")
     database.execute("PRAGMA busy_timeout = 250")
-    database.executescript(
-        """
+    try:
+        _reject_future_writer_protocol(database)
+        database.execute("BEGIN IMMEDIATE")
+        _execute_schema_script(
+            database,
+            """
         CREATE TABLE IF NOT EXISTS meta (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
@@ -158,37 +167,206 @@ def open_database(project_root: Path) -> sqlite3.Connection:
           created_at TEXT NOT NULL,
           PRIMARY KEY(origin_id, subject_kind, subject_id)
         );
-        """
-    )
-    _ensure_column(database, "calls", "actual_harness", "TEXT NOT NULL DEFAULT 'unknown'")
-    _ensure_column(database, "calls", "declared_result", "TEXT")
-    _ensure_column(database, "deliveries", "call_id", "TEXT")
-    _ensure_column(database, "deliveries", "checker_id", "TEXT")
-    _ensure_column(database, "deliveries", "checker_verified", "INTEGER NOT NULL DEFAULT 0")
-    _ensure_column(database, "deliveries", "checker_result", "TEXT")
-    _ensure_column(database, "deliveries", "checker_input_hash", "TEXT")
-    _ensure_column(database, "deliveries", "checker_artifact_hash", "TEXT")
-    _ensure_column(database, "deliveries", "checker_resource_hash", "TEXT")
-    _ensure_column(database, "deliveries", "checker_composite_hash", "TEXT")
-    _ensure_column(database, "deliveries", "checker_identity_version", "INTEGER NOT NULL DEFAULT 0")
-    _ensure_column(database, "deliveries", "sequence", "INTEGER NOT NULL DEFAULT 0")
-    _ensure_column(database, "feedback", "delivery_id", "TEXT")
-    _ensure_column(database, "imported_samples", "started_at", "TEXT NOT NULL DEFAULT ''")
-    _ensure_column(database, "imported_samples", "initiator", "TEXT")
-    _ensure_column(database, "imported_samples", "skill", "TEXT")
-    _ensure_column(database, "imported_samples", "executor", "TEXT")
-    _ensure_column(database, "imported_samples", "evidence", "TEXT")
-    _ensure_column(database, "imported_samples", "trigger_kind", "TEXT")
-    _ensure_column(database, "imported_samples", "expected_hash", "TEXT")
-    _backfill_delivery_sequences(database)
-    _migrate_feedback_revisions(database)
-    if database.execute("SELECT 1 FROM meta WHERE key = 'origin_id'").fetchone() is None:
-        database.execute(
-            "INSERT INTO meta(key, value) VALUES('origin_id', ?)", (str(uuid.uuid4()),)
+            """
         )
-        database.execute("INSERT INTO meta(key, value) VALUES('snapshot_revision', '0')")
-    database.commit()
+        _ensure_column(database, "calls", "actual_harness", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(database, "calls", "declared_result", "TEXT")
+        _ensure_column(database, "deliveries", "call_id", "TEXT")
+        _ensure_column(database, "deliveries", "checker_id", "TEXT")
+        _ensure_column(database, "deliveries", "checker_verified", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(database, "deliveries", "checker_result", "TEXT")
+        _ensure_column(database, "deliveries", "checker_input_hash", "TEXT")
+        _ensure_column(database, "deliveries", "checker_artifact_hash", "TEXT")
+        _ensure_column(database, "deliveries", "checker_resource_hash", "TEXT")
+        _ensure_column(database, "deliveries", "checker_composite_hash", "TEXT")
+        _ensure_column(database, "deliveries", "checker_identity_version", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(database, "deliveries", "sequence", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(database, "feedback", "delivery_id", "TEXT")
+        _ensure_column(database, "imported_samples", "started_at", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(database, "imported_samples", "initiator", "TEXT")
+        _ensure_column(database, "imported_samples", "skill", "TEXT")
+        _ensure_column(database, "imported_samples", "executor", "TEXT")
+        _ensure_column(database, "imported_samples", "evidence", "TEXT")
+        _ensure_column(database, "imported_samples", "trigger_kind", "TEXT")
+        _ensure_column(database, "imported_samples", "expected_hash", "TEXT")
+        _backfill_delivery_sequences(database)
+        _migrate_feedback_revisions(database)
+        if database.execute("SELECT 1 FROM meta WHERE key = 'origin_id'").fetchone() is None:
+            database.execute(
+                "INSERT INTO meta(key, value) VALUES('origin_id', ?)", (str(uuid.uuid4()),)
+            )
+            database.execute("INSERT INTO meta(key, value) VALUES('snapshot_revision', '0')")
+        _create_observation_tables(database)
+        database.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('writer_protocol', ?)",
+            (str(WRITER_PROTOCOL_VERSION),),
+        )
+        _install_writer_protocol_triggers(database)
+        database.commit()
+    except Exception:
+        database.rollback()
+        database.close()
+        raise
     return database
+
+
+def _register_writer_protocol(database: sqlite3.Connection) -> None:
+    """Mark a connection as a current records writer for guarded triggers."""
+
+    database.create_function("selc_writer_protocol", 0, lambda: WRITER_PROTOCOL_VERSION)
+
+
+def _reject_future_writer_protocol(database: sqlite3.Connection) -> None:
+    meta_exists = database.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+    ).fetchone()
+    if meta_exists is None:
+        return
+    row = database.execute("SELECT value FROM meta WHERE key = 'writer_protocol'").fetchone()
+    if row is None:
+        return
+    try:
+        protocol = int(row["value"])
+    except (TypeError, ValueError) as error:
+        raise SelcError(
+            "UNSUPPORTED_DATABASE_PROTOCOL",
+            "database writer protocol is invalid",
+            "restore a supported records database or update SELC",
+        ) from error
+    if protocol > WRITER_PROTOCOL_VERSION:
+        raise SelcError(
+            "UNSUPPORTED_DATABASE_PROTOCOL",
+            "database was written by a newer SELC runtime",
+            "update SELC before opening this records database",
+        )
+
+
+def _execute_schema_script(database: sqlite3.Connection, script: str) -> None:
+    """Execute schema DDL inside the caller's transaction.
+
+    ``sqlite3.Connection.executescript`` commits a pending transaction first.  A
+    migration needs the opposite property, so this deliberately executes each
+    complete statement through ``execute``.
+    """
+
+    for statement in script.split(";\n"):
+        if statement.strip():
+            database.execute(statement)
+
+
+def _create_observation_tables(database: sqlite3.Connection) -> None:
+    statements = (
+        """CREATE TABLE IF NOT EXISTS observation_events (
+            event_id TEXT PRIMARY KEY,
+            stable_identity TEXT,
+            event_digest TEXT NOT NULL,
+            protocol INTEGER NOT NULL,
+            adapter_name TEXT NOT NULL,
+            adapter_version TEXT NOT NULL,
+            installation_id TEXT NOT NULL,
+            host TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            session_id TEXT,
+            turn_id TEXT,
+            native_event_id TEXT,
+            phase TEXT NOT NULL,
+            source_context TEXT NOT NULL,
+            source_epoch INTEGER NOT NULL,
+            suite_id TEXT,
+            task_id TEXT,
+            kind TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            classification_version TEXT NOT NULL,
+            facts_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason TEXT,
+            applied_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_conflicts (
+            conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stable_identity TEXT NOT NULL,
+            original_event_id TEXT NOT NULL,
+            incoming_digest TEXT NOT NULL,
+            classification_version TEXT NOT NULL,
+            facts_json TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            reason TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_assessments (
+            task_id TEXT PRIMARY KEY,
+            first_result TEXT NOT NULL,
+            final_result TEXT NOT NULL,
+            assessment_version TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_call_assessments (
+            call_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            first_result TEXT NOT NULL,
+            final_result TEXT NOT NULL,
+            assessment_version TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_tombstones (
+            stable_identity TEXT PRIMARY KEY,
+            source_context TEXT NOT NULL,
+            source_epoch INTEGER NOT NULL,
+            suite_id TEXT,
+            task_id TEXT,
+            deleted_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_deletion_ranges (
+            deletion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            suite_id TEXT NOT NULL,
+            before_time TEXT,
+            delete_epoch INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_source_epochs (
+            source_context TEXT PRIMARY KEY,
+            invalid_before_epoch INTEGER NOT NULL,
+            deleted_at TEXT NOT NULL
+        )""",
+        "CREATE INDEX IF NOT EXISTS observation_events_status_idx ON observation_events(status, event_id)",
+        "CREATE INDEX IF NOT EXISTS observation_events_task_idx ON observation_events(task_id, status)",
+        "CREATE INDEX IF NOT EXISTS observation_events_identity_idx ON observation_events(stable_identity)",
+        """CREATE UNIQUE INDEX IF NOT EXISTS observation_events_stable_identity_unique
+        ON observation_events(stable_identity) WHERE stable_identity IS NOT NULL""",
+    )
+    for statement in statements:
+        database.execute(statement)
+
+
+def _install_writer_protocol_triggers(database: sqlite3.Connection) -> None:
+    protected_tables = (
+        "tasks",
+        "calls",
+        "deliveries",
+        "feedback",
+        "feedback_revisions",
+        "events",
+        "observation_events",
+        "observation_conflicts",
+        "observation_assessments",
+        "observation_call_assessments",
+        "observation_tombstones",
+        "observation_deletion_ranges",
+        "observation_source_epochs",
+    )
+    for table in protected_tables:
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            database.execute(
+                f"""CREATE TRIGGER IF NOT EXISTS writer_protocol_{table}_{operation.lower()}
+                BEFORE {operation} ON {table}
+                WHEN selc_writer_protocol() != {WRITER_PROTOCOL_VERSION}
+                BEGIN
+                    SELECT RAISE(ABORT, 'SELC_WRITER_PROTOCOL_REQUIRED');
+                END"""
+            )
 
 
 def _ensure_column(database: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -697,6 +875,337 @@ def close_task(database: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     return {"task_id": task_id, "replayed": False, "result": current, "first_result": first}
 
 
+@contextmanager
+def projection_transaction(database: sqlite3.Connection) -> Iterable[None]:
+    """Run reducer projections without public-method auto-commits.
+
+    Public record functions intentionally retain their single-operation commit
+    behavior.  The observation reducer uses this internal transaction boundary
+    so business projection and an event's consumed state commit together.
+    """
+
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except Exception:
+        database.rollback()
+        raise
+    else:
+        database.commit()
+
+
+def _project_start_task(
+    database: sqlite3.Connection,
+    *,
+    task_id: str,
+    suite_id: str,
+    suite_version: str,
+    harness: str,
+    initiator: str,
+    evidence: str,
+) -> bool:
+    current = database.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+    if current is not None:
+        expected = {
+            "suite_id": suite_id,
+            "suite_version": suite_version,
+            "harness": harness,
+            "initiator": initiator,
+            "evidence": evidence,
+            "is_test": 0,
+        }
+        if all(current[key] == value for key, value in expected.items()):
+            return True
+        raise SelcError(
+            "ID_CONFLICT",
+            f"task id already belongs to another task: {task_id}",
+            "preserve the original task and use a new business identity",
+        )
+    database.execute(
+        """INSERT INTO tasks(
+        task_id, suite_id, suite_version, harness, initiator, evidence, is_test,
+        status, created_at, owner_origin)
+        VALUES (?, ?, ?, ?, ?, ?, 0, 'active', ?, ?)""",
+        (
+            task_id,
+            suite_id,
+            suite_version,
+            harness,
+            initiator,
+            evidence,
+            utc_now(),
+            _origin_id(database),
+        ),
+    )
+    return False
+
+
+def _project_task_event(
+    database: sqlite3.Connection, *, task_id: str, kind: str, evidence: str
+) -> None:
+    allowed = {
+        "input_ready",
+        "permission_click",
+        "business_intervention",
+        "session_start",
+        "session_close",
+        "automatic_retry",
+        "interrupted",
+    }
+    if kind not in allowed:
+        raise SelcError("INVALID_EVENT", f"unsupported event: {kind}", "use a supported event")
+    task = _task(database, task_id)
+    database.execute(
+        "INSERT INTO events(task_id, kind, evidence, created_at) VALUES (?, ?, ?, ?)",
+        (task_id, kind, evidence, utc_now()),
+    )
+    if kind == "input_ready":
+        database.execute("UPDATE tasks SET input_ready = 1 WHERE task_id = ?", (task_id,))
+    elif kind == "business_intervention":
+        database.execute("UPDATE tasks SET business_intervention = 1 WHERE task_id = ?", (task_id,))
+    elif kind == "session_start":
+        if task["status"] != "active":
+            raise SelcError("TASK_CLOSED", "cannot start a session for a closed task", "start a task")
+        database.execute(
+            """INSERT OR REPLACE INTO sessions(session_id, suite_id, status, evidence, created_at)
+            VALUES (?, ?, 'active', ?, ?)""",
+            (f"session:{task_id}", task["suite_id"], evidence, utc_now()),
+        )
+    elif kind == "session_close":
+        database.execute(
+            "UPDATE sessions SET status = 'closed', closed_at = ? WHERE session_id = ?",
+            (utc_now(), f"session:{task_id}"),
+        )
+    _recompute_task_results(database, task_id)
+
+
+def _project_start_call(
+    database: sqlite3.Connection,
+    *,
+    call_id: str,
+    task_id: str,
+    skill: str,
+    executor: str,
+    evidence: str,
+    expected_version: str,
+    expected_hash: str | None,
+    trigger_kind: str,
+) -> bool:
+    actual_harness = executor if executor in {"codex", "workbuddy"} else "unknown"
+    task = _task(database, task_id)
+    current = database.execute("SELECT * FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+    if current is not None:
+        expected = {
+            "task_id": task_id,
+            "skill": skill,
+            "executor": executor,
+            "actual_harness": actual_harness,
+            "evidence": evidence,
+            "expected_version": expected_version,
+            "expected_hash": expected_hash,
+            "trigger_kind": trigger_kind,
+        }
+        if all(current[key] == value for key, value in expected.items()):
+            return True
+        raise SelcError(
+            "ID_CONFLICT",
+            f"call id already belongs to another call: {call_id}",
+            "preserve the original invocation and use a new native identity",
+        )
+    if task["status"] != "active":
+        raise SelcError("TASK_CLOSED", "cannot start a call for a closed task", "start a new task")
+    database.execute(
+        """INSERT INTO calls(
+        call_id, task_id, skill, executor, actual_harness, evidence, expected_version,
+        expected_hash, trigger_kind, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+        (
+            call_id,
+            task_id,
+            skill,
+            executor,
+            actual_harness,
+            evidence,
+            expected_version,
+            expected_hash,
+            trigger_kind,
+            utc_now(),
+        ),
+    )
+    return False
+
+
+def _project_complete_call(database: sqlite3.Connection, *, call_id: str, result: str) -> None:
+    _validate_result(result)
+    row = database.execute("SELECT * FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+    if row is None:
+        raise SelcError("MISSING_CALL", f"call does not exist: {call_id}", "start the call first")
+    if row["declared_result"] is not None and row["declared_result"] != result:
+        raise SelcError(
+            "ID_CONFLICT",
+            f"call already has result {row['declared_result']}",
+            "create a new retry call",
+        )
+    database.execute(
+        "UPDATE calls SET declared_result = ?, status = 'closed' WHERE call_id = ?",
+        (result, call_id),
+    )
+    _recompute_call_results(database, call_id)
+
+
+def _project_delivery(
+    database: sqlite3.Connection,
+    *,
+    delivery_id: str,
+    task_id: str,
+    call_id: str | None,
+    artifact_hash: str,
+    rule_version: str,
+    checker_id: str,
+    checker_result: str,
+    checker_identity: dict[str, str],
+    sequence: int,
+) -> bool:
+    _validate_result(checker_result)
+    _task(database, task_id)
+    if call_id is not None:
+        call = database.execute("SELECT task_id FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+        if call is None or call["task_id"] != task_id:
+            raise SelcError(
+                "INVALID_DELIVERY_LINK",
+                "delivery call must exist under the same task",
+                "start the invocation before recording delivery evidence",
+            )
+    expected = {
+        "task_id": task_id,
+        "call_id": call_id,
+        "artifact_hash": artifact_hash,
+        "rule_version": rule_version,
+        "checker_id": checker_id,
+        "checker_result": checker_result,
+        "checker_input_hash": checker_identity["checker_input_hash"],
+        "checker_artifact_hash": checker_identity["checker_artifact_hash"],
+        "checker_resource_hash": checker_identity["checker_resource_hash"],
+        "checker_composite_hash": checker_identity["checker_composite_hash"],
+        "sequence": sequence,
+    }
+    current = database.execute(
+        "SELECT * FROM deliveries WHERE delivery_id = ?", (delivery_id,)
+    ).fetchone()
+    if current is not None:
+        if all(current[key] == value for key, value in expected.items()):
+            return True
+        raise SelcError(
+            "ID_CONFLICT",
+            f"delivery id already exists: {delivery_id}",
+            "preserve the original publication and use a new identity",
+        )
+    ordinal_conflict = database.execute(
+        "SELECT delivery_id FROM deliveries WHERE task_id = ? AND sequence = ?",
+        (task_id, sequence),
+    ).fetchone()
+    if ordinal_conflict is not None:
+        raise SelcError(
+            "PUBLICATION_CONFLICT",
+            f"publication ordinal {sequence} already belongs to {ordinal_conflict['delivery_id']}",
+            "retain the recorded publication order",
+        )
+    database.execute(
+        """INSERT INTO deliveries(
+        delivery_id, task_id, call_id, artifact_hash, rule_version, checker_id,
+        checker_verified, checker_result, checker_input_hash, checker_artifact_hash,
+        checker_resource_hash, checker_composite_hash, declared_result, effective_result,
+        checker_identity_version, complete_fixture, sequence, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)""",
+        (
+            delivery_id,
+            task_id,
+            call_id,
+            artifact_hash,
+            rule_version,
+            checker_id,
+            checker_result,
+            checker_identity["checker_input_hash"],
+            checker_identity["checker_artifact_hash"],
+            checker_identity["checker_resource_hash"],
+            checker_identity["checker_composite_hash"],
+            checker_result,
+            checker_result,
+            sequence,
+            utc_now(),
+        ),
+    )
+    _recompute_task_results(database, task_id)
+    if call_id is not None:
+        _recompute_call_results(database, call_id)
+    return False
+
+
+def _project_feedback(
+    database: sqlite3.Connection,
+    *,
+    feedback_id: str,
+    task_id: str,
+    delivery_id: str,
+    revision: int,
+    scope: str,
+    result: str,
+    body_hash: str | None,
+) -> bool:
+    _validate_result(result)
+    if scope not in {"first", "final", "requirement_change"}:
+        raise SelcError("INVALID_INPUT", "feedback scope is invalid", "use a supported scope")
+    if revision < 1:
+        raise SelcError("INVALID_INPUT", "feedback revision must be positive", "start at 1")
+    _task(database, task_id)
+    delivery = database.execute(
+        "SELECT call_id FROM deliveries WHERE delivery_id = ? AND task_id = ?",
+        (delivery_id, task_id),
+    ).fetchone()
+    if delivery is None:
+        raise SelcError(
+            "INVALID_FEEDBACK_LINK",
+            "feedback must bind an existing delivery in the same task",
+            "record its publication before feedback",
+        )
+    existing = database.execute(
+        "SELECT * FROM feedback_revisions WHERE feedback_id = ? AND revision = ?",
+        (feedback_id, revision),
+    ).fetchone()
+    if existing is not None:
+        expected = (task_id, delivery_id, scope, result, body_hash)
+        actual = (
+            existing["task_id"],
+            existing["delivery_id"],
+            existing["scope"],
+            existing["result"],
+            existing["body_hash"],
+        )
+        if actual == expected:
+            return True
+        raise SelcError("ID_CONFLICT", "feedback revision has different evidence", "use a new id")
+    latest = database.execute(
+        "SELECT MAX(revision) FROM feedback_revisions WHERE feedback_id = ?", (feedback_id,)
+    ).fetchone()[0]
+    expected_revision = int(latest) + 1 if latest is not None else 1
+    if revision != expected_revision:
+        raise SelcError(
+            "REVISION_CONFLICT",
+            f"expected feedback revision {expected_revision}",
+            "retry with the next revision",
+        )
+    database.execute(
+        """INSERT INTO feedback_revisions(
+        feedback_id, task_id, delivery_id, revision, scope, result, body_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (feedback_id, task_id, delivery_id, revision, scope, result, body_hash, utc_now()),
+    )
+    _recompute_task_results(database, task_id)
+    if delivery["call_id"] is not None:
+        _recompute_call_results(database, delivery["call_id"])
+    return False
+
+
 def _combine_with_feedback(base_result: str, feedback_results: list[str]) -> str:
     """Apply active feedback threads without allowing praise to erase a failure."""
 
@@ -752,6 +1261,13 @@ def _observed_first_result(base_result: str, complete_observation: bool, input_r
 
 
 def _recompute_task_results(database: sqlite3.Connection, task_id: str) -> None:
+    formal = _formal_assessment(database, task_id)
+    if formal is not None:
+        database.execute(
+            "UPDATE tasks SET first_result = ?, current_result = ? WHERE task_id = ?",
+            (formal["first_result"], formal["final_result"], task_id),
+        )
+        return
     task = _task(database, task_id)
     deliveries = database.execute(
         """SELECT delivery_id, effective_result, complete_fixture FROM deliveries
@@ -780,6 +1296,19 @@ def _recompute_task_results(database: sqlite3.Connection, task_id: str) -> None:
         "UPDATE tasks SET first_result = ?, current_result = ? WHERE task_id = ?",
         (first, current, task_id),
     )
+
+
+def _formal_assessment(database: sqlite3.Connection, task_id: str) -> sqlite3.Row | None:
+    """Return an observation-derived assessment when the v2 table exists."""
+
+    try:
+        return database.execute(
+            """SELECT first_result, final_result FROM observation_assessments
+            WHERE task_id = ?""",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
 
 
 def _recompute_call_results(database: sqlite3.Connection, call_id: str) -> None:
@@ -1276,7 +1805,12 @@ def import_snapshot(database: sqlite3.Connection, input_path: Path) -> dict[str,
                     "SELECT 1 FROM suppressions WHERE origin_id = ? AND subject_kind = ? AND subject_id = ?",
                     (origin_id, subject_kind, subject_id),
                 ).fetchone()
-                if suppressed is None:
+                deleted_by_range = _snapshot_in_deleted_range(
+                    database,
+                    str(sample.get("suite_id", "unknown")),
+                    str(sample.get("started_at", "")),
+                )
+                if suppressed is None and not deleted_by_range:
                     database.execute(
                         """INSERT INTO imported_samples(
                         origin_id, subject_kind, subject_id, suite_id, suite_version, harness,
@@ -1314,6 +1848,22 @@ def import_snapshot(database: sqlite3.Connection, input_path: Path) -> dict[str,
     }
 
 
+def _snapshot_in_deleted_range(
+    database: sqlite3.Connection, suite_id: str, started_at: str
+) -> bool:
+    """Keep an old minimal snapshot from restoring a locally deleted sample."""
+
+    try:
+        rows = database.execute(
+            """SELECT suite_id, before_time FROM observation_deletion_ranges
+            WHERE suite_id = ? OR suite_id = '*'""",
+            (suite_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+    return any(row["before_time"] is None or started_at < row["before_time"] for row in rows)
+
+
 def delete_records(
     database: sqlite3.Connection,
     *,
@@ -1321,6 +1871,7 @@ def delete_records(
     before: str | None,
     apply: bool,
 ) -> dict[str, Any]:
+    _register_writer_protocol(database)
     filters = []
     imported_filters = []
     arguments: list[object] = []
@@ -1337,7 +1888,7 @@ def delete_records(
 
     def selection() -> tuple[list[sqlite3.Row], list[sqlite3.Row], dict[str, Any]]:
         local_rows = database.execute(
-            f"SELECT task_id, owner_origin, status FROM tasks {where}", arguments
+            f"SELECT task_id, owner_origin, status, suite_id, created_at FROM tasks {where}", arguments
         ).fetchall()
         imported_rows = database.execute(
             f"SELECT origin_id, subject_kind, subject_id FROM imported_samples {imported_where}",
@@ -1348,6 +1899,24 @@ def delete_records(
             "imported_samples": len(imported_rows),
             "apply": apply,
         }
+        observation_filters = []
+        observation_arguments: list[object] = []
+        if suite_id:
+            observation_filters.append("suite_id = ?")
+            observation_arguments.append(suite_id)
+        if before:
+            observation_filters.append("occurred_at < ?")
+            observation_arguments.append(before)
+        observation_where = (
+            f"WHERE {' AND '.join(observation_filters)}" if observation_filters else ""
+        )
+        observation_rows = database.execute(
+            """SELECT event_id, stable_identity, source_context, source_epoch, suite_id, task_id
+            FROM observation_events """
+            + observation_where,
+            observation_arguments,
+        ).fetchall()
+        preview["observations"] = len(observation_rows)
         local_task_ids = [str(row["task_id"]) for row in local_rows]
         if local_task_ids:
             placeholders = ", ".join("?" for _ in local_task_ids)
@@ -1373,6 +1942,7 @@ def delete_records(
             "calls": active_calls,
             "sessions": active_sessions,
         }
+        preview["observation_rows"] = observation_rows
         return local_rows, imported_rows, preview
 
     if not apply:
@@ -1384,6 +1954,7 @@ def delete_records(
     # causes ACTIVE_LEASE) or receives a busy error before it can create a session.
     with database:
         database.execute("BEGIN IMMEDIATE")
+        deletion_boundary = before or utc_now()
         local_rows, imported_rows, preview = selection()
         active_leases = preview["active_leases"]
         if any(int(count) for count in active_leases.values()):
@@ -1391,6 +1962,52 @@ def delete_records(
                 "ACTIVE_LEASE",
                 "cannot delete records that still own active tasks, calls, or sessions",
                 "close the active task, call, and session explicitly before applying deletion",
+            )
+        deleted_suite = suite_id or "*"
+        deleted_epoch = int(
+            database.execute(
+                "SELECT COALESCE(MAX(delete_epoch), 0) + 1 FROM observation_deletion_ranges"
+            ).fetchone()[0]
+        )
+        database.execute(
+            """INSERT INTO observation_deletion_ranges(
+            suite_id, before_time, delete_epoch, created_at) VALUES (?, ?, ?, ?)""",
+            (deleted_suite, deletion_boundary, deleted_epoch, utc_now()),
+        )
+        observation_rows = preview.pop("observation_rows")
+        for observation in observation_rows:
+            stable_identity = observation["stable_identity"]
+            if stable_identity is not None:
+                database.execute(
+                    """INSERT OR REPLACE INTO observation_tombstones(
+                    stable_identity, source_context, source_epoch, suite_id, task_id, deleted_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        stable_identity,
+                        observation["source_context"],
+                        observation["source_epoch"],
+                        observation["suite_id"],
+                        observation["task_id"],
+                        utc_now(),
+                    ),
+                )
+            database.execute(
+                """INSERT INTO observation_source_epochs(
+                source_context, invalid_before_epoch, deleted_at) VALUES (?, ?, ?)
+                ON CONFLICT(source_context) DO UPDATE SET
+                  invalid_before_epoch = MAX(
+                    observation_source_epochs.invalid_before_epoch,
+                    excluded.invalid_before_epoch
+                  ),
+                  deleted_at = excluded.deleted_at""",
+                (observation["source_context"], observation["source_epoch"], utc_now()),
+            )
+            database.execute(
+                "DELETE FROM observation_conflicts WHERE original_event_id = ?",
+                (observation["event_id"],),
+            )
+            database.execute(
+                "DELETE FROM observation_events WHERE event_id = ?", (observation["event_id"],)
             )
         for row in local_rows:
             database.execute(
@@ -1411,6 +2028,12 @@ def delete_records(
                 )
             database.execute("DELETE FROM calls WHERE task_id = ?", (row["task_id"],))
             database.execute("DELETE FROM events WHERE task_id = ?", (row["task_id"],))
+            database.execute(
+                "DELETE FROM observation_assessments WHERE task_id = ?", (row["task_id"],)
+            )
+            database.execute(
+                "DELETE FROM observation_call_assessments WHERE task_id = ?", (row["task_id"],)
+            )
             database.execute("DELETE FROM tasks WHERE task_id = ?", (row["task_id"],))
         for row in imported_rows:
             database.execute(
