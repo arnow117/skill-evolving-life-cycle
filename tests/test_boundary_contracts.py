@@ -32,7 +32,14 @@ from selc.evolve import (
     verify_local_release,
 )
 from selc.install import install_suite
-from selc.manifest import create_suite, load_manifest, package_suite, seal_suite, suite_content_hash
+from selc.manifest import (
+    create_suite,
+    load_manifest,
+    package_suite,
+    seal_suite,
+    suite_content_hash,
+    validate_skill_structure,
+)
 
 
 def git(arguments: list[str], cwd: Path) -> str:
@@ -112,6 +119,7 @@ class BoundaryContractTests(unittest.TestCase):
             [
                 {
                     "number": 1,
+                    "state": "OPEN",
                     "headRefName": "codex/contribution-suite",
                     "baseRefName": "main",
                     "headRefOid": commit,
@@ -141,6 +149,27 @@ class BoundaryContractTests(unittest.TestCase):
                 commit,
             )
         self.assertEqual(foreign_fork.exception.code, "REQUEST_CONFLICT")
+        for state, expected_code in (
+            ("CLOSED", "REQUEST_INACTIVE"),
+            ("MERGED", "REQUEST_INACTIVE"),
+            (None, "REQUEST_QUERY_AMBIGUOUS"),
+        ):
+            with self.subTest(github_state=state):
+                response = json.loads(github)
+                if state is None:
+                    del response[0]["state"]
+                else:
+                    response[0]["state"] = state
+                with self.assertRaises(SelcError) as inactive:
+                    _parse_contribution_request(
+                        "github",
+                        json.dumps(response),
+                        "github.com/owner/center",
+                        "codex/contribution-suite",
+                        "main",
+                        commit,
+                    )
+                self.assertEqual(inactive.exception.code, expected_code)
         for unverified in ("", "null"):
             with self.subTest(unverified=unverified):
                 with self.assertRaises(SelcError) as ambiguous:
@@ -214,12 +243,14 @@ class BoundaryContractTests(unittest.TestCase):
             "github", "gh", "github.com/owner/center", "branch", "main"
         )
         self.assertIn("headRepository", github_argv[-1])
+        self.assertIn("state", github_argv[-1])
+        self.assertEqual(github_argv[github_argv.index("--state") + 1], "all")
         gitlab_argv = contribution_query_argv(
             "gitlab", "glab", "gitlab.com/owner/center", "branch", "main"
         )
         self.assertEqual(gitlab_argv[:3], ["glab", "api", "--hostname"])
         self.assertIn("projects/owner%2Fcenter/merge_requests", gitlab_argv[-1])
-        self.assertIn("state=opened", gitlab_argv[-1])
+        self.assertIn("state=all", gitlab_argv[-1])
 
     def test_nested_skill_fields_do_not_satisfy_portable_top_level_requirements(self) -> None:
         repository, suite = self.create_repository("nested-skill-suite", "suite")
@@ -262,6 +293,140 @@ class BoundaryContractTests(unittest.TestCase):
                 total_timeout_seconds=60,
             )
         self.assertEqual(invalid_candidate.exception.code, "INVALID_SKILL")
+
+    def test_description_scalar_syntax_rejects_non_strings_and_preserves_valid_quotes(self) -> None:
+        skill_directory = self.root / "scalar-syntax"
+        skill_directory.mkdir()
+        skill_file = skill_directory / "SKILL.md"
+
+        def write_skill(description: str) -> None:
+            skill_file.write_text(
+                "---\nname: text-report\ndescription: " + description + "\n---\nBody\n",
+                encoding="utf-8",
+            )
+
+        for description in (
+            "Plain portable description # author note",
+            '"null # literal" # author note',
+            "'it''s # literal' # author note",
+        ):
+            with self.subTest(description=description):
+                write_skill(description)
+                validate_skill_structure(skill_file, "text-report")
+
+        for description in (
+            "null # nullable",
+            "123 # numeric",
+            "true # boolean",
+            "on # enabled",
+            "OFF # disabled",
+            "2026-10-20",
+            "plain: mapping",
+            "[not, a, string]",
+        ):
+            with self.subTest(description=description):
+                write_skill(description)
+                with self.assertRaises(SelcError) as invalid:
+                    validate_skill_structure(skill_file, "text-report")
+                self.assertEqual(invalid.exception.code, "INVALID_SKILL")
+
+        for frontmatter in (
+            'name:"text-report"\ndescription: valid description',
+            'name: text-report\ndescription:"ordinary text"',
+        ):
+            with self.subTest(frontmatter=frontmatter):
+                skill_file.write_text(
+                    f"---\n{frontmatter}\n---\nBody\n",
+                    encoding="utf-8",
+                )
+                with self.assertRaises(SelcError) as invalid_separator:
+                    validate_skill_structure(skill_file, "text-report")
+                self.assertEqual(invalid_separator.exception.code, "INVALID_SKILL")
+
+        repository, suite = self.create_repository("scalar-pipeline-suite", "suite")
+        source_skill = suite / "skills" / "text-report" / "SKILL.md"
+        source_skill.write_text(
+            "---\nname: text-report\ndescription: null # nullable\n---\nBody\n",
+            encoding="utf-8",
+        )
+        for operation in (
+            lambda: load_manifest(suite),
+            lambda: seal_suite(suite),
+            lambda: package_suite(suite, self.root / "scalar-pipeline-suite.zip"),
+        ):
+            with self.assertRaises(SelcError) as invalid_source:
+                operation()
+            self.assertEqual(invalid_source.exception.code, "INVALID_SKILL")
+
+        source_skill.write_text(
+            "---\nname: text-report\ndescription: a valid source description\n---\nBody\n",
+            encoding="utf-8",
+        )
+        seal_suite(suite)
+        candidate = Path(
+            prepare_candidate(suite, self.root / "scalar-pipeline-candidate")["candidate"]
+        )
+        candidate_skill = candidate / "skills" / "text-report" / "SKILL.md"
+        candidate_skill.write_text(
+            "---\nname: text-report\ndescription: 2026-10-20\n---\nBody\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(SelcError) as invalid_candidate:
+            evaluate_candidate(
+                candidate,
+                self.root / "scalar-pipeline-evaluation.json",
+                max_runs=8,
+                model_calls=0,
+                candidate_number=1,
+                candidate_limit=2,
+                run_timeout_seconds=10,
+                total_timeout_seconds=60,
+            )
+        self.assertEqual(invalid_candidate.exception.code, "INVALID_SKILL")
+
+    def test_contribution_push_uses_the_verified_commit_not_a_later_head(self) -> None:
+        repository, suite = self.create_repository("push-object-suite", "suite")
+        candidate, evaluation = self.candidate_and_evaluation(suite, "push-object")
+        workspace = self.root / "push-object-workspace"
+        plan_path = self.root / "push-object-plan.json"
+        plan = prepare_contribution(candidate, suite, evaluation, repository, workspace, plan_path)
+
+        import selc.evolve as evolve_module
+
+        original_run_argv = evolve_module.run_argv
+        observed: dict[str, str | list[str]] = {}
+
+        def add_unverified_commit_before_push(arguments: list[str], **kwargs: object) -> str:
+            if arguments[:2] == ["git", "push"]:
+                observed["verified_commit"] = git(["rev-parse", "HEAD"], workspace)
+                outside = workspace / "outside.txt"
+                outside.write_text("not part of the evaluated candidate\n", encoding="utf-8")
+                git(["add", "outside.txt"], workspace)
+                git(["commit", "-m", "unverified concurrent edit"], workspace)
+                observed["later_head"] = git(["rev-parse", "HEAD"], workspace)
+                observed["push_arguments"] = arguments
+            return original_run_argv(arguments, **kwargs)
+
+        with patch.object(evolve_module, "run_argv", side_effect=add_unverified_commit_before_push):
+            result = execute_contribution(plan_path, "local", None, None)
+
+        verified_commit = str(observed["verified_commit"])
+        self.assertEqual(result["commit"], verified_commit)
+        self.assertEqual(
+            observed["push_arguments"][-1], f"{verified_commit}:refs/heads/{plan['branch']}"
+        )
+        self.assertNotEqual(observed["later_head"], verified_commit)
+        self.assertEqual(
+            git(["rev-parse", f"refs/heads/{plan['branch']}"], repository), verified_commit
+        )
+        outside_at_remote = subprocess.run(
+            ["git", "show", f"{plan['branch']}:outside.txt"],
+            cwd=repository,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertNotEqual(outside_at_remote.returncode, 0)
 
     def test_contribution_rejects_staged_or_committed_outside_changes(self) -> None:
         repository, suite = self.create_repository("contribution-tree-safety", "suite")
@@ -495,12 +660,14 @@ class BoundaryContractTests(unittest.TestCase):
                 "if host != 'github.com' or namespace != 'owner/central':\n"
                 "    sys.exit(8)\n"
                 "if arguments[:2] == ['pr', 'list']:\n"
+                "    if arguments[arguments.index('--state') + 1] != 'all':\n"
+                "        raise SystemExit(6)\n"
                 "    if not __import__('pathlib').Path(request_state).exists():\n"
                 "        print('[]')\n"
                 "    else:\n"
                 "        branch = arguments[arguments.index('--head') + 1]\n"
                 "        commit = subprocess.check_output(['git', '--git-dir', central, 'rev-parse', 'refs/heads/' + branch], text=True).strip()\n"
-                "        print(json.dumps([{'number': 1, 'headRefName': branch, 'baseRefName': 'main', 'headRefOid': commit, 'headRepository': {'nameWithOwner': 'owner/central'}, 'headRepositoryOwner': {'login': 'owner'}}]))\n"
+                "        print(json.dumps([{'number': 1, 'state': 'OPEN', 'headRefName': branch, 'baseRefName': 'main', 'headRefOid': commit, 'headRepository': {'nameWithOwner': 'owner/central'}, 'headRepositoryOwner': {'login': 'owner'}}]))\n"
                 "elif arguments[:2] == ['pr', 'create']:\n"
                 "    branch = arguments[arguments.index('--head') + 1]\n"
                 "    code = subprocess.run(['git', '--git-dir', central, 'show-ref', '--verify', '--quiet', 'refs/heads/' + branch]).returncode\n"
@@ -513,6 +680,7 @@ class BoundaryContractTests(unittest.TestCase):
             )
             client.chmod(0o700)
             result = execute_contribution(plan_path, "github", "owner/central", str(client))
+            reused = execute_contribution(plan_path, "github", "owner/central", str(client))
             verified = verify_contribution(plan_path, "github", str(client))
 
         self.assertEqual(
@@ -526,6 +694,7 @@ class BoundaryContractTests(unittest.TestCase):
         self.assertNotEqual(absent_from_author.returncode, 0)
         self.assertIn("github.com/owner/central", result["query"])
         self.assertEqual(result["request"], "recovered_after_ambiguous_create")
+        self.assertEqual(reused["request"], "reused")
         provider_requests = [json.loads(line) for line in client_log.read_text().splitlines()]
         self.assertTrue(all(request["host"] == "github.com" for request in provider_requests))
         self.assertTrue(
@@ -625,6 +794,9 @@ class BoundaryContractTests(unittest.TestCase):
                 "if arguments[:1] == ['api']:\n"
                 "    with open(query_log, 'a', encoding='utf-8') as handle:\n"
                 "        handle.write(json.dumps(arguments) + '\\n')\n"
+                "    if 'state=all' not in arguments[-1]:\n"
+                "        print('[]')\n"
+                "        raise SystemExit(0)\n"
                 "    commit = subprocess.check_output(\n"
                 "        ['git', '--git-dir', central, 'rev-parse', 'refs/heads/' + branch], text=True\n"
                 "    ).strip()\n"
@@ -647,7 +819,7 @@ class BoundaryContractTests(unittest.TestCase):
 
         self.assertFalse(create_log.exists())
         query_argv = json.loads(query_log.read_text(encoding="utf-8").splitlines()[0])
-        self.assertIn("state=opened", query_argv[-1])
+        self.assertIn("state=all", query_argv[-1])
 
     def test_release_center_boundary_rejects_an_escaping_releases_symlink(self) -> None:
         repository, suite = self.create_repository("release-suite", "suite")

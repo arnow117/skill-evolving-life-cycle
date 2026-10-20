@@ -386,7 +386,13 @@ def validate_skill_structure(skill_file: Path, declared_name: str) -> None:
         key, raw_value = line.split(":", maxsplit=1)
         if key not in {"name", "description"}:
             continue
-        value = _portable_frontmatter_scalar(raw_value.strip())
+        if raw_value and not raw_value[0].isspace():
+            raise SelcError(
+                "INVALID_SKILL",
+                "portable skill frontmatter requires whitespace after a required field colon",
+                "write required fields as 'name: value' and 'description: value'",
+            )
+        value = _portable_frontmatter_scalar(raw_value)
         if key in {"name", "description"}:
             if key in values:
                 raise SelcError(
@@ -415,47 +421,118 @@ def validate_skill_structure(skill_file: Path, declared_name: str) -> None:
         )
 
 
-def _portable_frontmatter_scalar(value: str) -> str:
-    """Parse the intentionally narrow scalar form supported by the runtime."""
+def _portable_frontmatter_scalar(raw_value: str) -> str:
+    """Parse the deliberately small YAML-string subset portable suites support.
 
+    This parser accepts only forms that can be shown to be strings without a
+    YAML dependency.  It intentionally does not attempt to support every YAML
+    scalar accepted by the authoring validator.
+    """
+
+    value = raw_value.lstrip()
     if not value or value.startswith("#"):
         return ""
-    if value[0] in "[{|>&*!" or value.casefold() in {
-        "~",
-        "null",
-        "true",
-        "false",
-        "yes",
-        "no",
-        ".nan",
-        ".inf",
-        "-.inf",
-        "+.inf",
-    }:
+    if value.startswith('"'):
+        return _double_quoted_frontmatter_string(value)
+    if value.startswith("'"):
+        return _single_quoted_frontmatter_string(value)
+
+    plain = _plain_frontmatter_string(value)
+    if not plain:
+        return ""
+    if not (plain[0].isalpha() or plain[0] == "_"):
         raise SelcError(
             "INVALID_SKILL",
             "portable skill frontmatter needs a string scalar",
-            "use an unquoted or simply quoted string value",
+            "quote numeric, date-like, or symbolic values",
         )
-    if value[0] in {"'", '"'}:
-        if len(value) < 2 or value[-1] != value[0]:
-            raise SelcError(
-                "INVALID_SKILL",
-                "portable skill frontmatter has an unterminated string",
-                "use a complete quoted string value",
-            )
-        value = value[1:-1]
-        return value.strip()
-    if re.fullmatch(
-        r"[-+]?(?:0[xob][0-9a-fA-F_]+|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)",
-        value,
-    ):
+    if plain.casefold() in {"~", "null", "true", "false", "yes", "no", "on", "off"}:
         raise SelcError(
             "INVALID_SKILL",
             "portable skill frontmatter needs a string scalar",
-            "quote numeric-looking values or use a descriptive string",
+            "quote reserved YAML values",
         )
-    return value.strip()
+    if re.search(r":(?=\s|$)", plain):
+        raise SelcError(
+            "INVALID_SKILL",
+            "portable skill frontmatter has an ambiguous mapping value",
+            "quote text that contains a mapping-like colon",
+        )
+    return plain
+
+
+def _double_quoted_frontmatter_string(value: str) -> str:
+    """Accept a JSON string followed by only whitespace or a YAML comment."""
+
+    try:
+        decoded, end = json.JSONDecoder().raw_decode(value)
+    except json.JSONDecodeError as error:
+        raise SelcError(
+            "INVALID_SKILL",
+            "portable skill frontmatter has an invalid double-quoted string",
+            "use JSON string syntax or a simple single-quoted string",
+        ) from error
+    if not isinstance(decoded, str):
+        raise SelcError(
+            "INVALID_SKILL",
+            "portable skill frontmatter needs a string scalar",
+            "quote the value as a JSON string",
+        )
+    _assert_scalar_tail(value[end:])
+    return decoded.strip()
+
+
+def _single_quoted_frontmatter_string(value: str) -> str:
+    """Accept YAML's simple single-quoted string with doubled-quote escapes."""
+
+    characters: list[str] = []
+    index = 1
+    while index < len(value):
+        character = value[index]
+        if character != "'":
+            characters.append(character)
+            index += 1
+            continue
+        if index + 1 < len(value) and value[index + 1] == "'":
+            characters.append("'")
+            index += 2
+            continue
+        _assert_scalar_tail(value[index + 1 :])
+        return "".join(characters).strip()
+    raise SelcError(
+        "INVALID_SKILL",
+        "portable skill frontmatter has an unterminated single-quoted string",
+        "close the string or use JSON double-quoted syntax",
+    )
+
+
+def _assert_scalar_tail(tail: str) -> None:
+    """Require an explicit whitespace boundary before an outside comment."""
+
+    if not tail:
+        return
+    if not tail[0].isspace():
+        raise SelcError(
+            "INVALID_SKILL",
+            "portable skill frontmatter has text after a quoted string",
+            "separate a trailing comment with whitespace",
+        )
+    remainder = tail.lstrip()
+    if remainder and not remainder.startswith("#"):
+        raise SelcError(
+            "INVALID_SKILL",
+            "portable skill frontmatter has text after a quoted string",
+            "put only a comment after the quoted string",
+        )
+
+
+def _plain_frontmatter_string(value: str) -> str:
+    """Strip only a YAML comment whose hash has a preceding whitespace boundary."""
+
+    for index, character in enumerate(value):
+        if character == "#" and index > 0 and value[index - 1].isspace():
+            return value[:index].rstrip()
+    return value.rstrip()
 
 
 def render_text_report(text: str, resources_root: Path) -> str:

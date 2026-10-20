@@ -54,9 +54,16 @@ def write_release_fake(
         request_state = state.with_suffix(".contribution-request")
         contribution_adapter = (
             'if [ "$1" = pr ] && [ "$2" = list ]; then\n'
+            "  previous=\n"
+            "  state_filter=\n"
+            '  for argument in "$@"; do\n'
+            '    if [ "$previous" = --state ]; then state_filter=$argument; break; fi\n'
+            "    previous=$argument\n"
+            "  done\n"
+            '  if [ "$state_filter" != all ]; then exit 12; fi\n'
             f'  if [ ! -f "{request_state}" ]; then printf "[]"; exit 0; fi\n'
             f'  IFS="|" read branch commit < "{request_state}"\n'
-            '  printf \'[{"number":1,"headRefName":"%s","baseRefName":"main","headRefOid":"%s","headRepository":{"nameWithOwner":"owner/control-repository"},"headRepositoryOwner":{"login":"owner"}}]\' "$branch" "$commit"\n'
+            '  printf \'[{"number":1,"state":"OPEN","headRefName":"%s","baseRefName":"main","headRefOid":"%s","headRepository":{"nameWithOwner":"owner/control-repository"},"headRepositoryOwner":{"login":"owner"}}]\' "$branch" "$commit"\n'
             "  exit 0\n"
             "fi\n"
             'if [ "$1" = pr ] && [ "$2" = create ]; then\n'
@@ -76,6 +83,7 @@ def write_release_fake(
         request_state = state.with_suffix(".contribution-request")
         contribution_adapter = (
             'if [ "$1" = api ]; then\n'
+            '  case "$4" in *state=all*) ;; *) exit 12 ;; esac\n'
             f'  if [ ! -f "{request_state}" ]; then printf "[]"; exit 0; fi\n'
             f'  IFS="|" read branch commit < "{request_state}"\n'
             '  printf \'[{"state":"opened","source_branch":"%s","target_branch":"main","sha":"%s","source_project_id":17,"target_project_id":17}]\' "$branch" "$commit"\n'
@@ -1148,6 +1156,19 @@ class SelcSmokeTests(unittest.TestCase):
                 "--client",
                 str(fake_gitlab),
             )
+            reused_contribution = run_cli(
+                "contribute",
+                "execute",
+                "--plan",
+                str(contribution_plan),
+                "--provider",
+                "gitlab",
+                "--repository",
+                "owner/control-repository",
+                "--client",
+                str(fake_gitlab),
+            )
+            self.assertEqual(reused_contribution["request"], "reused")
             verified_contribution = run_cli(
                 "contribute",
                 "verify",

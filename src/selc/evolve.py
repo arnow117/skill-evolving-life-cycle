@@ -613,7 +613,10 @@ def execute_contribution(
             _validate_remote_contribution_destination(plan, provider, repository)
         )
     contribution_commit = _prepare_or_reuse_contribution_commit(workspace, plan)
-    run_argv(["git", "push", push_upstream, f"HEAD:refs/heads/{plan['branch']}"], cwd=workspace)
+    run_argv(
+        ["git", "push", push_upstream, f"{contribution_commit}:refs/heads/{plan['branch']}"],
+        cwd=workspace,
+    )
     _assert_remote_branch_points_to_commit(push_upstream, str(plan["branch"]), contribution_commit)
     result: dict[str, Any] = {
         "workspace": str(workspace),
@@ -803,8 +806,10 @@ def contribution_query_argv(
             branch,
             "--base",
             base_branch,
+            "--state",
+            "all",
             "--json",
-            "number,headRefName,baseRefName,headRepository,headRepositoryOwner,headRefOid",
+            "number,state,headRefName,baseRefName,headRepository,headRepositoryOwner,headRefOid",
         ]
     if provider == "gitlab":
         host, namespace = repository.split("/", maxsplit=1)
@@ -816,7 +821,7 @@ def contribution_query_argv(
             host,
             f"projects/{encoded_namespace}/merge_requests"
             f"?source_branch={quote(branch, safe='')}&target_branch={quote(base_branch, safe='')}"
-            "&state=opened",
+            "&state=all",
         ]
     raise SelcError(
         "UNSUPPORTED_PROVIDER", f"unsupported provider: {provider}", "choose github or gitlab"
@@ -1104,6 +1109,19 @@ def _parse_contribution_request(
                 and head_repository.get("nameWithOwner") == expected_repository
                 and head_owner.get("login") == expected_repository.split("/", maxsplit=1)[0]
             ):
+                state = item.get("state")
+                if not isinstance(state, str):
+                    raise SelcError(
+                        "REQUEST_QUERY_AMBIGUOUS",
+                        "GitHub request query lacks an open-state value",
+                        "inspect the fixed repository before retrying",
+                    )
+                if state != "OPEN":
+                    raise SelcError(
+                        "REQUEST_INACTIVE",
+                        "GitHub returned a matching contribution request that is not open",
+                        "inspect the inactive request and prepare a new contribution if needed",
+                    )
                 return "matching"
     elif provider == "gitlab":
         for item in entries:
