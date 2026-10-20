@@ -182,7 +182,6 @@ def resolve_framework_source(
     if local_source.is_file() and local_source.suffix == ".zip":
         temporary = Path(tempfile.mkdtemp(prefix="selc-framework-package-"))
         _safe_extract(local_source, temporary)
-        load_framework(temporary)
         return temporary, {
             "kind": "framework_package",
             "repo": str(local_source.resolve()),
@@ -191,7 +190,6 @@ def resolve_framework_source(
             "base": None,
         }
     if local_source.is_dir() and framework_path(local_source).is_file():
-        load_framework(local_source)
         return local_source, {
             "kind": "framework_directory",
             "repo": str(local_source.resolve()),
@@ -200,7 +198,6 @@ def resolve_framework_source(
             "base": None,
         }
     if local_source.is_dir() and (local_source / "suite.json").is_file() and subdir is None:
-        load_framework(local_source)
         return local_source, {
             "kind": "framework_suite",
             "repo": str(local_source.resolve()),
@@ -249,16 +246,15 @@ def resolve_framework_source(
                 "specify a framework subdirectory",
             )
         framework_root = candidates[0]
-        framework = load_framework(framework_root)
         stable_parent = Path(tempfile.mkdtemp(prefix="selc-git-framework-"))
         stable = stable_parent / "framework"
-        stable.mkdir()
         descriptor = framework_path(framework_root)
         if descriptor.is_file():
-            shutil.copy2(descriptor, framework_path(stable))
+            stable.mkdir()
+            shutil.copy2(descriptor, framework_path(stable), follow_symlinks=False)
+            shutil.copytree(framework_root / "runtime", stable / "runtime", symlinks=True)
         else:
-            write_json(framework_path(stable), framework)
-        shutil.copytree(framework_root / "runtime", stable / "runtime")
+            copy_portable_suite(framework_root, stable)
         return stable, {
             "kind": "framework_git",
             "repo": source_text,
@@ -558,6 +554,55 @@ def _restore_business_source_baseline(
     return restored
 
 
+def _snapshot_business_source(source_root: Path, destination: Path) -> tuple[dict[str, Any], str]:
+    """Copy and validate the portable business bytes used by one install call.
+
+    Directory sources are mutable.  Metadata taken from a live directory cannot
+    safely describe files copied later from that directory, so every install
+    derives its manifest and business digest from this private copy instead.
+    ``copy_portable_suite`` also limits the snapshot to the same portable
+    surface that installation eventually activates.
+    """
+
+    copy_portable_suite(source_root, destination)
+    manifest = load_manifest(destination)
+    return manifest, portable_tree_hash(destination)
+
+
+def _snapshot_framework_source(source_root: Path, destination: Path) -> dict[str, Any]:
+    """Copy and validate framework descriptor/runtime bytes for one install call.
+
+    A runtime-only framework has just ``framework.json`` and ``runtime``;
+    a complete suite can also serve as a framework source.  Copy the complete
+    portable surface for the latter so its embedded descriptor is derived from
+    the same stable bytes.  Validation occurs after copying, which rejects a
+    partially changed descriptor/runtime pair instead of resealing it.
+    """
+
+    descriptor = framework_path(source_root)
+    if descriptor.is_file():
+        destination.mkdir(parents=True)
+        shutil.copy2(descriptor, framework_path(destination), follow_symlinks=False)
+        shutil.copytree(source_root / "runtime", destination / "runtime", symlinks=True)
+    else:
+        copy_portable_suite(source_root, destination)
+    return load_framework(destination)
+
+
+def _framework_matches_selection(framework_info: dict[str, Any], selection: dict[str, Any]) -> bool:
+    """Check that an implicit source still represents the saved selection."""
+
+    return (
+        framework_info.get("kind") == selection.get("kind")
+        and framework_info.get("repo") == selection.get("repo")
+        and framework_info.get("subdir") == selection.get("subdir")
+        and framework_info.get("commit") == selection.get("commit")
+        and framework_info.get("version") == selection.get("version")
+        and framework_info.get("runtime_protocol") == selection.get("runtime_protocol")
+        and framework_info.get("digest") == selection.get("digest")
+    )
+
+
 def install_suite(
     *,
     source: str | Path,
@@ -570,78 +615,86 @@ def install_suite(
     framework_subdir: str | None = None,
     prepared_business_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    business_root, source_info = resolve_source(source, ref, subdir)
-    manifest = load_manifest(business_root)
-    business_digest = portable_tree_hash(business_root)
-    if prepared_business_snapshot is not None:
-        if not _business_candidate_matches_snapshot(
-            manifest, source_info, business_digest, prepared_business_snapshot
-        ):
-            raise SelcError(
-                "STALE_BUSINESS_SELECTION",
-                "the saved business source no longer matches the installed business",
-                "retry with an explicit --source after reviewing the business update",
+    business_source_root, source_info = resolve_source(source, ref, subdir)
+    with temporary_directory("selc-install-input-") as temporary:
+        business_root = temporary / "business"
+        manifest, business_digest = _snapshot_business_source(business_source_root, business_root)
+        if prepared_business_snapshot is not None:
+            if not _business_candidate_matches_snapshot(
+                manifest, source_info, business_digest, prepared_business_snapshot
+            ):
+                raise SelcError(
+                    "STALE_BUSINESS_SELECTION",
+                    "the saved business source no longer matches the installed business",
+                    "retry with an explicit --source after reviewing the business update",
+                )
+            source_info = _restore_business_source_baseline(source_info, prepared_business_snapshot)
+        implicit_framework_selection_observed = framework_source is None
+        preserved_external_selection: dict[str, Any] | None = None
+        if implicit_framework_selection_observed:
+            preserved_external_selection = _saved_external_framework_selection(
+                project_root, manifest["suite_id"]
             )
-        source_info = _restore_business_source_baseline(source_info, prepared_business_snapshot)
-    implicit_framework_selection_observed = framework_source is None
-    preserved_external_selection: dict[str, Any] | None = None
-    if implicit_framework_selection_observed:
-        preserved_external_selection = _saved_external_framework_selection(
-            project_root, manifest["suite_id"]
+        if framework_source is None and preserved_external_selection is None:
+            framework_info = {
+                "kind": "embedded",
+                "version": manifest["framework_version"],
+                "runtime_protocol": manifest.get("runtime_protocol", 1),
+                "digest": tree_hash(business_root / "runtime"),
+                "status": "active_embedded",
+            }
+            return _install_materialized_suite(
+                suite_root=business_root,
+                source_info=source_info,
+                framework_info=framework_info,
+                business_digest=business_digest,
+                project_root=project_root,
+                harness=harness,
+                preserved_external_selection=preserved_external_selection,
+                implicit_framework_selection_observed=implicit_framework_selection_observed,
+                prepared_business_snapshot=prepared_business_snapshot,
+            )
+
+        if preserved_external_selection is not None:
+            framework_source = str(preserved_external_selection["repo"])
+            framework_ref = preserved_external_selection.get(
+                "commit"
+            ) or preserved_external_selection.get("base")
+            framework_subdir = preserved_external_selection.get("subdir")
+
+        framework_source_root, framework_source_info = resolve_framework_source(
+            framework_source, framework_ref, framework_subdir
         )
-    if framework_source is None and preserved_external_selection is None:
-        framework_info = {
-            "kind": "embedded",
-            "version": manifest["framework_version"],
-            "runtime_protocol": manifest.get("runtime_protocol", 1),
-            "digest": tree_hash(business_root / "runtime"),
-            "status": "active_embedded",
+        framework_root = temporary / "framework"
+        framework = _snapshot_framework_source(framework_source_root, framework_root)
+        framework_info = framework_source_info | {
+            "version": framework["framework_version"],
+            "runtime_protocol": framework["runtime_protocol"],
+            "digest": framework["runtime_hash"],
+            "status": "active_external",
         }
-        return _install_materialized_suite(
-            suite_root=business_root,
-            source_info=source_info,
-            framework_info=framework_info,
-            business_digest=business_digest,
-            project_root=project_root,
-            harness=harness,
-            preserved_external_selection=preserved_external_selection,
-            implicit_framework_selection_observed=implicit_framework_selection_observed,
-            prepared_business_snapshot=prepared_business_snapshot,
-        )
-
-    if preserved_external_selection is not None:
-        framework_source = str(preserved_external_selection["repo"])
-        framework_ref = preserved_external_selection.get(
-            "commit"
-        ) or preserved_external_selection.get("base")
-        framework_subdir = preserved_external_selection.get("subdir")
-
-    framework_root, framework_source_info = resolve_framework_source(
-        framework_source, framework_ref, framework_subdir
-    )
-    framework = load_framework(framework_root)
-    framework_info = framework_source_info | {
-        "version": framework["framework_version"],
-        "runtime_protocol": framework["runtime_protocol"],
-        "digest": framework["runtime_hash"],
-        "status": "active_external",
-    }
-    if preserved_external_selection is not None:
-        framework_info["base"] = preserved_external_selection.get("base")
-    with temporary_directory("selc-composite-") as temporary:
-        composite = temporary / "suite"
-        materialize_composite_suite(business_root, framework_root, composite)
-        return _install_materialized_suite(
-            suite_root=composite,
-            source_info=source_info,
-            framework_info=framework_info,
-            business_digest=business_digest,
-            project_root=project_root,
-            harness=harness,
-            preserved_external_selection=preserved_external_selection,
-            implicit_framework_selection_observed=implicit_framework_selection_observed,
-            prepared_business_snapshot=prepared_business_snapshot,
-        )
+        if preserved_external_selection is not None:
+            framework_info["base"] = preserved_external_selection.get("base")
+            if not _framework_matches_selection(framework_info, preserved_external_selection):
+                raise SelcError(
+                    "STALE_FRAMEWORK_SELECTION",
+                    "the saved external framework source changed before this install",
+                    "select the changed framework explicitly to apply its new runtime",
+                )
+        with temporary_directory("selc-composite-") as composite_temporary:
+            composite = composite_temporary / "suite"
+            materialize_composite_suite(business_root, framework_root, composite)
+            return _install_materialized_suite(
+                suite_root=composite,
+                source_info=source_info,
+                framework_info=framework_info,
+                business_digest=business_digest,
+                project_root=project_root,
+                harness=harness,
+                preserved_external_selection=preserved_external_selection,
+                implicit_framework_selection_observed=implicit_framework_selection_observed,
+                prepared_business_snapshot=prepared_business_snapshot,
+            )
 
 
 def _install_materialized_suite(

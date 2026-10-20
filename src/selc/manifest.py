@@ -101,6 +101,13 @@ def framework_path(root: Path) -> Path:
 def load_framework(root: Path) -> dict[str, Any]:
     """Validate a standalone framework package or a framework embedded in a suite."""
 
+    descriptor_path = framework_path(root)
+    if descriptor_path.is_symlink():
+        raise SelcError(
+            "UNSAFE_SYMLINK",
+            "framework descriptor cannot be a symlink",
+            "copy framework.json into the framework package",
+        )
     descriptor = _read_framework_descriptor(root)
     required = {"schema_version", "framework_version", "runtime_protocol", "runtime_hash"}
     missing = required.difference(descriptor)

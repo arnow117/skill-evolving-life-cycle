@@ -33,6 +33,7 @@ from selc.install import current_installation, install_suite, recover_installati
 from selc.manifest import (
     create_suite,
     package_suite,
+    portable_tree_hash,
     render_text_report,
     seal_suite,
     suite_content_hash,
@@ -214,6 +215,291 @@ class InstallationContractsTests(unittest.TestCase):
         installation = current_installation(project, "distinct-selection")
         self.assertEqual(installation["framework_source"]["status"], "active_external")
         self.assertEqual(installation["harnesses"], ["codex", "workbuddy"])
+
+    def test_explicit_framework_uses_a_private_snapshot_for_metadata_and_runtime(self) -> None:
+        """A later directory edit cannot split framework metadata from runtime bytes."""
+
+        suite = self.create_suite("framework-input-snapshot", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        project = self.root / "project"
+        original_descriptor = json.loads((framework / "framework.json").read_text(encoding="utf-8"))
+        original_runtime_hash = tree_hash(framework / "runtime")
+
+        import selc.install as install_module
+
+        original_materialize = install_module.materialize_composite_suite
+        changed = False
+
+        def change_after_snapshot(
+            business_root: Path, framework_root: Path, destination: Path
+        ) -> dict[str, object]:
+            nonlocal changed
+            self.assertEqual(tree_hash(framework_root / "runtime"), original_runtime_hash)
+            if not changed:
+                changed = True
+                self.change_external_framework(framework)
+            return original_materialize(business_root, framework_root, destination)
+
+        install_module.materialize_composite_suite = change_after_snapshot
+        try:
+            installed = install_suite(
+                source=suite,
+                project_root=project,
+                harness="codex",
+                ref=None,
+                framework_source=framework,
+            )
+        finally:
+            install_module.materialize_composite_suite = original_materialize
+
+        self.assertTrue(changed)
+        current = project / ".selc" / "installs" / "framework-input-snapshot" / "current"
+        installation = current_installation(project, "framework-input-snapshot")
+        self.assertEqual(tree_hash(current / "runtime"), original_runtime_hash)
+        self.assertEqual(installation["framework_source"]["digest"], original_runtime_hash)
+        self.assertEqual(
+            installation["framework_source"]["version"], original_descriptor["framework_version"]
+        )
+        self.assertEqual(installed["framework"]["digest"], original_runtime_hash)
+        self.assertNotEqual(tree_hash(framework / "runtime"), original_runtime_hash)
+
+    def test_implicit_changed_framework_requires_an_explicit_new_selection(self) -> None:
+        suite = self.create_suite("implicit-framework-snapshot", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        project = self.root / "project"
+        install_suite(
+            source=suite,
+            project_root=project,
+            harness="codex",
+            ref=None,
+            framework_source=framework,
+        )
+        selected = current_installation(project, "implicit-framework-snapshot")
+        selected_digest = selected["digest"]
+        selected_framework = dict(selected["framework_source"])
+        self.change_external_framework(framework)
+
+        with self.assertRaises(SelcError) as captured:
+            install_suite(
+                source=suite,
+                project_root=project,
+                harness="workbuddy",
+                ref=None,
+            )
+        self.assertEqual(captured.exception.code, "STALE_FRAMEWORK_SELECTION")
+        unchanged = current_installation(project, "implicit-framework-snapshot")
+        self.assertEqual(unchanged["digest"], selected_digest)
+        self.assertEqual(unchanged["framework_source"], selected_framework)
+        self.assertEqual(unchanged["harnesses"], ["codex"])
+
+        refreshed = install_suite(
+            source=suite,
+            project_root=project,
+            harness="workbuddy",
+            ref=None,
+            framework_source=framework,
+        )
+        current = project / ".selc" / "installs" / "implicit-framework-snapshot" / "current"
+        self.assertEqual(refreshed["framework"]["digest"], tree_hash(framework / "runtime"))
+        self.assertEqual(tree_hash(current / "runtime"), tree_hash(framework / "runtime"))
+        self.assertEqual(
+            current_installation(project, "implicit-framework-snapshot")["harnesses"],
+            ["codex", "workbuddy"],
+        )
+
+    def test_framework_only_update_keeps_the_business_input_snapshot(self) -> None:
+        """A mutable directory source cannot introduce business bytes after precheck."""
+
+        suite = self.create_suite("business-input-snapshot", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        project = self.root / "project"
+        initial = install_suite(source=suite, project_root=project, harness="codex", ref=None)
+
+        import selc.install as install_module
+
+        original_materialize = install_module.materialize_composite_suite
+        changed = False
+
+        def change_after_snapshot(
+            business_root: Path, framework_root: Path, destination: Path
+        ) -> dict[str, object]:
+            nonlocal changed
+            self.assertEqual(portable_tree_hash(business_root), initial["digest"])
+            if not changed:
+                changed = True
+                self.change_embedded_framework(suite)
+            return original_materialize(business_root, framework_root, destination)
+
+        install_module.materialize_composite_suite = change_after_snapshot
+        try:
+            exit_code, result = self.cli_in_process(
+                "updates",
+                "apply",
+                "--suite-id",
+                "business-input-snapshot",
+                "--framework-source",
+                str(framework),
+                "--project-root",
+                str(project),
+                "--harness",
+                "codex",
+            )
+        finally:
+            install_module.materialize_composite_suite = original_materialize
+
+        self.assertEqual(exit_code, 0, result)
+        self.assertTrue(changed)
+        current = project / ".selc" / "installs" / "business-input-snapshot" / "current"
+        installed = current_installation(project, "business-input-snapshot")
+        self.assertEqual(installed["version"], "1.0.0")
+        self.assertEqual(installed["business_digest"], initial["digest"])
+        self.assertNotIn(
+            "BUSINESS_EMBEDDED_RUNTIME_MARKER",
+            (current / "runtime" / "selc" / "__init__.py").read_text(encoding="utf-8"),
+        )
+
+    def test_explicit_business_update_uses_the_copied_business_input(self) -> None:
+        suite = self.create_suite("business-copy-input", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        project = self.root / "project"
+        initial = install_suite(
+            source=suite,
+            project_root=project,
+            harness="codex",
+            ref=None,
+            framework_source=framework,
+        )
+
+        import selc.install as install_module
+
+        original_materialize = install_module.materialize_composite_suite
+        changed = False
+
+        def change_after_snapshot(
+            business_root: Path, framework_root: Path, destination: Path
+        ) -> dict[str, object]:
+            nonlocal changed
+            self.assertEqual(portable_tree_hash(business_root), initial["digest"])
+            if not changed:
+                changed = True
+                self.change_embedded_framework(suite)
+            return original_materialize(business_root, framework_root, destination)
+
+        install_module.materialize_composite_suite = change_after_snapshot
+        try:
+            repeated = install_suite(
+                source=suite,
+                project_root=project,
+                harness="workbuddy",
+                ref=None,
+                framework_source=framework,
+            )
+        finally:
+            install_module.materialize_composite_suite = original_materialize
+
+        self.assertTrue(changed)
+        self.assertTrue(repeated["reused"])
+        current = project / ".selc" / "installs" / "business-copy-input" / "current"
+        installation = current_installation(project, "business-copy-input")
+        self.assertEqual(installation["version"], "1.0.0")
+        self.assertEqual(installation["business_digest"], initial["digest"])
+        self.assertNotIn(
+            "BUSINESS_EMBEDDED_RUNTIME_MARKER",
+            (current / "runtime" / "selc" / "__init__.py").read_text(encoding="utf-8"),
+        )
+
+    def test_inconsistent_framework_snapshot_is_rejected_and_cleaned(self) -> None:
+        """Snapshot validation rejects a partial descriptor/runtime change without resealing."""
+
+        suite = self.create_suite("framework-input-invalid", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        runtime_file = framework / "runtime" / "selc" / "__init__.py"
+        runtime_file.write_text(
+            runtime_file.read_text(encoding="utf-8") + "\nPARTIAL_RUNTIME_CHANGE = True\n",
+            encoding="utf-8",
+        )
+        project = self.root / "project"
+
+        import selc.install as install_module
+
+        original_temporary_directory = install_module.temporary_directory
+        owned_snapshots: list[Path] = []
+
+        @contextlib.contextmanager
+        def track_temporary_directory(prefix: str):
+            with original_temporary_directory(prefix) as temporary:
+                if prefix == "selc-install-input-":
+                    owned_snapshots.append(temporary)
+                yield temporary
+
+        install_module.temporary_directory = track_temporary_directory
+        try:
+            with self.assertRaises(SelcError) as captured:
+                install_suite(
+                    source=suite,
+                    project_root=project,
+                    harness="codex",
+                    ref=None,
+                    framework_source=framework,
+                )
+        finally:
+            install_module.temporary_directory = original_temporary_directory
+
+        self.assertEqual(captured.exception.code, "FRAMEWORK_HASH_MISMATCH")
+        self.assertTrue(owned_snapshots)
+        self.assertTrue(all(not snapshot.exists() for snapshot in owned_snapshots))
+        self.assertFalse((project / ".selc" / "installations.json").exists())
+
+    def test_framework_snapshot_rejects_runtime_and_descriptor_symlinks(self) -> None:
+        suite = self.create_suite("framework-symlink-input", ["text-report"])
+
+        for name, entry in (
+            ("runtime", "runtime/selc/__init__.py"),
+            ("descriptor", "framework.json"),
+        ):
+            with self.subTest(entry=entry):
+                framework = self.copy_external_framework(suite, f"framework-{name}")
+                original = framework / entry
+                outside = self.root / f"outside-{name}"
+                outside.write_bytes(original.read_bytes())
+                original.unlink()
+                original.symlink_to(outside)
+
+                with self.assertRaises(SelcError) as captured:
+                    install_suite(
+                        source=suite,
+                        project_root=self.root / f"project-{name}",
+                        harness="codex",
+                        ref=None,
+                        framework_source=framework,
+                    )
+
+                self.assertEqual(captured.exception.code, "UNSAFE_SYMLINK")
+
+    def test_successful_install_cleans_its_owned_input_snapshot(self) -> None:
+        suite = self.create_suite("framework-input-cleanup", ["text-report"])
+        project = self.root / "project"
+
+        import selc.install as install_module
+
+        original_temporary_directory = install_module.temporary_directory
+        owned_snapshots: list[Path] = []
+
+        @contextlib.contextmanager
+        def track_temporary_directory(prefix: str):
+            with original_temporary_directory(prefix) as temporary:
+                if prefix == "selc-install-input-":
+                    owned_snapshots.append(temporary)
+                yield temporary
+
+        install_module.temporary_directory = track_temporary_directory
+        try:
+            install_suite(source=suite, project_root=project, harness="codex", ref=None)
+        finally:
+            install_module.temporary_directory = original_temporary_directory
+
+        self.assertTrue(owned_snapshots)
+        self.assertTrue(all(not snapshot.exists() for snapshot in owned_snapshots))
 
     def test_implicit_install_rechecks_an_empty_framework_selection_snapshot(self) -> None:
         """A default install cannot overwrite a concurrent explicit selection."""
