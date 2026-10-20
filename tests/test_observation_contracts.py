@@ -339,6 +339,91 @@ class ObservationContractTests(unittest.TestCase):
             ("fail", "fail"),
         )
 
+    def test_feedback_revisions_replay_after_the_missing_predecessor_without_blocking_other_tasks(self) -> None:
+        database = self.database()
+        self.save_formal_pass(database)
+        revision_two = self.event(
+            kind="feedback",
+            native_event_id="feedback-r2",
+            phase="post_delivery",
+            facts={
+                "task_id": "task-a",
+                "delivery_id": "delivery-a",
+                "feedback_id": "review-thread",
+                "feedback_revision": 2,
+                "feedback_scope": "final",
+                "feedback_result": "fail",
+                "feedback_body_hash": "review-r2",
+                "actor": "human",
+                "origin": "managed_semantic",
+                "causation": "voluntary_feedback",
+            },
+        )
+        pending = observation.ingest(database, revision_two)
+        self.assertEqual(pending["replay"]["pending"], 1)
+        self.assertEqual(
+            (observation.assessment(database, "task-a")["first_result"],
+             observation.assessment(database, "task-a")["final_result"]),
+            ("unknown", "unknown"),
+        )
+
+        database.close()
+        database = self.database()
+        self.save_formal_pass(
+            database,
+            task_id="task-b",
+            call_id="call-b",
+            delivery_id="delivery-b",
+            native_prefix="other-task",
+        )
+        self.assertEqual(observation.assessment(database, "task-b")["final_result"], "pass")
+
+        revision_one = self.event(
+            kind="feedback",
+            native_event_id="feedback-r1",
+            phase="post_delivery",
+            facts={
+                "task_id": "task-a",
+                "delivery_id": "delivery-a",
+                "feedback_id": "review-thread",
+                "feedback_revision": 1,
+                "feedback_scope": "final",
+                "feedback_result": "fail",
+                "feedback_body_hash": "review-r1",
+                "actor": "human",
+                "origin": "managed_semantic",
+                "causation": "voluntary_feedback",
+            },
+        )
+        replayed = observation.ingest(database, revision_one)
+        self.assertEqual(replayed["replay"]["pending"], 0)
+        self.assertEqual(
+            (observation.assessment(database, "task-a")["first_result"],
+             observation.assessment(database, "task-a")["final_result"]),
+            ("fail", "fail"),
+        )
+
+        conflict = self.event(
+            kind="feedback",
+            native_event_id="feedback-r1-conflict",
+            phase="post_delivery",
+            facts={
+                "task_id": "task-a",
+                "delivery_id": "delivery-a",
+                "feedback_id": "review-thread",
+                "feedback_revision": 1,
+                "feedback_scope": "final",
+                "feedback_result": "pass",
+                "feedback_body_hash": "different-r1",
+                "actor": "human",
+                "origin": "managed_semantic",
+                "causation": "voluntary_feedback",
+            },
+        )
+        with self.assertRaises(SelcError) as captured:
+            observation.ingest(database, conflict)
+        self.assertEqual(captured.exception.code, "ID_CONFLICT")
+
     def test_unknown_checker_never_establishes_a_positive_formal_result(self) -> None:
         database = self.database()
         task = {

@@ -26,11 +26,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import selectors
 import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from dataclasses import dataclass
 from decimal import Decimal, localcontext
@@ -50,8 +50,8 @@ MAX_RESOURCE_IDENTIFIER_BYTES = 4_096
 MAX_SCRIPT_PAYLOAD_BYTES = 300_000
 MAX_EXACT_SUM_PRECISION = 8_192
 MAX_REASON_LENGTH = 512
-PROCESS_GRACE_SECONDS = 0.2
-PROCESS_CLEANUP_SECONDS = 1.0
+PROCESS_GRACE_SECONDS = 0.1
+PROCESS_CLEANUP_SECONDS = 0.25
 
 STATUS_PASS = "pass"
 STATUS_FAIL = "fail"
@@ -287,9 +287,12 @@ class JsonItemSummaryProvider:
 
         assert items is not None
         deduplicate_ids = bool(request.configuration.get("duplicate_ids_count_once", False))
-        count_result = _check_count_rule(items, artifact_value, deduplicate_ids)
-        sum_result = _check_sum_rule(items, artifact_value, deduplicate_ids)
-        return ProviderOutcome(rule_results=(count_result, sum_result))
+        rule_results: list[RuleResult] = []
+        if "count" in request.required_rule_ids:
+            rule_results.append(_check_count_rule(items, artifact_value, deduplicate_ids))
+        if "sum" in request.required_rule_ids:
+            rule_results.append(_check_sum_rule(items, artifact_value, deduplicate_ids))
+        return ProviderOutcome(rule_results=tuple(rule_results))
 
 
 class ScriptCheckerProvider:
@@ -397,32 +400,22 @@ class _ScriptCompleted:
 
 
 class _BoundedCapture:
-    """Drain a stream while retaining at most a fixed amount of evidence."""
+    """Retain bounded nonblocking pipe output without a reader thread."""
 
     def __init__(self, limit: int) -> None:
         self.limit = limit
         self._data = bytearray()
-        self._lock = threading.Lock()
         self.exceeded = False
 
-    def drain(self, stream: Any) -> None:
-        while True:
-            try:
-                chunk = stream.read(8_192)
-            except (OSError, ValueError):
-                return
-            if not chunk:
-                return
-            with self._lock:
-                available = self.limit + 1 - len(self._data)
-                if available > 0:
-                    self._data.extend(chunk[:available])
-                if len(chunk) > available or len(self._data) > self.limit:
-                    self.exceeded = True
+    def add(self, chunk: bytes) -> None:
+        available = self.limit + 1 - len(self._data)
+        if available > 0:
+            self._data.extend(chunk[:available])
+        if len(chunk) > available or len(self._data) > self.limit:
+            self.exceeded = True
 
     def bytes(self) -> bytes:
-        with self._lock:
-            return bytes(self._data[: self.limit])
+        return bytes(self._data[: self.limit])
 
 
 def _run_owned_script(
@@ -445,6 +438,7 @@ def _run_owned_script(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
+            bufsize=0,
         )
     except OSError:
         return _ScriptCompleted(b"", "checker-start-failed")
@@ -452,84 +446,138 @@ def _run_owned_script(
     assert process.stdin is not None
     assert process.stdout is not None
     assert process.stderr is not None
+    deadline = started_at + timeout_seconds
+    completed, reason = _communicate_until_deadline(
+        process=process,
+        payload=payload,
+        deadline=deadline,
+        max_stdout_bytes=max_stdout_bytes,
+        max_stderr_bytes=max_stderr_bytes,
+    )
+    if reason is not None and not _terminate_owned_process_group(process):
+        reason = "process-cleanup-incomplete"
+    if reason is None and not _ensure_process_group_is_empty(process.pid, process):
+        reason = "process-cleanup-incomplete"
+    _close_process_stdin(process.stdin)
+    _close_process_stream(process.stdout)
+    _close_process_stream(process.stderr)
+    return _ScriptCompleted(completed, reason)
+
+
+def _communicate_until_deadline(
+    *,
+    process: subprocess.Popen[bytes],
+    payload: bytes,
+    deadline: float,
+    max_stdout_bytes: int,
+    max_stderr_bytes: int,
+) -> tuple[bytes, str | None]:
+    """Exchange bounded bytes without waiting for inherited pipe descriptors.
+
+    A trusted script can still start a child that escapes its process group and
+    inherits stdout or stderr.  That child is outside the process group we own,
+    so the only safe response is a bounded ``process-cleanup-incomplete``
+    result.  In particular, this loop never calls a buffered ``close`` while a
+    reader could be blocked behind that unrelated child.
+    """
+
+    assert process.stdin is not None
+    assert process.stdout is not None
+    assert process.stderr is not None
     stdout_capture = _BoundedCapture(max_stdout_bytes)
     stderr_capture = _BoundedCapture(max_stderr_bytes)
-    stdout_thread = threading.Thread(
-        target=stdout_capture.drain,
-        args=(process.stdout,),
-        daemon=True,
-        name="selc-checker-stdout",
-    )
-    stderr_thread = threading.Thread(
-        target=stderr_capture.drain,
-        args=(process.stderr,),
-        daemon=True,
-        name="selc-checker-stderr",
-    )
-    stdout_thread.start()
-    stderr_thread.start()
-    stdin_thread = threading.Thread(
-        target=_write_process_stdin,
-        args=(process.stdin, payload),
-        daemon=True,
-        name="selc-checker-stdin",
-    )
-    stdin_thread.start()
+    streams = {
+        process.stdin.fileno(): (process.stdin, selectors.EVENT_WRITE, None),
+        process.stdout.fileno(): (process.stdout, selectors.EVENT_READ, stdout_capture),
+        process.stderr.fileno(): (process.stderr, selectors.EVENT_READ, stderr_capture),
+    }
+    for descriptor in streams:
+        os.set_blocking(descriptor, False)
+    payload_offset = 0
+    open_descriptors = set(streams)
+    selector = selectors.DefaultSelector()
+    for descriptor, (stream, events, _) in streams.items():
+        selector.register(descriptor, events, stream)
 
-    deadline = started_at + timeout_seconds
     reason: str | None = None
-    while process.poll() is None:
-        if stdout_capture.exceeded or stderr_capture.exceeded:
-            reason = "checker-output-limit"
-            break
-        if time.monotonic() >= deadline:
-            reason = "checker-timeout"
-            break
-        time.sleep(0.01)
+    try:
+        while open_descriptors:
+            now = time.monotonic()
+            if now >= deadline:
+                reason = "checker-timeout" if process.poll() is None else "process-cleanup-incomplete"
+                break
+            timeout = min(0.01, deadline - now)
+            for selected, mask in selector.select(timeout):
+                descriptor = selected.fd
+                stream, _, capture = streams[descriptor]
+                if capture is None and mask & selectors.EVENT_WRITE:
+                    try:
+                        written = os.write(descriptor, payload[payload_offset:])
+                    except (BlockingIOError, BrokenPipeError, OSError):
+                        written = 0
+                        _unregister_descriptor(selector, descriptor, open_descriptors)
+                    else:
+                        payload_offset += written
+                        if payload_offset == len(payload):
+                            _unregister_descriptor(selector, descriptor, open_descriptors)
+                            _close_process_stdin(stream)
+                elif capture is not None and mask & selectors.EVENT_READ:
+                    try:
+                        chunk = os.read(descriptor, 8_192)
+                    except BlockingIOError:
+                        continue
+                    except OSError:
+                        chunk = b""
+                    if not chunk:
+                        _unregister_descriptor(selector, descriptor, open_descriptors)
+                    else:
+                        capture.add(chunk)
+                        if capture.exceeded:
+                            reason = "checker-output-limit"
+                            break
+            if reason is not None:
+                break
+            if process.poll() is not None and not {
+                process.stdout.fileno(), process.stderr.fileno()
+            }.intersection(open_descriptors):
+                break
+    finally:
+        selector.close()
 
-    if reason is not None:
-        if not _terminate_owned_process_group(process):
-            reason = "process-cleanup-incomplete"
-    else:
-        process.wait()
-        if not _ensure_process_group_is_empty(process.pid, process):
-            reason = "process-cleanup-incomplete"
+    if reason is None:
+        if process.poll() is None:
+            reason = "checker-timeout"
         elif process.returncode != 0:
             if process.returncode < 0:
                 reason = f"checker-signaled:{-process.returncode}"
             else:
                 reason = f"checker-crashed:{process.returncode}"
-        elif stdout_capture.exceeded or stderr_capture.exceeded:
-            reason = "checker-output-limit"
-
-    stdout_thread.join(timeout=PROCESS_CLEANUP_SECONDS)
-    stderr_thread.join(timeout=PROCESS_CLEANUP_SECONDS)
-    stdin_thread.join(timeout=PROCESS_CLEANUP_SECONDS)
-    if stdin_thread.is_alive():
-        _close_process_stdin(process.stdin)
-        stdin_thread.join(timeout=PROCESS_CLEANUP_SECONDS)
-    if stdout_thread.is_alive() or stderr_thread.is_alive() or stdin_thread.is_alive():
-        reason = "process-cleanup-incomplete"
-    _close_process_stdin(process.stdin)
-    process.stdout.close()
-    process.stderr.close()
-
-    return _ScriptCompleted(stdout_capture.bytes(), reason)
+    return stdout_capture.bytes(), reason
 
 
-def _write_process_stdin(stream: Any, payload: bytes) -> None:
-    try:
-        stream.write(payload)
-    except (BrokenPipeError, OSError, ValueError):
+def _unregister_descriptor(
+    selector: selectors.BaseSelector, descriptor: int, open_descriptors: set[int]
+) -> None:
+    if descriptor not in open_descriptors:
         return
-    finally:
-        _close_process_stdin(stream)
+    try:
+        selector.unregister(descriptor)
+    except KeyError:
+        pass
+    open_descriptors.discard(descriptor)
 
 
 def _close_process_stdin(stream: Any) -> None:
     try:
         stream.close()
     except (BrokenPipeError, OSError, ValueError):
+        return
+
+
+def _close_process_stream(stream: Any) -> None:
+    try:
+        stream.close()
+    except OSError:
         return
 
 
@@ -782,7 +830,11 @@ def _normalise_rule_result(expected_rule_id: str, value: object) -> RuleResult:
         reason = value.get("reason")
     else:
         return RuleResult(expected_rule_id, STATUS_UNKNOWN, "malformed-rule-result")
-    if rule_id != expected_rule_id or status not in VALID_STATUSES:
+    if (
+        rule_id != expected_rule_id
+        or not isinstance(status, str)
+        or status not in VALID_STATUSES
+    ):
         return RuleResult(expected_rule_id, STATUS_UNKNOWN, "malformed-rule-result")
     if not isinstance(reason, str) or not reason or len(reason) > MAX_REASON_LENGTH:
         return RuleResult(expected_rule_id, STATUS_UNKNOWN, "malformed-rule-result")

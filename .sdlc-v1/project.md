@@ -30,6 +30,8 @@ SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成�
 
 ## 检查入口
 
+F-002发布目标为公开GitHub源码、SELC框架及简单合成套件的版本化可安装制品。T011先完成真实贡献PR、发布计划和制品准备；正式Validate/Review绑定实现后，由Ship执行已确认的Release和两端正式安装升级smoke。正式发布保留用户最后一次确认；源码推送或Draft PR不等于released。
+
 正式验证使用的主要命令如下，完整原始证据、绑定 commit 和适用范围见工程上下文。
 
 ```bash

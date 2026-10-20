@@ -12,6 +12,13 @@ from pathlib import Path
 from typing import Any
 
 from . import RUNTIME_VERSION, SCHEMA_VERSION
+from .checker_integration import (
+    check_result_payload,
+    inspect_script_checkers,
+    register_script_checker,
+    run_installed_check,
+)
+from .checkers import SubjectIdentity
 from .errors import SelcError
 from .evolve import (
     confirm_release,
@@ -217,6 +224,34 @@ def _parser() -> argparse.ArgumentParser:
     deleting.add_argument("--suite-id")
     deleting.add_argument("--before")
     deleting.add_argument("--apply", action="store_true")
+
+    checker = subcommands.add_parser(
+        "checker", help="register or inspect project-local trusted checker scripts"
+    )
+    checker_commands = checker.add_subparsers(dest="checker_command", required=True)
+    checker_register = checker_commands.add_parser(
+        "register-script", help="pin a maintainer-owned Python checker script"
+    )
+    _project(checker_register)
+    checker_register.add_argument("--name", required=True)
+    checker_register.add_argument("--version", required=True)
+    checker_register.add_argument("--script", type=_path, required=True)
+    checker_register.add_argument("--digest", required=True)
+    checker_register.add_argument("--rule", action="append", required=True)
+    checker_register.add_argument("--timeout-seconds", type=float, default=1.0)
+    checker_inspect = checker_commands.add_parser(
+        "inspect", help="show registered checker identities without running them"
+    )
+    _project(checker_inspect)
+
+    check = subcommands.add_parser(
+        "check", help="diagnose one declared installed-suite artifact check"
+    )
+    _project(check)
+    check.add_argument("--suite", required=True)
+    check.add_argument("--check-id", required=True)
+    check.add_argument("--input", type=_path, required=True)
+    check.add_argument("--artifact", type=_path, required=True)
 
     updates = subcommands.add_parser("updates", help="inspect or explicitly apply a suite update")
     update_commands = updates.add_subparsers(dest="updates_command", required=True)
@@ -584,6 +619,31 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
             }
         finally:
             database.close()
+    if command == "checker":
+        if arguments.checker_command == "register-script":
+            return {
+                "checker": register_script_checker(
+                    project_root=arguments.project_root,
+                    name=arguments.name,
+                    version=arguments.version,
+                    script_path=arguments.script,
+                    digest=arguments.digest,
+                    supported_rules=arguments.rule,
+                    timeout_seconds=arguments.timeout_seconds,
+                )
+            }
+        return {"checkers": inspect_script_checkers(arguments.project_root)}
+    if command == "check":
+        execution = run_installed_check(
+            project_root=arguments.project_root,
+            suite_id=arguments.suite,
+            check_id=arguments.check_id,
+            input_path=arguments.input,
+            artifact_path=arguments.artifact,
+            subject=SubjectIdentity("diagnostic", "diagnostic", "diagnostic"),
+            run_id=f"diagnostic:{arguments.suite}:{arguments.check_id}",
+        )
+        return {"check": check_result_payload(execution)}
     if command == "feedback":
         database = open_database(arguments.project_root)
         try:

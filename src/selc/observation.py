@@ -458,7 +458,13 @@ def _reduce_one(database: sqlite3.Connection, row: sqlite3.Row) -> str:
         try:
             _apply_projection(database, event)
         except SelcError as error:
-            if error.code in {"MISSING_TASK", "MISSING_CALL", "INVALID_DELIVERY_LINK", "INVALID_FEEDBACK_LINK"}:
+            if error.code in {
+                "MISSING_TASK",
+                "MISSING_CALL",
+                "INVALID_DELIVERY_LINK",
+                "INVALID_FEEDBACK_LINK",
+                "MISSING_FEEDBACK_REVISION",
+            }:
                 database.execute(
                     "UPDATE observation_events SET reason = ? WHERE event_id = ?",
                     (f"pending dependency: {error.code}", event["event_id"]),
@@ -676,6 +682,9 @@ def _refresh_assessment(database: sqlite3.Connection, task_id: str) -> None:
         formal_start=formal_start,
         input_ready=bool(task["input_ready"]),
         pending_count=pending_count,
+        pending_feedback_for_current_delivery=_pending_feedback_for_current_delivery(
+            database, task_id, delivery_rows
+        ),
         conflicted_event_ids=conflicted_event_ids,
         publication_gap=publication_gap,
         call_id=None,
@@ -723,6 +732,9 @@ def _refresh_assessment(database: sqlite3.Connection, task_id: str) -> None:
             formal_start=formal_start and call_formal_start,
             input_ready=bool(task["input_ready"]),
             pending_count=_pending_for_call(database, task_id, call_id),
+            pending_feedback_for_current_delivery=_pending_feedback_for_current_delivery(
+                database, task_id, call_deliveries
+            ),
             conflicted_event_ids=conflicted_event_ids,
             publication_gap=publication_gap,
             call_id=call_id,
@@ -764,6 +776,7 @@ def _assessment_for_scope(
     formal_start: bool,
     input_ready: bool,
     pending_count: int,
+    pending_feedback_for_current_delivery: bool,
     conflicted_event_ids: set[str],
     publication_gap: bool,
     call_id: str | None,
@@ -791,6 +804,8 @@ def _assessment_for_scope(
     reasons: list[str] = []
     if pending_count:
         reasons.append("pending_or_quarantined_events")
+    if pending_feedback_for_current_delivery:
+        reasons.append("pending_feedback_for_current_delivery")
     if execution_conflicts:
         reasons.append("native_identity_conflict")
     if gap:
@@ -831,12 +846,14 @@ def _assessment_for_scope(
             and final_formal
             and not gap
             and not final_delivery_conflicted
+            and not pending_feedback_for_current_delivery
         ):
             final_result = "pass"
     return (
         {"first_result": first_result, "final_result": final_result},
         {
             "pending_events": pending_count,
+            "pending_feedback_for_current_delivery": pending_feedback_for_current_delivery,
             "conflicts": len(execution_conflicts),
             "publication_gap": gap,
             "interventions": len(interventions),
@@ -848,6 +865,37 @@ def _assessment_for_scope(
             "reasons": reasons,
         },
     )
+
+
+def _pending_feedback_for_current_delivery(
+    database: sqlite3.Connection, task_id: str, deliveries: list[sqlite3.Row]
+) -> bool:
+    """Return whether unresolved original-requirement feedback can overturn the last delivery.
+
+    A pending event about another execution interval is not enough to erase a
+    separately verified current artifact.  A pending feedback revision tied to
+    that exact artifact is different: it can revise its outcome, so pass is not
+    justified until the feedback sequence can be projected.
+    """
+
+    if not deliveries:
+        return False
+    current_delivery_id = str(deliveries[-1]["delivery_id"])
+    rows = database.execute(
+        """SELECT kind, facts_json FROM observation_events
+        WHERE task_id = ? AND status IN ('pending', 'quarantined')""",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        if row["kind"] != "feedback":
+            continue
+        facts = json.loads(row["facts_json"])
+        if (
+            facts.get("delivery_id") == current_delivery_id
+            and facts.get("feedback_scope") != "requirement_change"
+        ):
+            return True
+    return False
 
 
 def _events_for_call(events: list[dict[str, Any]], call_id: str) -> list[dict[str, Any]]:

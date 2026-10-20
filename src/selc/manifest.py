@@ -28,6 +28,10 @@ FRONTMATTER_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 RUNTIME_PROTOCOL = 1
 SOURCE_BASELINE_NAME = "source-baseline.json"
 ASCII_SPACE = " "
+MAX_ARTIFACT_CHECKS = 64
+MAX_ARTIFACT_CHECK_CONFIGURATION_BYTES = 16_384
+MAX_ARTIFACT_CHECK_RULES = 64
+MAX_ARTIFACT_CHECK_IDENTIFIER_BYTES = 256
 
 
 def manifest_path(suite_root: Path) -> Path:
@@ -287,6 +291,185 @@ def validate_manifest(manifest: dict[str, Any], suite_root: Path) -> None:
     if not isinstance(skills, list) or not skills:
         raise SelcError("INVALID_MANIFEST", "skills must contain at least one skill", "add a skill")
     validate_declared_skills(suite_root, skills)
+    artifact_checks = normalize_artifact_checks(manifest.get("artifact_checks"))
+    validate_skill_artifact_check_references(skills, artifact_checks)
+
+
+def normalize_artifact_checks(value: object) -> dict[str, dict[str, Any]]:
+    """Validate optional protocol-1 artifact-check declarations.
+
+    Declarations select an already trusted checker identity and its business
+    rules. They deliberately contain no executable paths, argv values, or
+    environment settings. A project-local maintainer registry is responsible
+    for any external implementation selected at runtime.
+    """
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise SelcError(
+            "INVALID_MANIFEST",
+            "artifact_checks must be an object keyed by check id",
+            "declare each artifact check as an object",
+        )
+    if len(value) > MAX_ARTIFACT_CHECKS:
+        raise SelcError(
+            "INVALID_MANIFEST",
+            "artifact_checks exceeds the supported check limit",
+            "split the suite or keep at most 64 checks",
+        )
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for check_id, raw_declaration in value.items():
+        if not isinstance(check_id, str) or not NAME.fullmatch(check_id):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                "artifact check ids must be unique lowercase kebab-case identifiers",
+                "repair the artifact_checks keys",
+            )
+        if not isinstance(raw_declaration, dict):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} must be an object",
+                "repair the check declaration",
+            )
+        allowed = {
+            "checker",
+            "rule_version",
+            "required_rule_ids",
+            "configuration",
+            "require_network_isolation",
+        }
+        unexpected = set(raw_declaration).difference(allowed)
+        if unexpected:
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} has unsupported fields: {', '.join(sorted(unexpected))}",
+                "keep executable registration outside suite.json",
+            )
+
+        checker = raw_declaration.get("checker")
+        if not isinstance(checker, dict) or set(checker).difference({"name", "version", "digest"}):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} needs checker name and version",
+                "repair the checker declaration",
+            )
+        checker_name = checker.get("name")
+        checker_version = checker.get("version")
+        if not _bounded_artifact_check_string(checker_name) or not _bounded_artifact_check_string(
+            checker_version
+        ):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} checker name and version must be bounded strings",
+                "repair the checker declaration",
+            )
+        checker_digest = checker.get("digest")
+        if checker_digest is not None and not _artifact_check_digest(checker_digest):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} checker digest must be SHA-256 hex",
+                "omit it or use the trusted implementation digest",
+            )
+
+        rule_version = raw_declaration.get("rule_version")
+        if not _bounded_artifact_check_string(rule_version):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} rule_version must be a bounded string",
+                "set the rule version",
+            )
+        required_rule_ids = raw_declaration.get("required_rule_ids")
+        if (
+            not isinstance(required_rule_ids, list)
+            or not required_rule_ids
+            or len(required_rule_ids) > MAX_ARTIFACT_CHECK_RULES
+            or any(not _bounded_artifact_check_string(item) for item in required_rule_ids)
+            or len(set(required_rule_ids)) != len(required_rule_ids)
+        ):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} required_rule_ids must be unique bounded strings",
+                "declare one or more unique required rules",
+            )
+        configuration = raw_declaration.get("configuration")
+        if not isinstance(configuration, dict):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} configuration must be an object",
+                "use an object with JSON-compatible values",
+            )
+        try:
+            configuration_bytes = canonical_json(configuration).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} configuration is not JSON-compatible",
+                "use JSON-compatible configuration values",
+            ) from error
+        if len(configuration_bytes) > MAX_ARTIFACT_CHECK_CONFIGURATION_BYTES:
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} configuration exceeds the size limit",
+                "keep configuration at or below 16384 bytes",
+            )
+        require_network_isolation = raw_declaration.get("require_network_isolation", False)
+        if not isinstance(require_network_isolation, bool):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} require_network_isolation must be boolean",
+                "use true or false",
+            )
+        normalized[check_id] = {
+            "checker": {
+                "name": checker_name,
+                "version": checker_version,
+                **({"digest": checker_digest} if checker_digest is not None else {}),
+            },
+            "rule_version": rule_version,
+            "required_rule_ids": list(required_rule_ids),
+            "configuration": dict(configuration),
+            "require_network_isolation": require_network_isolation,
+        }
+    return normalized
+
+
+def validate_skill_artifact_check_references(
+    skills: list[Any], artifact_checks: dict[str, dict[str, Any]]
+) -> None:
+    """Ensure an optional skill ``artifact_check`` points to a declared check."""
+
+    for skill in skills:
+        if not isinstance(skill, dict):
+            continue
+        reference = skill.get("artifact_check")
+        if reference is None:
+            continue
+        if not isinstance(reference, str) or reference not in artifact_checks:
+            raise SelcError(
+                "INVALID_MANIFEST",
+                "skill artifact_check must name a declared artifact check",
+                "declare the check in artifact_checks or remove the reference",
+            )
+
+
+def _bounded_artifact_check_string(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value.encode("utf-8")) <= MAX_ARTIFACT_CHECK_IDENTIFIER_BYTES
+    )
+
+
+def _artifact_check_digest(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
 
 
 def normalize_declared_skills(skills: list[Any]) -> list[dict[str, str]]:

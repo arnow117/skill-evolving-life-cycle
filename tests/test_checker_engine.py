@@ -109,6 +109,21 @@ class CheckerEngineTests(unittest.TestCase):
 
         self.assertEqual(result.status, "pass")
 
+    def test_builtin_emits_only_the_requested_builtin_rules(self) -> None:
+        count_only = check_artifact(
+            self.request(required_rules=("count",), artifact_value={"count": 3, "sum": 999}),
+            self.registry,
+        )
+        sum_only = check_artifact(
+            self.request(required_rules=("sum",), artifact_value={"count": 999, "sum": 10}),
+            self.registry,
+        )
+
+        self.assertEqual(count_only.status, "pass")
+        self.assertEqual([(item.rule_id, item.status) for item in count_only.rule_results], [("count", "pass")])
+        self.assertEqual(sum_only.status, "pass")
+        self.assertEqual([(item.rule_id, item.status) for item in sum_only.rule_results], [("sum", "pass")])
+
     def test_json_sum_uses_exact_decimal_semantics_for_large_and_cancelling_values(self) -> None:
         rounded_false_pass = replace(
             self.request(),
@@ -369,6 +384,31 @@ json.dump(
         self.assertEqual(malformed.status, "unknown")
         self.assertEqual(malformed.rule_results[0].reason, "malformed-rule-result")
 
+    def test_non_string_script_status_is_malformed_not_an_engine_crash(self) -> None:
+        for invalid_status in ("[]", "{}"):
+            with self.subTest(invalid_status=invalid_status):
+                provider, identity = self.script_provider(
+                    "\n".join(
+                        (
+                            "import json",
+                            "import sys",
+                            "request = json.load(sys.stdin)",
+                            "json.dump({'protocol': 1, 'checker': request['checker'], 'results': [",
+                            "    {'rule_id': 'external', 'status': " + invalid_status + ", 'reason': 'bad'}",
+                            "]}, sys.stdout)",
+                        )
+                    )
+                )
+                registry = CheckerRegistry()
+                registry.register(identity, provider)
+
+                result = check_artifact(
+                    self.request(checker=identity, required_rules=("external",)), registry
+                )
+
+                self.assertEqual(result.status, "unknown")
+                self.assertEqual(result.rule_results[0].reason, "malformed-rule-result")
+
     def test_changed_registered_script_digest_prevents_side_effects(self) -> None:
         sentinel = self.root / "digest-mismatch-ran"
         provider, identity = self.script_provider(
@@ -589,6 +629,55 @@ time.sleep(30)
         while self.process_exists(child_pid) and time.monotonic() < deadline:
             time.sleep(0.02)
         self.assertFalse(self.process_exists(child_pid))
+
+    def test_escaped_pipe_holder_returns_by_deadline_without_reader_threads(self) -> None:
+        child_pid_file = self.root / "escaped-helper.pid"
+        provider, identity = self.script_provider(
+            """
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+request = json.load(sys.stdin)
+helper = subprocess.Popen(
+    [sys.executable, "-c", "import time; time.sleep(4)"],
+    stdout=sys.stdout,
+    stderr=sys.stderr,
+    start_new_session=True,
+)
+Path(request["configuration"]["child_pid_file"]).write_text(str(helper.pid), encoding="utf-8")
+""",
+            timeout_seconds=0.1,
+        )
+        registry = CheckerRegistry()
+        registry.register(identity, provider)
+
+        started = time.monotonic()
+        result = check_artifact(
+            self.request(
+                checker=identity,
+                required_rules=("external",),
+                configuration={"child_pid_file": str(child_pid_file)},
+            ),
+            registry,
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(result.status, "unknown")
+        self.assertEqual(result.reason, "process-cleanup-incomplete")
+        self.assertLess(elapsed, 0.6)
+        self.assertFalse(
+            any(thread.name.startswith("selc-checker-") for thread in threading.enumerate())
+        )
+        helper_pid = int(child_pid_file.read_text(encoding="utf-8"))
+        try:
+            os.kill(helper_pid, 0)
+        except ProcessLookupError:
+            pass
+        else:
+            os.kill(helper_pid, 9)
 
     def script_provider(
         self,

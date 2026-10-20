@@ -87,6 +87,29 @@ selc stats --project-root /tmp/selc-project --include-test
 
 Reports keep independent task and call denominators. Each axis exposes `N`, `S`, `K`, `U`, success lower bound `S_over_N`, known-result success `S_over_K`, and coverage `K_over_N`; zero denominators are `null`. First one-shot and final delivery stay separate. Necessary input and permission clicks are recorded with `event`; a `business_intervention` makes one-shot fail while final delivery can still be separately assessed. Ordinary self-report results are `unknown`; `--complete-observation-fixture` is rejected outside a test task. A trusted business check can establish final artifact success, but first one-shot remains `unknown` until a test fixture or a complete trusted host observation exists. A business intervention makes the task first result fail without copying that result to unrelated calls. A hard delivery failure stays failed. Feedback binds the original delivery requirement: legacy `first` and `final` scopes both refute that delivery, so a negative assessment changes its first and final outcome; a new passing remedial delivery can restore only the final outcome. A higher revision of the same feedback ID supersedes that feedback thread, while independent negative feedback remains effective. `requirement_change` records a later requirement without rewriting the original delivery. For a normal text report, `--checker text-report-v1 --rule-version text-report-v1 --input <input> --output <report>` performs the built-in, installed-resource check and binds the reported artifact hash; an arbitrary checker name does not prove success.
 
+## US-003A — Diagnose a declared artifact check
+
+An optional schema-1 `suite.json` `artifact_checks` object declares a fixed checker identity, rule version, required rule IDs, JSON configuration, and an optional OS-network-isolation requirement. A skill entry can name one declaration with `artifact_check`. Declarations contain no executable path, argv, or environment values. A missing declaration, unsupported rule, installed-byte drift, source change, unavailable checker, or manifest digest pin mismatch cannot produce a pass.
+
+```bash
+selc check --project-root /tmp/selc-project --suite simple-reports \
+  --check-id item-summary --input /tmp/items.json --artifact /tmp/summary.json
+```
+
+`check` reads fixed input and artifact bytes, runs the selected installed framework's trusted checker, then confirms that those source paths and the installed typed tree did not change. Its JSON result binds the active installation version and typed-tree digest separately from the checker's composite-byte digest, and includes the checker identity, input/artifact/resource digests, and each required rule result. It is diagnostic only: it creates no task, call, delivery, publication, or statistics denominator. A managed adapter can later attach the same internal result to its exact task/call/delivery with one short records transaction after execution.
+
+The built-in `json-item-summary@1` verifies JSON `items` against an artifact `count` and `sum` using exact decimal semantics. For a maintainer-owned extension, register a current digest-pinned local script in the project before any suite declaration selects it:
+
+```bash
+SCRIPT_DIGEST=$(shasum -a 256 /tmp/maintainer-checker.py | awk '{print $1}')
+selc checker register-script --project-root /tmp/selc-project \
+  --name custom-summary --version 1 --script /tmp/maintainer-checker.py \
+  --digest "$SCRIPT_DIGEST" --rule custom
+selc checker inspect --project-root /tmp/selc-project
+```
+
+The project registry is explicit and local; it does not accept a business request's executable, environment, or command line. The runtime verifies the script digest before starting a private snapshot. Script stdin/stdout/stderr and runtime are bounded, but this is not an OS sandbox. A declaration requiring OS-enforced network isolation returns `unknown` unless an implementation can actually provide it.
+
 The runtime also has an internal Python observation store for future managed host adapters: `selc.observation.ingest`, `replay`, `timeline`, and `assessment`. It accepts only a bounded v1 semantic DTO, persists its allowlisted identifiers, hashes, classification facts, and opaque evidence references before projection, and derives formal results from that evidence. Replay also restores assessments affected by persisted pending, quarantined, or conflicting evidence after a crash. A formal first pass requires complete execution evidence; a verifier-bound final pass can remain valid when unrelated execution evidence is incomplete, while a verified failure remains fail. Conflicted final-delivery evidence and publication gaps cannot establish a pass. There is no CLI input, automatic host discovery, managed receipt transport, or claim that either desktop host has complete observation coverage yet.
 
 Export and import only minimal result samples, not business artifacts or feedback bodies:

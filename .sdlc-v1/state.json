@@ -118,9 +118,9 @@
             "T008"
           ],
           "id": "T009",
-          "status": "todo",
+          "status": "done",
           "title": "业务checker套件声明、CLI与记录集成",
-          "updated_at": "2026-10-20T08:35:22Z"
+          "updated_at": "2026-10-20T10:00:43Z"
         },
         "T010": {
           "depends_on": [
@@ -140,9 +140,16 @@
           "status": "todo",
           "title": "真实评估、GitHub贡献和发布升级闭环",
           "updated_at": "2026-10-20T08:35:24Z"
+        },
+        "T012": {
+          "depends_on": [],
+          "id": "T012",
+          "status": "done",
+          "title": "最少native context实验工具准备",
+          "updated_at": "2026-10-20T10:05:51Z"
         }
       },
-      "updated_at": "2026-10-20T09:17:07Z",
+      "updated_at": "2026-10-20T10:05:51Z",
       "validation": {
         "at": null,
         "command": null,
@@ -176,7 +183,7 @@
       "product_context_ref": ".sdlc-v1/context/REQ-002.product.md",
       "status": "in_delivery",
       "title": "补齐 Codex 与 WorkBuddy 自动统计及业务验证扩展",
-      "updated_at": "2026-10-20T09:17:07Z"
+      "updated_at": "2026-10-20T10:05:51Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

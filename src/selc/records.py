@@ -97,6 +97,36 @@ def open_database(project_root: Path) -> sqlite3.Connection:
           sequence INTEGER NOT NULL,
           created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS checker_runs (
+          delivery_id TEXT PRIMARY KEY REFERENCES deliveries(delivery_id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(task_id),
+          call_id TEXT NOT NULL REFERENCES calls(call_id),
+          subject_delivery_id TEXT NOT NULL,
+          check_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          checker_name TEXT NOT NULL,
+          checker_version TEXT NOT NULL,
+          checker_digest TEXT NOT NULL,
+          rule_version TEXT NOT NULL,
+          result TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          input_digest TEXT NOT NULL,
+          artifact_digest TEXT NOT NULL,
+          resource_identity TEXT NOT NULL,
+          resource_digest TEXT NOT NULL,
+          composite_identity TEXT NOT NULL,
+          composite_digest TEXT NOT NULL,
+          installation_digest TEXT NOT NULL,
+          installation_version TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS checker_rule_results (
+          delivery_id TEXT NOT NULL REFERENCES checker_runs(delivery_id) ON DELETE CASCADE,
+          rule_id TEXT NOT NULL,
+          result TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          PRIMARY KEY(delivery_id, rule_id)
+        );
         CREATE TABLE IF NOT EXISTS feedback (
           feedback_id TEXT PRIMARY KEY,
           task_id TEXT NOT NULL REFERENCES tasks(task_id),
@@ -432,10 +462,21 @@ def _task(database: sqlite3.Connection, task_id: str) -> sqlite3.Row:
 
 
 def _validate_result(result: str) -> None:
-    if result not in {"pass", "fail", "unknown"}:
+    if not isinstance(result, str) or result not in {"pass", "fail", "unknown"}:
         raise SelcError(
             "INVALID_INPUT", "result must be pass, fail, or unknown", "provide a supported result"
         )
+
+
+@contextmanager
+def _transaction_if_needed(database: sqlite3.Connection) -> Iterable[None]:
+    """Use the caller's projection transaction without committing it early."""
+
+    if database.in_transaction:
+        yield
+        return
+    with database:
+        yield
 
 
 def start_task(
@@ -639,7 +680,7 @@ def record_delivery(
     _validate_result(declared_result)
     if checker_result is not None:
         _validate_result(checker_result)
-    with database:
+    with _transaction_if_needed(database):
         task = _task(database, task_id)
         if call_id is not None:
             call = database.execute(
@@ -747,6 +788,182 @@ def record_delivery(
         "sequence": sequence,
         "replayed": False,
     }
+
+
+def record_checked_delivery(database: sqlite3.Connection, execution: Any) -> dict[str, Any]:
+    """Atomically link a completed checker execution to its exact delivery.
+
+    ``execution`` is the internal ``CheckerExecution`` DTO from
+    ``checker_integration``.  Checkers run before this function is called, so
+    a long-running trusted script never holds the SQLite transaction.  Callers
+    that already own ``projection_transaction`` can safely use this helper: it
+    detects the active transaction and leaves commit ownership with the caller.
+    """
+
+    result = getattr(execution, "result", None)
+    check_id = getattr(execution, "check_id", None)
+    installation_digest = getattr(execution, "installation_digest", None)
+    installation_version = getattr(execution, "installation_version", None)
+    subject = getattr(result, "subject", None)
+    checker = getattr(result, "checker", None)
+    if (
+        not isinstance(check_id, str)
+        or not isinstance(installation_digest, str)
+        or not isinstance(installation_version, str)
+        or subject is None
+        or checker is None
+    ):
+        raise SelcError(
+            "INVALID_DELIVERY_CHECK",
+            "checked delivery needs a complete trusted checker execution",
+            "run the installed checker before recording the delivery",
+        )
+    task_id = getattr(subject, "task_id", None)
+    call_id = getattr(subject, "call_id", None)
+    delivery_id = getattr(subject, "delivery_id", None)
+    if not all(isinstance(value, str) and value for value in (task_id, call_id, delivery_id)):
+        raise SelcError(
+            "INVALID_DELIVERY_CHECK",
+            "checker subject must identify task, call, and delivery",
+            "bind the checker to the actual delivery identity",
+        )
+    _validate_result(getattr(result, "status", ""))
+    rule_results = tuple(getattr(result, "rule_results", ()))
+    if not rule_results:
+        raise SelcError(
+            "INVALID_DELIVERY_CHECK",
+            "checker result must include required rule outcomes",
+            "run a declared checker with one or more required rules",
+        )
+
+    checker_identity = {
+        "checker_input_hash": str(getattr(result, "input_digest", "")),
+        "checker_artifact_hash": str(getattr(result, "artifact_digest", "")),
+        "checker_resource_hash": str(getattr(result, "resource_digest", "")),
+        "checker_composite_hash": str(getattr(result, "composite_digest", "")),
+    }
+    with _transaction_if_needed(database):
+        task = _task(database, task_id)
+        call = database.execute(
+            "SELECT task_id, expected_version, expected_hash FROM calls WHERE call_id = ?",
+            (call_id,),
+        ).fetchone()
+        if call is None or call["task_id"] != task_id:
+            raise SelcError(
+                "INVALID_DELIVERY_LINK",
+                "checked delivery call must exist under the same task",
+                "record the managed call before its checked delivery",
+            )
+        if (
+            task["suite_version"] != installation_version
+            or call["expected_version"] != installation_version
+            or call["expected_hash"] != installation_digest
+        ):
+            raise SelcError(
+                "INSTALLATION_IDENTITY_DRIFT",
+                "checker execution does not match the task and call installation identity",
+                "start a new managed call for the selected installation",
+            )
+        delivery = record_delivery(
+            database,
+            delivery_id=delivery_id,
+            task_id=task_id,
+            call_id=call_id,
+            artifact_hash=checker_identity["checker_artifact_hash"],
+            rule_version=str(getattr(result, "rule_version", "")),
+            declared_result=str(getattr(result, "status", "")),
+            complete_fixture=False,
+            checker_id=f"{checker.name}@{checker.version}",
+            checker_verified=True,
+            checker_result=str(getattr(result, "status", "")),
+            checker_identity=checker_identity,
+        )
+        _store_checker_execution(
+            database,
+            execution=execution,
+            task_id=task_id,
+            call_id=call_id,
+            delivery_id=delivery_id,
+            rule_results=rule_results,
+        )
+    return delivery
+
+
+def _store_checker_execution(
+    database: sqlite3.Connection,
+    *,
+    execution: Any,
+    task_id: str,
+    call_id: str,
+    delivery_id: str,
+    rule_results: tuple[Any, ...],
+) -> None:
+    result = execution.result
+    checker = result.checker
+    expected = {
+        "delivery_id": delivery_id,
+        "task_id": task_id,
+        "call_id": call_id,
+        "subject_delivery_id": result.subject.delivery_id,
+        "check_id": execution.check_id,
+        "run_id": result.run_id,
+        "checker_name": checker.name,
+        "checker_version": checker.version,
+        "checker_digest": checker.digest,
+        "rule_version": result.rule_version,
+        "result": result.status,
+        "reason": result.reason,
+        "input_digest": result.input_digest,
+        "artifact_digest": result.artifact_digest,
+        "resource_identity": result.resource_identity,
+        "resource_digest": result.resource_digest,
+        "composite_identity": result.composite_identity,
+        "composite_digest": result.composite_digest,
+        "installation_digest": execution.installation_digest,
+        "installation_version": execution.installation_version,
+    }
+    existing = database.execute(
+        "SELECT * FROM checker_runs WHERE delivery_id = ?", (delivery_id,)
+    ).fetchone()
+    expected_rules = [
+        (str(item.rule_id), str(item.status), str(item.reason)) for item in rule_results
+    ]
+    if len({item[0] for item in expected_rules}) != len(expected_rules):
+        raise SelcError(
+            "INVALID_DELIVERY_CHECK",
+            "checker result repeats a rule id",
+            "keep one result for each required rule",
+        )
+    if existing is not None:
+        existing_rules = [
+            (str(row["rule_id"]), str(row["result"]), str(row["reason"]))
+            for row in database.execute(
+                "SELECT rule_id, result, reason FROM checker_rule_results "
+                "WHERE delivery_id = ? ORDER BY rule_id",
+                (delivery_id,),
+            ).fetchall()
+        ]
+        if (
+            all(existing[key] == value for key, value in expected.items())
+            and sorted(existing_rules) == sorted(expected_rules)
+        ):
+            return
+        raise SelcError(
+            "ID_CONFLICT",
+            "delivery already has different checker evidence",
+            "preserve the original checker result and use a new delivery id",
+        )
+    columns = ", ".join(expected)
+    placeholders = ", ".join("?" for _ in expected)
+    database.execute(
+        f"INSERT INTO checker_runs({columns}, created_at) VALUES ({placeholders}, ?)",
+        [*expected.values(), utc_now()],
+    )
+    database.executemany(
+        """INSERT INTO checker_rule_results(delivery_id, rule_id, result, reason)
+        VALUES (?, ?, ?, ?)""",
+        [(delivery_id, rule_id, status, reason) for rule_id, status, reason in expected_rules],
+    )
 
 
 def record_feedback(
@@ -1189,6 +1406,12 @@ def _project_feedback(
     ).fetchone()[0]
     expected_revision = int(latest) + 1 if latest is not None else 1
     if revision != expected_revision:
+        if revision > expected_revision:
+            raise SelcError(
+                "MISSING_FEEDBACK_REVISION",
+                f"feedback revision {expected_revision} is still pending",
+                "replay after the missing earlier revision arrives",
+            )
         raise SelcError(
             "REVISION_CONFLICT",
             f"expected feedback revision {expected_revision}",
@@ -1886,7 +2109,9 @@ def delete_records(
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
     imported_where = f"WHERE {' AND '.join(imported_filters)}" if imported_filters else ""
 
-    def selection() -> tuple[list[sqlite3.Row], list[sqlite3.Row], dict[str, Any]]:
+    def selection() -> tuple[
+        list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row], dict[str, Any]
+    ]:
         local_rows = database.execute(
             f"SELECT task_id, owner_origin, status, suite_id, created_at FROM tasks {where}", arguments
         ).fetchall()
@@ -1942,11 +2167,10 @@ def delete_records(
             "calls": active_calls,
             "sessions": active_sessions,
         }
-        preview["observation_rows"] = observation_rows
-        return local_rows, imported_rows, preview
+        return local_rows, imported_rows, observation_rows, preview
 
     if not apply:
-        _, _, preview = selection()
+        _, _, _, preview = selection()
         return {"preview": preview}
 
     # A reserved SQLite write transaction closes the direct-API race as well as
@@ -1955,7 +2179,7 @@ def delete_records(
     with database:
         database.execute("BEGIN IMMEDIATE")
         deletion_boundary = before or utc_now()
-        local_rows, imported_rows, preview = selection()
+        local_rows, imported_rows, observation_rows, preview = selection()
         active_leases = preview["active_leases"]
         if any(int(count) for count in active_leases.values()):
             raise SelcError(
@@ -1974,7 +2198,6 @@ def delete_records(
             suite_id, before_time, delete_epoch, created_at) VALUES (?, ?, ?, ?)""",
             (deleted_suite, deletion_boundary, deleted_epoch, utc_now()),
         )
-        observation_rows = preview.pop("observation_rows")
         for observation in observation_rows:
             stable_identity = observation["stable_identity"]
             if stable_identity is not None:
