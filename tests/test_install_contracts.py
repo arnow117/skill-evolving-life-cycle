@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -68,6 +70,16 @@ class InstallationContractsTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, expected, completed.stdout + completed.stderr)
         return json.loads(completed.stdout)
+
+    def cli_in_process(self, *arguments: str) -> tuple[int, dict[str, object]]:
+        """Invoke the public argparse path while an installation seam is controlled."""
+
+        import selc.cli as cli_module
+
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            exit_code = cli_module.main(list(arguments))
+        return exit_code, json.loads(output.getvalue())
 
     def copy_external_framework(self, suite: Path, name: str = "external-framework") -> Path:
         """Build a runtime-only source with exactly the suite's initial framework bytes."""
@@ -156,6 +168,8 @@ class InstallationContractsTests(unittest.TestCase):
         updated = self.cli(
             "updates",
             "apply",
+            "--source",
+            str(suite),
             "--suite-id",
             "selection-suite",
             "--project-root",
@@ -264,6 +278,221 @@ class InstallationContractsTests(unittest.TestCase):
         installation = current_installation(project, "embedded-repeat")
         self.assertEqual(installation["framework_source"]["status"], "active_embedded")
         self.assertEqual(installation["harnesses"], ["codex", "workbuddy"])
+
+    def test_cli_update_apply_preserves_omitted_framework_selection(self) -> None:
+        suite = self.create_suite("cli-implicit-framework", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        project = self.root / "project"
+        install_suite(
+            source=suite,
+            project_root=project,
+            harness="codex",
+            ref=None,
+            framework_source=framework,
+        )
+
+        updated = self.cli(
+            "updates",
+            "apply",
+            "--source",
+            str(suite),
+            "--project-root",
+            str(project),
+            "--harness",
+            "workbuddy",
+        )
+
+        self.assertTrue(updated["installation"]["reused"])
+        installation = current_installation(project, "cli-implicit-framework")
+        self.assertEqual(installation["framework_source"]["repo"], str(framework.resolve()))
+        self.assertEqual(installation["harnesses"], ["codex", "workbuddy"])
+
+    def test_cli_update_apply_rechecks_omitted_framework_selection(self) -> None:
+        """CLI omission retains the same compare-and-swap as ordinary install."""
+
+        suite = self.create_suite("cli-framework-race", ["text-report"])
+        framework_a = self.copy_external_framework(suite, "framework-a")
+        framework_b = self.copy_external_framework(suite, "framework-b")
+        self.change_external_framework(framework_b)
+        project = self.root / "project"
+        install_suite(
+            source=suite,
+            project_root=project,
+            harness="codex",
+            ref=None,
+            framework_source=framework_a,
+        )
+
+        import selc.install as install_module
+
+        original_install = install_module._install_materialized_suite
+        injected = False
+
+        def select_framework_b(**arguments: object) -> dict[str, object]:
+            nonlocal injected
+            if not injected:
+                injected = True
+                install_suite(
+                    source=suite,
+                    project_root=project,
+                    harness="codex",
+                    ref=None,
+                    framework_source=framework_b,
+                )
+            return original_install(**arguments)
+
+        install_module._install_materialized_suite = select_framework_b
+        try:
+            exit_code, result = self.cli_in_process(
+                "updates",
+                "apply",
+                "--source",
+                str(suite),
+                "--project-root",
+                str(project),
+                "--harness",
+                "workbuddy",
+            )
+        finally:
+            install_module._install_materialized_suite = original_install
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(result["error"]["code"], "STALE_FRAMEWORK_SELECTION")
+        installation = current_installation(project, "cli-framework-race")
+        self.assertEqual(installation["framework_source"]["repo"], str(framework_b.resolve()))
+        self.assertEqual(installation["harnesses"], ["codex"])
+        current = project / ".selc" / "installs" / "cli-framework-race" / "current"
+        self.assertEqual(tree_hash(current / "runtime"), tree_hash(framework_b / "runtime"))
+
+    def test_framework_only_apply_keeps_matching_directory_business(self) -> None:
+        suite = self.create_suite("framework-only-normal", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        project = self.root / "project"
+        install_suite(source=suite, project_root=project, harness="codex", ref=None)
+
+        updated = self.cli(
+            "updates",
+            "apply",
+            "--suite-id",
+            "framework-only-normal",
+            "--framework-source",
+            str(framework),
+            "--project-root",
+            str(project),
+            "--harness",
+            "codex",
+        )
+
+        self.assertEqual(updated["installation"]["version"], "1.0.0")
+        installation = current_installation(project, "framework-only-normal")
+        self.assertEqual(installation["framework_source"]["repo"], str(framework.resolve()))
+
+    def test_framework_only_apply_rejects_changed_directory_business(self) -> None:
+        suite = self.create_suite("framework-only-drift", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        project = self.root / "project"
+        install_suite(source=suite, project_root=project, harness="codex", ref=None)
+        self.change_embedded_framework(suite)
+
+        rejected = self.cli(
+            "updates",
+            "apply",
+            "--suite-id",
+            "framework-only-drift",
+            "--framework-source",
+            str(framework),
+            "--project-root",
+            str(project),
+            "--harness",
+            "codex",
+            expected=2,
+        )
+
+        self.assertEqual(rejected["error"]["code"], "STALE_BUSINESS_SELECTION")
+        installation = current_installation(project, "framework-only-drift")
+        self.assertEqual(installation["version"], "1.0.0")
+        current = project / ".selc" / "installs" / "framework-only-drift" / "current"
+        runtime = (current / "runtime" / "selc" / "__init__.py").read_text(encoding="utf-8")
+        self.assertNotIn("BUSINESS_EMBEDDED_RUNTIME_MARKER", runtime)
+
+    def test_framework_only_apply_rechecks_business_snapshot_at_activation(self) -> None:
+        repository = self.root / "business-repository"
+        repository.mkdir()
+        suite = repository / "suite"
+        project = self.root / "project"
+        create_suite("framework-only-race", "1.0.0", suite, ["text-report"])
+        framework = self.copy_external_framework(suite)
+        git(["init", "-b", "main"], repository)
+        git(["config", "user.name", "Fixture"], repository)
+        git(["config", "user.email", "fixture@example.test"], repository)
+        git(["add", "."], repository)
+        git(["commit", "-m", "business v1"], repository)
+        first_commit = git(["rev-parse", "HEAD"], repository)
+        git(["tag", "v1.0.0"], repository)
+        install_suite(
+            source=repository,
+            subdir="suite",
+            project_root=project,
+            harness="codex",
+            ref="v1.0.0",
+        )
+
+        self.change_embedded_framework(suite)
+        skill_path = suite / "skills" / "text-report" / "SKILL.md"
+        skill_path.write_text(
+            skill_path.read_text(encoding="utf-8") + "\nBUSINESS_V2_CONTENT_MARKER\n",
+            encoding="utf-8",
+        )
+        seal_suite(suite)
+        git(["add", "."], repository)
+        git(["commit", "-m", "business v2"], repository)
+        second_commit = git(["rev-parse", "HEAD"], repository)
+        git(["tag", "v1.1.0"], repository)
+
+        import selc.install as install_module
+
+        original_install = install_module._install_materialized_suite
+        injected = False
+
+        def apply_business_v2(**arguments: object) -> dict[str, object]:
+            nonlocal injected
+            if not injected:
+                injected = True
+                install_suite(
+                    source=repository,
+                    subdir="suite",
+                    project_root=project,
+                    harness="codex",
+                    ref="v1.1.0",
+                )
+            return original_install(**arguments)
+
+        install_module._install_materialized_suite = apply_business_v2
+        try:
+            exit_code, result = self.cli_in_process(
+                "updates",
+                "apply",
+                "--suite-id",
+                "framework-only-race",
+                "--framework-source",
+                str(framework),
+                "--project-root",
+                str(project),
+                "--harness",
+                "codex",
+            )
+        finally:
+            install_module._install_materialized_suite = original_install
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(result["error"]["code"], "STALE_BUSINESS_SELECTION")
+        installation = current_installation(project, "framework-only-race")
+        self.assertEqual(installation["version"], "1.1.0")
+        self.assertEqual(installation["source"]["commit"], second_commit)
+        self.assertNotEqual(installation["source"]["commit"], first_commit)
+        current = project / ".selc" / "installs" / "framework-only-race" / "current"
+        skill = (current / "skills" / "text-report" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("BUSINESS_V2_CONTENT_MARKER", skill)
 
     def test_implicit_install_preserves_external_git_source_baseline(self) -> None:
         suite = self.create_suite("git-selection", ["text-report"])

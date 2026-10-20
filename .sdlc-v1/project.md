@@ -6,7 +6,7 @@
 
 SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成物面向 Codex 与 WorkBuddy；产品权威为 `context/REQ-001.product.md`，当前工程方案为 `context/F-001.engineering.md`。AiTaxs 为延后试点，不是当前实现依赖。进度仅由 `state.json` 表示。
 
-用户已确认本地提交及继续验证/评审。首轮 commit-bound Validate 在 `7cab4b8` 发现框架来源复用与目录恢复缺陷，其失败证据保留。T-002 返修的 43 项测试及主 Agent 定向验收已通过，需绑定修复 commit 正式重验。技术栈为 Python >=3.11 标准库 CLI + SQLite + Git/uv；实际功能范围和证据以工程上下文的独立实际记录为准。
+用户已确认本地提交及继续验证/评审。首轮 `7cab4b8`、第二轮 `f1f3d20` 的验证失败证据保留。CLI 来源意图及业务快照返修已由主 Agent 接受，48 项测试和两份原失败复现均通过；正式 Validate 需绑定新的修复 commit。技术栈为 Python >=3.11 标准库 CLI + SQLite + Git/uv；实际功能范围和证据以工程上下文的独立实际记录为准。
 
 ## 约定与环境
 
@@ -24,7 +24,7 @@ SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成�
 | 本机记录 | `src/selc/records.py`，项目 `.selc/records.sqlite3` | 行为测试候选见工程实际记录 |
 | 安装与宿主适配 | `manifest.py` / `install.py`，生成物独立 entry | 本地结构与 portable CLI 测试；真实宿主 smoke 未运行 |
 | 更新/评估/贡献/发布 | `install.py` / `evolve.py`，portable suite runtime | 框架来源复用、目录恢复、缺省保留与选择并发复核已有返修证据；贡献仅 public GitHub/GitLab 和 local，真实外部执行未授权 |
-| 验证 | `tests/` 和 README 的 US-001 至 US-005 | 返修后 43 项本地测试通过，证据见工程 Validation；正式验证需绑定新实现 commit |
+| 验证 | `tests/` 和 README 的 US-001 至 US-005 | 48 项测试及原 CLI 并发失败已通过主 Agent 返修验收；正式验证等待新 commit，见工程 Validation |
 
 ## 检查入口
 

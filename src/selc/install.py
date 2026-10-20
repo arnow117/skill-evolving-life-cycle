@@ -487,6 +487,77 @@ def _active_external_framework_selection(
     return framework
 
 
+def business_selection_snapshot(installation: dict[str, Any]) -> dict[str, Any]:
+    """Capture the business identity that a framework-only update must retain."""
+
+    suite_id = installation.get("suite_id")
+    source = installation.get("source")
+    version = installation.get("version")
+    business_digest = installation.get("business_digest")
+    if (
+        not isinstance(suite_id, str)
+        or not isinstance(source, dict)
+        or not isinstance(version, str)
+        or not isinstance(business_digest, str)
+    ):
+        raise SelcError(
+            "MISSING_SOURCE_BASELINE",
+            "installed suite has no complete reusable business source",
+            "supply --source for this update",
+        )
+    return {
+        "suite_id": suite_id,
+        "source": dict(source),
+        "version": version,
+        "business_digest": business_digest,
+    }
+
+
+def _business_candidate_matches_snapshot(
+    manifest: dict[str, Any],
+    source_info: dict[str, Any],
+    business_digest: str,
+    snapshot: dict[str, Any],
+) -> bool:
+    expected_source = snapshot["source"]
+    return (
+        manifest["suite_id"] == snapshot["suite_id"]
+        and manifest["version"] == snapshot["version"]
+        and business_digest == snapshot["business_digest"]
+        and source_info.get("kind") == expected_source.get("kind")
+        and source_info.get("repo") == expected_source.get("repo")
+        and source_info.get("subdir") == expected_source.get("subdir")
+        and source_info.get("commit") == expected_source.get("commit")
+    )
+
+
+def _installed_business_matches_snapshot(
+    installation: dict[str, Any] | None,
+    snapshot: dict[str, Any],
+) -> bool:
+    if installation is None:
+        return False
+    return (
+        installation.get("suite_id") == snapshot["suite_id"]
+        and installation.get("source") == snapshot["source"]
+        and installation.get("version") == snapshot["version"]
+        and installation.get("business_digest") == snapshot["business_digest"]
+    )
+
+
+def _restore_business_source_baseline(
+    source_info: dict[str, Any], snapshot: dict[str, Any]
+) -> dict[str, Any]:
+    """Keep the saved stable ref after resolving its pinned commit."""
+
+    restored = dict(source_info)
+    expected_source = snapshot["source"]
+    restored["base"] = expected_source.get("base")
+    if "contribution_base" in expected_source:
+        restored["contribution_base"] = expected_source["contribution_base"]
+    return restored
+
+
 def install_suite(
     *,
     source: str | Path,
@@ -497,9 +568,21 @@ def install_suite(
     framework_source: str | Path | None = None,
     framework_ref: str | None = None,
     framework_subdir: str | None = None,
+    prepared_business_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     business_root, source_info = resolve_source(source, ref, subdir)
     manifest = load_manifest(business_root)
+    business_digest = portable_tree_hash(business_root)
+    if prepared_business_snapshot is not None:
+        if not _business_candidate_matches_snapshot(
+            manifest, source_info, business_digest, prepared_business_snapshot
+        ):
+            raise SelcError(
+                "STALE_BUSINESS_SELECTION",
+                "the saved business source no longer matches the installed business",
+                "retry with an explicit --source after reviewing the business update",
+            )
+        source_info = _restore_business_source_baseline(source_info, prepared_business_snapshot)
     implicit_framework_selection_observed = framework_source is None
     preserved_external_selection: dict[str, Any] | None = None
     if implicit_framework_selection_observed:
@@ -518,11 +601,12 @@ def install_suite(
             suite_root=business_root,
             source_info=source_info,
             framework_info=framework_info,
-            business_digest=portable_tree_hash(business_root),
+            business_digest=business_digest,
             project_root=project_root,
             harness=harness,
             preserved_external_selection=preserved_external_selection,
             implicit_framework_selection_observed=implicit_framework_selection_observed,
+            prepared_business_snapshot=prepared_business_snapshot,
         )
 
     if preserved_external_selection is not None:
@@ -551,11 +635,12 @@ def install_suite(
             suite_root=composite,
             source_info=source_info,
             framework_info=framework_info,
-            business_digest=portable_tree_hash(business_root),
+            business_digest=business_digest,
             project_root=project_root,
             harness=harness,
             preserved_external_selection=preserved_external_selection,
             implicit_framework_selection_observed=implicit_framework_selection_observed,
+            prepared_business_snapshot=prepared_business_snapshot,
         )
 
 
@@ -569,6 +654,7 @@ def _install_materialized_suite(
     harness: str,
     preserved_external_selection: dict[str, Any] | None = None,
     implicit_framework_selection_observed: bool = False,
+    prepared_business_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     manifest = load_manifest(suite_root)
     digest = portable_tree_hash(suite_root)
@@ -591,6 +677,14 @@ def _install_materialized_suite(
         database = open_database(project_root)
         leases = active_leases(database, suite_id)
         database.close()
+        if prepared_business_snapshot is not None and not _installed_business_matches_snapshot(
+            existing, prepared_business_snapshot
+        ):
+            raise SelcError(
+                "STALE_BUSINESS_SELECTION",
+                "the installed business changed while the framework-only update was prepared",
+                "retry the framework update against the current business version",
+            )
         if existing:
             current_external_selection = _active_external_framework_selection(existing)
             if (

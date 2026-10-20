@@ -26,6 +26,7 @@ from .evolve import (
     verify_local_release,
 )
 from .install import (
+    business_selection_snapshot,
     current_installation,
     framework_update_check,
     install_root,
@@ -657,6 +658,7 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
             business_source = arguments.business_source or arguments.source
             business_ref = arguments.ref
             business_subdir = arguments.subdir
+            prepared_business_snapshot: dict[str, Any] | None = None
             existing: dict[str, Any] | None = None
             if arguments.suite_id:
                 existing = current_installation(arguments.project_root, arguments.suite_id)
@@ -667,6 +669,7 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
                         "framework-only apply requires --suite-id for the installed business source",
                         "provide --source or select an installed suite",
                     )
+                prepared_business_snapshot = business_selection_snapshot(existing)
                 saved_source = existing["source"]
                 business_source = saved_source.get("repo")
                 business_ref = saved_source.get("commit") or saved_source.get("base")
@@ -686,15 +689,6 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
                 except SelcError as error:
                     if error.code != "MISSING_INSTALLATION":
                         raise
-            framework_source = arguments.framework_source
-            framework_ref = arguments.framework_ref
-            framework_subdir = arguments.framework_subdir
-            if framework_source is None and existing is not None:
-                saved_framework = existing["framework_source"]
-                if saved_framework.get("status") == "active_external":
-                    framework_source = saved_framework["repo"]
-                    framework_ref = saved_framework.get("commit") or saved_framework.get("base")
-                    framework_subdir = saved_framework.get("subdir")
             return {
                 "installation": install_suite(
                     source=business_source,
@@ -702,9 +696,10 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
                     harness=arguments.harness,
                     ref=business_ref,
                     subdir=business_subdir,
-                    framework_source=framework_source,
-                    framework_ref=framework_ref,
-                    framework_subdir=framework_subdir,
+                    framework_source=arguments.framework_source,
+                    framework_ref=arguments.framework_ref,
+                    framework_subdir=arguments.framework_subdir,
+                    prepared_business_snapshot=prepared_business_snapshot,
                 )
             }
         return recover_installation(arguments.project_root, arguments.suite_id)
