@@ -223,6 +223,130 @@ class InstallationContractsTests(unittest.TestCase):
         self.assertEqual(installation["framework_source"]["status"], "active_external")
         self.assertEqual(installation["harnesses"], ["codex", "workbuddy"])
 
+    def test_skill_path_defaults_are_normalized_without_rewriting_manifest_bytes(self) -> None:
+        for kind in ("omitted", "explicit-default", "explicit-custom"):
+            with self.subTest(kind=kind):
+                suite = self.create_suite(f"path-{kind}", ["text-report"])
+                manifest_path = suite / "suite.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                skill = manifest["skills"][0]
+                if kind == "omitted":
+                    del skill["path"]
+                elif kind == "explicit-custom":
+                    shutil.move(str(suite / "skills" / "text-report"), suite / "skills" / "custom")
+                    skill["path"] = "skills/custom"
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                seal_suite(suite)
+
+                loaded_manifest = load_manifest(suite)
+                self.assertEqual(
+                    loaded_manifest, json.loads(manifest_path.read_text(encoding="utf-8"))
+                )
+                package = self.root / f"path-{kind}.zip"
+                package_suite(suite, package)
+
+                candidate_parent = self.root / f"path-{kind}-candidate"
+                candidate = Path(prepare_candidate(suite, candidate_parent)["candidate"])
+                evaluation = self.root / f"path-{kind}-evaluation.json"
+                result = evaluate_candidate(
+                    candidate,
+                    evaluation,
+                    max_runs=8,
+                    model_calls=0,
+                    candidate_number=1,
+                    candidate_limit=2,
+                    run_timeout_seconds=10,
+                    total_timeout_seconds=60,
+                )
+                self.assertEqual(result["status"], "passed")
+
+                project = self.root / f"path-{kind}-project"
+                install_suite(source=package, project_root=project, harness="codex", ref=None)
+                install_suite(source=package, project_root=project, harness="workbuddy", ref=None)
+                self.assertEqual(
+                    recover_installation(project, f"path-{kind}"),
+                    {"recovered": False, "state": "no_journal"},
+                )
+                expected_relative = (
+                    "skills/custom" if kind == "explicit-custom" else "skills/text-report"
+                )
+                link = project / ".agents" / "skills" / "text-report"
+                self.assertTrue(link.is_symlink())
+                self.assertEqual(
+                    link.resolve(),
+                    (
+                        project
+                        / ".selc"
+                        / "installs"
+                        / f"path-{kind}"
+                        / "current"
+                        / expected_relative
+                    ).resolve(),
+                )
+
+    def test_omitted_skill_path_recovers_an_interrupted_dual_harness_registration(self) -> None:
+        """Journal recovery uses the same in-memory default path interpretation."""
+
+        suite = self.create_suite("path-omitted-recovery", ["text-report"])
+        manifest_path = suite / "suite.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        del manifest["skills"][0]["path"]
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        seal_suite(suite)
+
+        package = self.root / "path-omitted-recovery.zip"
+        package_suite(suite, package)
+        project = self.root / "path-omitted-recovery-project"
+        first = install_suite(source=package, project_root=project, harness="codex", ref=None)
+
+        import selc.install as install_module
+
+        original_write_registry = install_module._write_registry
+        writes = 0
+
+        def fail_once(project_root: Path, registry: dict[str, object]) -> None:
+            nonlocal writes
+            writes += 1
+            if writes == 1:
+                raise OSError("injected registry interruption")
+            original_write_registry(project_root, registry)
+
+        install_module._write_registry = fail_once
+        try:
+            with self.assertRaises(OSError):
+                install_suite(source=package, project_root=project, harness="workbuddy", ref=None)
+        finally:
+            install_module._write_registry = original_write_registry
+
+        journal = project / ".selc" / "installs" / "path-omitted-recovery" / "journal.json"
+        self.assertTrue(journal.is_file())
+        recovered = recover_installation(project, "path-omitted-recovery")
+        self.assertTrue(recovered["recovered"])
+        self.assertFalse(journal.exists())
+
+        active = current_installation(project, "path-omitted-recovery")
+        self.assertEqual(active["digest"], first["digest"])
+        self.assertEqual(active["harnesses"], ["codex", "workbuddy"])
+        self.assertEqual(
+            active["registrations"],
+            {"codex": ["text-report"], "workbuddy": ["text-report"]},
+        )
+        expected_skill = (
+            project
+            / ".selc"
+            / "installs"
+            / "path-omitted-recovery"
+            / "current"
+            / "skills"
+            / "text-report"
+        ).resolve()
+        for harness_path in (
+            project / ".agents" / "skills" / "text-report",
+            project / ".codebuddy" / "skills" / "text-report",
+        ):
+            self.assertTrue(harness_path.is_symlink())
+            self.assertEqual(harness_path.resolve(), expected_skill)
+
     def test_explicit_framework_uses_a_private_snapshot_for_metadata_and_runtime(self) -> None:
         """A later directory edit cannot split framework metadata from runtime bytes."""
 

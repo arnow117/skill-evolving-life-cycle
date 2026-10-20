@@ -32,7 +32,7 @@ from selc.evolve import (
     verify_local_release,
 )
 from selc.install import install_suite
-from selc.manifest import create_suite, suite_content_hash
+from selc.manifest import create_suite, load_manifest, package_suite, seal_suite, suite_content_hash
 
 
 def git(arguments: list[str], cwd: Path) -> str:
@@ -157,6 +157,7 @@ class BoundaryContractTests(unittest.TestCase):
         gitlab = json.dumps(
             [
                 {
+                    "state": "opened",
                     "source_branch": "codex/contribution-suite",
                     "target_branch": "main",
                     "sha": commit,
@@ -187,6 +188,28 @@ class BoundaryContractTests(unittest.TestCase):
             )
         self.assertEqual(forked_merge_request.exception.code, "REQUEST_CONFLICT")
 
+        for state, expected_code in (
+            ("closed", "REQUEST_INACTIVE"),
+            ("merged", "REQUEST_INACTIVE"),
+            (None, "REQUEST_QUERY_AMBIGUOUS"),
+        ):
+            with self.subTest(gitlab_state=state):
+                response = json.loads(gitlab)
+                if state is None:
+                    del response[0]["state"]
+                else:
+                    response[0]["state"] = state
+                with self.assertRaises(SelcError) as inactive:
+                    _parse_contribution_request(
+                        "gitlab",
+                        json.dumps(response),
+                        "gitlab.com/owner/center",
+                        "codex/contribution-suite",
+                        "main",
+                        commit,
+                    )
+                self.assertEqual(inactive.exception.code, expected_code)
+
         github_argv = contribution_query_argv(
             "github", "gh", "github.com/owner/center", "branch", "main"
         )
@@ -196,6 +219,151 @@ class BoundaryContractTests(unittest.TestCase):
         )
         self.assertEqual(gitlab_argv[:3], ["glab", "api", "--hostname"])
         self.assertIn("projects/owner%2Fcenter/merge_requests", gitlab_argv[-1])
+        self.assertIn("state=opened", gitlab_argv[-1])
+
+    def test_nested_skill_fields_do_not_satisfy_portable_top_level_requirements(self) -> None:
+        repository, suite = self.create_repository("nested-skill-suite", "suite")
+        skill = suite / "skills" / "text-report" / "SKILL.md"
+        skill.write_text(
+            "---\nmetadata:\n  name: text-report\n  description: nested only\n---\nBody\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(SelcError) as invalid_manifest:
+            load_manifest(suite)
+        self.assertEqual(invalid_manifest.exception.code, "INVALID_SKILL")
+        with self.assertRaises(SelcError) as invalid_seal:
+            seal_suite(suite)
+        self.assertEqual(invalid_seal.exception.code, "INVALID_SKILL")
+        with self.assertRaises(SelcError) as invalid_package:
+            package_suite(suite, self.root / "nested-skill-suite.zip")
+        self.assertEqual(invalid_package.exception.code, "INVALID_SKILL")
+
+        skill.write_text(
+            "---\nname: text-report\ndescription: valid top-level description\n---\nBody\n",
+            encoding="utf-8",
+        )
+        seal_suite(suite)
+        candidate = Path(prepare_candidate(suite, self.root / "nested-candidate")["candidate"])
+        nested_candidate_skill = candidate / "skills" / "text-report" / "SKILL.md"
+        nested_candidate_skill.write_text(
+            "---\nmetadata:\n  name: text-report\n  description: nested only\n---\nBody\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(SelcError) as invalid_candidate:
+            evaluate_candidate(
+                candidate,
+                self.root / "nested-evaluation.json",
+                max_runs=8,
+                model_calls=0,
+                candidate_number=1,
+                candidate_limit=2,
+                run_timeout_seconds=10,
+                total_timeout_seconds=60,
+            )
+        self.assertEqual(invalid_candidate.exception.code, "INVALID_SKILL")
+
+    def test_contribution_rejects_staged_or_committed_outside_changes(self) -> None:
+        repository, suite = self.create_repository("contribution-tree-safety", "suite")
+        outside = repository / "outside.txt"
+        outside.write_text("baseline\n", encoding="utf-8")
+        git(["add", "outside.txt"], repository)
+        git(["commit", "-m", "outside baseline"], repository)
+
+        candidate, evaluation = self.candidate_and_evaluation(suite, "contribution-tree-safety")
+        staged_workspace = self.root / "staged-outside-workspace"
+        staged_plan_path = self.root / "staged-outside-plan.json"
+        staged_plan = prepare_contribution(
+            candidate,
+            suite,
+            evaluation,
+            repository,
+            staged_workspace,
+            staged_plan_path,
+        )
+        staged_outside = staged_workspace / "outside.txt"
+        staged_outside.write_text("hidden staged change\n", encoding="utf-8")
+        git(["add", "outside.txt"], staged_workspace)
+        staged_outside.write_text("baseline\n", encoding="utf-8")
+        self.assertNotIn(
+            "outside.txt",
+            git(
+                ["diff", "--name-only", str(staged_plan["workspace_base_head"])],
+                staged_workspace,
+            ),
+        )
+        with self.assertRaises(SelcError) as staged_error:
+            execute_contribution(staged_plan_path, "local", None, None)
+        self.assertEqual(staged_error.exception.code, "UNSAFE_CONTRIBUTION")
+        self.assertEqual(
+            git(["rev-parse", "HEAD"], staged_workspace), staged_plan["workspace_base_head"]
+        )
+
+        recovery_workspace = self.root / "committed-outside-workspace"
+        recovery_plan_path = self.root / "committed-outside-plan.json"
+        recovery_plan = prepare_contribution(
+            candidate,
+            suite,
+            evaluation,
+            repository,
+            recovery_workspace,
+            recovery_plan_path,
+        )
+
+        import selc.evolve as evolve_module
+
+        original_run_argv = evolve_module.run_argv
+
+        def fail_push(arguments: list[str], **kwargs: object) -> str:
+            if arguments[:2] == ["git", "push"]:
+                raise SelcError(
+                    "COMMAND_FAILED",
+                    "injected push failure",
+                    "retry the same contribution plan",
+                )
+            return original_run_argv(arguments, **kwargs)
+
+        with (
+            patch.object(evolve_module, "run_argv", side_effect=fail_push),
+            self.assertRaises(SelcError) as initial_failure,
+        ):
+            execute_contribution(recovery_plan_path, "local", None, None)
+        self.assertEqual(initial_failure.exception.code, "COMMAND_FAILED")
+
+        recovered_outside = recovery_workspace / "outside.txt"
+        recovered_outside.write_text("amended outside change\n", encoding="utf-8")
+        git(["add", "outside.txt"], recovery_workspace)
+        git(["commit", "--amend", "--no-edit"], recovery_workspace)
+        recovered_outside.write_text("baseline\n", encoding="utf-8")
+        self.assertNotIn(
+            "outside.txt",
+            git(
+                ["diff", "--name-only", str(recovery_plan["workspace_base_head"])],
+                recovery_workspace,
+            ),
+        )
+
+        with self.assertRaises(SelcError) as committed_error:
+            execute_contribution(recovery_plan_path, "local", None, None)
+        self.assertEqual(committed_error.exception.code, "UNSAFE_CONTRIBUTION")
+
+        git(["checkout", "--", "outside.txt"], recovery_workspace)
+        self.assertEqual(git(["diff", "--name-only"], recovery_workspace), "")
+        with self.assertRaises(SelcError) as clean_workspace_error:
+            execute_contribution(recovery_plan_path, "local", None, None)
+        self.assertEqual(clean_workspace_error.exception.code, "UNSAFE_CONTRIBUTION")
+        remote_branch = subprocess.run(
+            [
+                "git",
+                "show-ref",
+                "--verify",
+                "--quiet",
+                f"refs/heads/{recovery_plan['branch']}",
+            ],
+            cwd=repository,
+            check=False,
+        )
+        self.assertNotEqual(remote_branch.returncode, 0)
 
     def test_empty_candidate_skill_cannot_be_evaluated_or_contributed(self) -> None:
         _, suite = self.create_repository("invalid-candidate-suite", "suite")
@@ -417,6 +585,69 @@ class BoundaryContractTests(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(central_branch.returncode, 0)
+
+    def test_gitlab_closed_request_is_not_reused_or_recreated(self) -> None:
+        repository, suite = self.create_repository("closed-gitlab-suite", "suite")
+        central = self.root / "closed-gitlab-central.git"
+        git(["clone", "--bare", str(repository), str(central)], self.root)
+        hosted_upstream = "https://gitlab.com/owner/central.git"
+        git(["remote", "add", "origin", hosted_upstream], repository)
+        candidate, evaluation = self.candidate_and_evaluation(suite, "closed-gitlab")
+        workspace = self.root / "closed-gitlab-workspace"
+        plan_path = self.root / "closed-gitlab-plan.json"
+        rewrite = {
+            "GIT_CONFIG_COUNT": "1",
+            "GIT_CONFIG_KEY_0": f"url.{central}.insteadOf",
+            "GIT_CONFIG_VALUE_0": hosted_upstream,
+        }
+
+        with patch.dict(os.environ, rewrite, clear=False):
+            plan = prepare_contribution(
+                candidate,
+                suite,
+                evaluation,
+                repository,
+                workspace,
+                plan_path,
+            )
+            query_log = self.root / "closed-gitlab-query.log"
+            create_log = self.root / "closed-gitlab-create.log"
+            client = self.root / "fake-closed-glab"
+            client.write_text(
+                "#!" + sys.executable + "\n"
+                "import json, subprocess, sys\n"
+                f"central = {str(central)!r}\n"
+                f"branch = {str(plan['branch'])!r}\n"
+                f"base = {str(plan['base_branch'])!r}\n"
+                f"query_log = {str(query_log)!r}\n"
+                f"create_log = {str(create_log)!r}\n"
+                "arguments = sys.argv[1:]\n"
+                "if arguments[:1] == ['api']:\n"
+                "    with open(query_log, 'a', encoding='utf-8') as handle:\n"
+                "        handle.write(json.dumps(arguments) + '\\n')\n"
+                "    commit = subprocess.check_output(\n"
+                "        ['git', '--git-dir', central, 'rev-parse', 'refs/heads/' + branch], text=True\n"
+                "    ).strip()\n"
+                "    print(json.dumps([{'state': 'closed', 'source_branch': branch, 'target_branch': base, 'sha': commit, 'source_project_id': 17, 'target_project_id': 17}]))\n"
+                "    raise SystemExit(0)\n"
+                "if arguments[:2] == ['mr', 'create']:\n"
+                "    open(create_log, 'w', encoding='utf-8').write('unexpected create')\n"
+                "    raise SystemExit(9)\n"
+                "raise SystemExit(8)\n",
+                encoding="utf-8",
+            )
+            client.chmod(0o700)
+
+            with self.assertRaises(SelcError) as closed_execute:
+                execute_contribution(plan_path, "gitlab", "owner/central", str(client))
+            self.assertEqual(closed_execute.exception.code, "REQUEST_INACTIVE")
+            with self.assertRaises(SelcError) as closed_verify:
+                verify_contribution(plan_path, "gitlab", str(client))
+            self.assertEqual(closed_verify.exception.code, "REQUEST_INACTIVE")
+
+        self.assertFalse(create_log.exists())
+        query_argv = json.loads(query_log.read_text(encoding="utf-8").splitlines()[0])
+        self.assertIn("state=opened", query_argv[-1])
 
     def test_release_center_boundary_rejects_an_escaping_releases_symlink(self) -> None:
         repository, suite = self.create_repository("release-suite", "suite")

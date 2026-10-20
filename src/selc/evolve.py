@@ -18,6 +18,7 @@ from .errors import SelcError
 from .manifest import (
     load_framework,
     load_manifest,
+    normalize_declared_skills,
     package_suite,
     portable_tree_hash,
     render_text_report,
@@ -56,9 +57,7 @@ def prepare_candidate(suite_root: Path, output: Path) -> dict[str, Any]:
     shutil.copytree(suite_root / "resources", candidate / "resources")
     shutil.copytree(suite_root / "resources", output / "baseline-resources")
     baseline_hash = tree_hash(suite_root)
-    declared_skills = [
-        {"name": str(skill["name"]), "path": str(skill["path"])} for skill in manifest["skills"]
-    ]
+    declared_skills = normalize_declared_skills(manifest["skills"])
     protected = {
         "schema_version": 1,
         "suite_id": manifest["suite_id"],
@@ -816,7 +815,8 @@ def contribution_query_argv(
             "--hostname",
             host,
             f"projects/{encoded_namespace}/merge_requests"
-            f"?source_branch={quote(branch, safe='')}&target_branch={quote(base_branch, safe='')}",
+            f"?source_branch={quote(branch, safe='')}&target_branch={quote(base_branch, safe='')}"
+            "&state=opened",
         ]
     raise SelcError(
         "UNSUPPORTED_PROVIDER", f"unsupported provider: {provider}", "choose github or gitlab"
@@ -864,16 +864,6 @@ def contribution_create_argv(
             "--description",
             note_path.read_text(encoding="utf-8"),
         ]
-    raise SelcError(
-        "UNSUPPORTED_PROVIDER", f"unsupported provider: {provider}", "choose github or gitlab"
-    )
-
-
-def contribution_verify_argv(provider: str, client: str, repository: str, branch: str) -> list[str]:
-    if provider == "github":
-        return [client, "pr", "view", branch, "--repo", repository]
-    if provider == "gitlab":
-        return [client, "mr", "view", branch, "--repo", repository]
     raise SelcError(
         "UNSUPPORTED_PROVIDER", f"unsupported provider: {provider}", "choose github or gitlab"
     )
@@ -943,26 +933,56 @@ def _business_diff(baseline_root: Path, candidate_root: Path) -> str:
 
 
 def _assert_workspace_changes_are_safe(workspace: Path, plan: dict[str, Any]) -> None:
-    """Reject tracked and untracked changes outside the prepared suite surface."""
+    """Reject uncommitted index and worktree changes outside the prepared surface."""
 
-    source_commit = str(plan["workspace_base_head"])
-    tracked = run_argv(
-        ["git", "diff", "--name-only", "--no-renames", source_commit], cwd=workspace
+    staged = run_argv(
+        ["git", "diff", "--cached", "--name-only", "--no-renames"], cwd=workspace
     ).splitlines()
+    unstaged = run_argv(["git", "diff", "--name-only", "--no-renames"], cwd=workspace).splitlines()
     untracked = run_argv(
         ["git", "ls-files", "--others", "--exclude-standard"], cwd=workspace
     ).splitlines()
     suite_subdir = str(plan["suite_subdir"])
-    for name in sorted({*tracked, *untracked}):
+    for name in sorted({*staged, *unstaged}):
+        _assert_controlled_contribution_path(Path(name), suite_subdir)
+    for name in sorted(untracked):
         if name == "SELC_CONTRIBUTION.md" and _is_expected_contribution_note(workspace, plan):
             continue
-        path = Path(name)
-        if not _is_controlled_contribution_path(path, suite_subdir):
-            raise SelcError(
-                "UNSAFE_CONTRIBUTION",
-                f"prepared workspace contains an unexpected change: {name}",
-                "recreate the contribution workspace",
-            )
+        _assert_controlled_contribution_path(Path(name), suite_subdir)
+
+
+def _assert_controlled_contribution_path(path: Path, suite_subdir: str) -> None:
+    if _is_controlled_contribution_path(path, suite_subdir):
+        return
+    raise SelcError(
+        "UNSAFE_CONTRIBUTION",
+        f"prepared workspace contains an unexpected change: {path.as_posix()}",
+        "recreate the contribution workspace",
+    )
+
+
+def _assert_contribution_commit_paths_are_safe(
+    workspace: Path, contribution_commit: str, plan: dict[str, Any]
+) -> None:
+    """Check the actual baseline-to-commit tree, not only the mutable worktree."""
+
+    baseline = str(plan["workspace_base_head"])
+    changed_paths = run_argv(
+        [
+            "git",
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "--no-renames",
+            "-r",
+            baseline,
+            contribution_commit,
+        ],
+        cwd=workspace,
+    ).splitlines()
+    suite_subdir = str(plan["suite_subdir"])
+    for name in sorted(changed_paths):
+        _assert_controlled_contribution_path(Path(name), suite_subdir)
 
 
 def _contribution_note(plan: dict[str, Any]) -> str:
@@ -1095,13 +1115,28 @@ def _parse_contribution_request(
                     "GitLab request query lacks source or target project identity",
                     "inspect the fixed repository before retrying",
                 )
-            if (
+            matches_identity = (
                 item.get("source_branch") == branch
                 and item.get("target_branch") == base_branch
                 and item.get("sha") == commit
                 and source_project == target_project
-            ):
-                return "matching"
+            )
+            if not matches_identity:
+                continue
+            state = item.get("state")
+            if not isinstance(state, str):
+                raise SelcError(
+                    "REQUEST_QUERY_AMBIGUOUS",
+                    "GitLab request query lacks an opened-state value",
+                    "inspect the fixed repository before retrying",
+                )
+            if state != "opened":
+                raise SelcError(
+                    "REQUEST_INACTIVE",
+                    "GitLab returned a matching contribution request that is not opened",
+                    "inspect the inactive request and prepare a new contribution if needed",
+                )
+            return "matching"
     else:
         raise SelcError(
             "UNSUPPORTED_PROVIDER",
@@ -1150,6 +1185,7 @@ def _assert_committed_workspace_matches_plan(
 ) -> None:
     """Re-read the actual Git commit before push, rather than trusting the index."""
 
+    _assert_contribution_commit_paths_are_safe(workspace, contribution_commit, plan)
     with tempfile.TemporaryDirectory(prefix="selc-contribution-verify-") as temporary:
         checkout = Path(temporary) / "checkout"
         run_argv(["git", "clone", "--no-checkout", str(workspace), str(checkout)])

@@ -78,7 +78,7 @@ def write_release_fake(
             'if [ "$1" = api ]; then\n'
             f'  if [ ! -f "{request_state}" ]; then printf "[]"; exit 0; fi\n'
             f'  IFS="|" read branch commit < "{request_state}"\n'
-            '  printf \'[{"source_branch":"%s","target_branch":"main","sha":"%s","source_project_id":17,"target_project_id":17}]\' "$branch" "$commit"\n'
+            '  printf \'[{"state":"opened","source_branch":"%s","target_branch":"main","sha":"%s","source_project_id":17,"target_project_id":17}]\' "$branch" "$commit"\n'
             "  exit 0\n"
             "fi\n"
             'if [ "$1" = mr ] && [ "$2" = create ]; then\n'

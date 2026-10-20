@@ -287,10 +287,16 @@ def validate_manifest(manifest: dict[str, Any], suite_root: Path) -> None:
     validate_declared_skills(suite_root, skills)
 
 
-def validate_declared_skills(suite_root: Path, skills: list[Any]) -> None:
-    """Validate manifest-owned skill names, paths, and portable bodies."""
+def normalize_declared_skills(skills: list[Any]) -> list[dict[str, str]]:
+    """Return manifest skill entries with the documented default path applied.
+
+    The normal form is intentionally derived in memory.  Consumers share it for
+    file lookup and registration, while ``load_manifest`` continues to preserve
+    the exact manifest bytes and its content hash.
+    """
 
     names: set[str] = set()
+    normalized: list[dict[str, str]] = []
     for skill in skills:
         if not isinstance(skill, dict) or not isinstance(skill.get("name"), str):
             raise SelcError("INVALID_MANIFEST", "each skill requires a name", "repair suite.json")
@@ -310,6 +316,16 @@ def validate_declared_skills(suite_root: Path, skills: list[Any]) -> None:
                 "repair the declared skill path",
             )
         relative = require_relative_path(relative_value)
+        normalized.append({"name": name, "path": relative.as_posix()})
+    return normalized
+
+
+def validate_declared_skills(suite_root: Path, skills: list[Any]) -> None:
+    """Validate manifest-owned skill names, paths, and portable bodies."""
+
+    for skill in normalize_declared_skills(skills):
+        name = skill["name"]
+        relative = Path(skill["path"])
         skill_file = suite_root / relative / "SKILL.md"
         if not skill_file.is_file():
             raise SelcError(
@@ -355,6 +371,12 @@ def validate_skill_structure(skill_file: Path, declared_name: str) -> None:
     for line in lines[1:closing_index]:
         if not line.strip() or line.lstrip().startswith("#"):
             continue
+        if line[0].isspace():
+            raise SelcError(
+                "INVALID_SKILL",
+                f"skill frontmatter has an unsupported nested field: {skill_file}",
+                "use supported top-level name and description scalars",
+            )
         if ":" not in line:
             raise SelcError(
                 "INVALID_SKILL",
@@ -362,7 +384,8 @@ def validate_skill_structure(skill_file: Path, declared_name: str) -> None:
                 "use simple scalar name and description fields",
             )
         key, raw_value = line.split(":", maxsplit=1)
-        key = key.strip()
+        if key not in {"name", "description"}:
+            continue
         value = _portable_frontmatter_scalar(raw_value.strip())
         if key in {"name", "description"}:
             if key in values:

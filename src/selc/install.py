@@ -18,6 +18,7 @@ from .manifest import (
     load_framework,
     load_manifest,
     materialize_composite_suite,
+    normalize_declared_skills,
     portable_tree_hash,
 )
 from .records import active_leases, open_database
@@ -432,7 +433,9 @@ def _sync_harness_skills(
 
     base = _harness_base(project_root, harness)
     base.mkdir(parents=True, exist_ok=True)
-    paths = {str(skill["name"]): str(skill["path"]) for skill in manifest["skills"]}
+    paths = {
+        skill["name"]: skill["path"] for skill in normalize_declared_skills(manifest["skills"])
+    }
     desired_names = set(paths)
     for skill_name in set(previous_names) - desired_names:
         link = base / skill_name
@@ -983,7 +986,9 @@ def _assert_installation_state(
             "run updates recover and restore the package contents",
         )
     manifest = load_manifest(expected)
-    skill_paths = {str(skill["name"]): str(skill["path"]) for skill in manifest["skills"]}
+    skill_paths = {
+        skill["name"]: skill["path"] for skill in normalize_declared_skills(manifest["skills"])
+    }
     registry = _registry(project_root)
     if registry["installations"].get(suite_id) != installation:
         raise SelcError(

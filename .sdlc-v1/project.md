@@ -6,7 +6,7 @@
 
 SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成物面向 Codex 与 WorkBuddy；产品权威为 `context/REQ-001.product.md`，当前工程方案为 `context/F-001.engineering.md`。AiTaxs 为延后试点，不是当前实现依赖。进度仅由 `state.json` 表示。
 
-用户已确认本地提交及继续验证/评审。前四轮正式验证失败证据保留。`a537f62` 正式 Validate 通过；首次独立整体 Review 提出 F1–F9，T003 修正按 API007–011 已接受 Build（66 tests、README US001–005 实际旅程），待本地提交后正式 Validate/Review。技术栈为 Python >=3.11 标准库 CLI + SQLite + Git/uv；实际功能范围和证据以工程上下文的独立实际记录为准。
+用户已确认本地提交及继续验证/评审。前四轮正式验证失败和全部 Review 记录保留。`6a5814f` 正式 Validate PASS；第二轮独立 Review 的四项边界缺陷按 API012 修正，主 Agent 已接受同一 T003 Build（71 tests、README 实际旅程和 journal 恢复回归），待新 commit 的正式验证/评审。技术栈为 Python >=3.11 标准库 CLI + SQLite + Git/uv；实际功能范围和证据以工程上下文的独立实际记录为准。
 
 ## 约定与环境
 
@@ -24,7 +24,7 @@ SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成�
 | 本机记录 | `src/selc/records.py`，项目 `.selc/records.sqlite3` | 行为测试候选见工程实际记录 |
 | 安装与宿主适配 | `manifest.py` / `install.py`，生成物独立 entry | 本地结构与 portable CLI 测试；真实宿主 smoke 未运行 |
 | 更新/评估/贡献/发布 | `install.py` / `evolve.py`，portable suite runtime | 框架来源复用、目录恢复、缺省保留与选择并发复核已有返修证据；贡献仅 public GitHub/GitLab 和 local，真实外部执行未授权 |
-| 验证 | `tests/` 和 README 的 US-001 至 US-005 | a537f62 正式 Validate PASS，56 项测试及 SC001–007 本地范围证据，见工程 Validation |
+| 验证 | `tests/` 和 README 的 US-001 至 US-005 | 6a5814f 正式 Validate PASS，66 项测试及 SC001–007 本地范围证据，见工程 Validation |
 
 ## 检查入口
 
