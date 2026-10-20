@@ -24,9 +24,18 @@
           "status": "done",
           "title": "实现可运行 SELC 与简单双宿主套件闭环",
           "updated_at": "2026-10-19T18:36:52Z"
+        },
+        "T-002": {
+          "depends_on": [
+            "T-001"
+          ],
+          "id": "T-002",
+          "status": "done",
+          "title": "修正正式验证发现的框架来源复用和目录恢复缺陷",
+          "updated_at": "2026-10-20T00:59:05Z"
         }
       },
-      "updated_at": "2026-10-19T18:36:52Z",
+      "updated_at": "2026-10-20T00:59:05Z",
       "validation": {
         "at": null,
         "command": null,
@@ -47,7 +56,7 @@
       "product_context_ref": ".sdlc-v1/context/REQ-001.product.md",
       "status": "in_delivery",
       "title": "Skill Evolving Life Cycle 的创建、观测与迭代方案",
-      "updated_at": "2026-10-19T18:36:52Z"
+      "updated_at": "2026-10-20T00:59:05Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

@@ -1,12 +1,12 @@
 # SELC 项目上下文
 
-更新：2026-10-20。项目根为本文件上两级的独立 Git 仓库；当前实际分支 `codex/design`，无初始 commit、无 remote。
+更新：2026-10-20。项目根为本文件上两级的独立 Git 仓库；分支 `codex/design`，初始实现 commit `7cab4b8`，修正版沿同分支推进，当前业务版本以 Git HEAD/正式 validation 绑定为准，无 remote。
 
 ## 定位与事实
 
 SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成物面向 Codex 与 WorkBuddy；产品权威为 `context/REQ-001.product.md`，当前工程方案为 `context/F-001.engineering.md`。AiTaxs 为延后试点，不是当前实现依赖。进度仅由 `state.json` 表示。
 
-当前实现已由主 Agent 接受 Build，36 项本地测试及独立有界快照复查通过；正式 commit-bound Validate/Review 待本地提交许可。技术栈为 Python >=3.11 标准库 CLI + SQLite + Git/uv；实际功能范围和证据以工程上下文的独立实际记录为准。
+用户已确认本地提交及继续验证/评审。首轮 commit-bound Validate 在 `7cab4b8` 发现框架来源复用与目录恢复缺陷，其失败证据保留。T-002 返修的 43 项测试及主 Agent 定向验收已通过，需绑定修复 commit 正式重验。技术栈为 Python >=3.11 标准库 CLI + SQLite + Git/uv；实际功能范围和证据以工程上下文的独立实际记录为准。
 
 ## 约定与环境
 
@@ -23,8 +23,8 @@ SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成�
 | 作者 skill/CLI | `.claude/skills/selc/`、`scripts/selc.py`、`src/selc/cli.py` | 创建/creator 改写/seal/打包本地流程通过 |
 | 本机记录 | `src/selc/records.py`，项目 `.selc/records.sqlite3` | 行为测试候选见工程实际记录 |
 | 安装与宿主适配 | `manifest.py` / `install.py`，生成物独立 entry | 本地结构与 portable CLI 测试；真实宿主 smoke 未运行 |
-| 更新/评估/贡献/发布 | `install.py` / `evolve.py`，portable suite runtime | 本地与受控 provider 测试通过；贡献仅 public GitHub/GitLab 和 local，真实外部执行未授权 |
-| 验证 | `tests/` 和 README 的 US-001 至 US-005 | 36 项测试、README journey 和有界独立快照复查通过；正式 lifecycle 验证待提交 |
+| 更新/评估/贡献/发布 | `install.py` / `evolve.py`，portable suite runtime | 框架来源复用、目录恢复、缺省保留与选择并发复核已有返修证据；贡献仅 public GitHub/GitLab 和 local，真实外部执行未授权 |
+| 验证 | `tests/` 和 README 的 US-001 至 US-005 | 返修后 43 项本地测试通过，证据见工程 Validation；正式验证需绑定新实现 commit |
 
 ## 检查入口
 

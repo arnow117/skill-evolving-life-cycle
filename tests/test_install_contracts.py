@@ -28,7 +28,13 @@ from selc.evolve import (
     verify_local_release,
 )
 from selc.install import current_installation, install_suite, recover_installation
-from selc.manifest import create_suite, package_suite, render_text_report, suite_content_hash
+from selc.manifest import (
+    create_suite,
+    package_suite,
+    render_text_report,
+    seal_suite,
+    suite_content_hash,
+)
 from selc.util import exclusive_lock, file_hash, tree_hash
 
 
@@ -62,6 +68,314 @@ class InstallationContractsTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, expected, completed.stdout + completed.stderr)
         return json.loads(completed.stdout)
+
+    def copy_external_framework(self, suite: Path, name: str = "external-framework") -> Path:
+        """Build a runtime-only source with exactly the suite's initial framework bytes."""
+
+        framework = self.root / name
+        framework.mkdir()
+        shutil.copytree(suite / "runtime", framework / "runtime")
+        shutil.copy2(suite / "framework.json", framework / "framework.json")
+        return framework
+
+    def change_external_framework(self, framework: Path) -> None:
+        """Make an external runtime distinguishable from the business embedded runtime."""
+
+        runtime_init = framework / "runtime" / "selc" / "__init__.py"
+        runtime_init.write_text(
+            runtime_init.read_text(encoding="utf-8") + "\nEXTERNAL_RUNTIME_MARKER = True\n",
+            encoding="utf-8",
+        )
+        descriptor_path = framework / "framework.json"
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        descriptor["framework_version"] = "external-0.1.0"
+        descriptor["runtime_hash"] = tree_hash(framework / "runtime")
+        descriptor_path.write_text(json.dumps(descriptor), encoding="utf-8")
+
+    def change_embedded_framework(self, suite: Path) -> None:
+        """Make a later business package carry a detectably different embedded runtime."""
+
+        manifest_path = suite / "suite.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["version"] = "1.1.0"
+        manifest["framework_version"] = "0.2.0"
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+        runtime_init = suite / "runtime" / "selc" / "__init__.py"
+        runtime_init.write_text(
+            runtime_init.read_text(encoding="utf-8")
+            + "\nBUSINESS_EMBEDDED_RUNTIME_MARKER = True\n",
+            encoding="utf-8",
+        )
+        descriptor_path = suite / "framework.json"
+        descriptor = json.loads(descriptor_path.read_text(encoding="utf-8"))
+        descriptor["framework_version"] = "0.2.0"
+        descriptor["runtime_hash"] = tree_hash(suite / "runtime")
+        descriptor_path.write_text(json.dumps(descriptor), encoding="utf-8")
+        seal_suite(suite)
+
+    def test_same_digest_external_framework_selection_is_persisted_and_preserved(self) -> None:
+        suite = self.create_suite("selection-suite", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        project = self.root / "project"
+        initial = install_suite(source=suite, project_root=project, harness="codex", ref=None)
+
+        selected = self.cli(
+            "updates",
+            "apply",
+            "--suite-id",
+            "selection-suite",
+            "--framework-source",
+            str(framework),
+            "--project-root",
+            str(project),
+            "--harness",
+            "codex",
+        )
+        self.assertTrue(selected["installation"]["reused"])
+        selected_installation = current_installation(project, "selection-suite")
+        self.assertEqual(selected_installation["framework_source"]["status"], "active_external")
+        self.assertEqual(
+            selected_installation["framework_source"]["repo"], str(framework.resolve())
+        )
+        self.assertEqual(selected_installation["source"]["subdir"], ".")
+        self.assertEqual(selected_installation["digest"], initial["digest"])
+
+        second_harness = install_suite(
+            source=suite,
+            project_root=project,
+            harness="workbuddy",
+            ref=None,
+        )
+        self.assertTrue(second_harness["reused"])
+        registered = current_installation(project, "selection-suite")
+        self.assertEqual(registered["harnesses"], ["codex", "workbuddy"])
+        self.assertEqual(registered["framework_source"]["status"], "active_external")
+
+        self.change_embedded_framework(suite)
+        updated = self.cli(
+            "updates",
+            "apply",
+            "--suite-id",
+            "selection-suite",
+            "--project-root",
+            str(project),
+            "--harness",
+            "codex",
+        )
+        self.assertFalse(updated["installation"]["reused"])
+        current = project / ".selc" / "installs" / "selection-suite" / "current"
+        runtime_init = (current / "runtime" / "selc" / "__init__.py").read_text(encoding="utf-8")
+        self.assertNotIn("BUSINESS_EMBEDDED_RUNTIME_MARKER", runtime_init)
+        preserved = current_installation(project, "selection-suite")
+        self.assertEqual(preserved["framework_source"]["status"], "active_external")
+        self.assertEqual(preserved["framework_source"]["repo"], str(framework.resolve()))
+
+    def test_implicit_install_preserves_a_distinct_external_runtime(self) -> None:
+        suite = self.create_suite("distinct-selection", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        self.change_external_framework(framework)
+        project = self.root / "project"
+
+        initial = install_suite(
+            source=suite,
+            project_root=project,
+            harness="codex",
+            ref=None,
+            framework_source=framework,
+        )
+        repeated = install_suite(
+            source=suite,
+            project_root=project,
+            harness="workbuddy",
+            ref=None,
+        )
+
+        self.assertTrue(repeated["reused"])
+        self.assertEqual(repeated["digest"], initial["digest"])
+        current = project / ".selc" / "installs" / "distinct-selection" / "current"
+        runtime_init = (current / "runtime" / "selc" / "__init__.py").read_text(encoding="utf-8")
+        self.assertIn("EXTERNAL_RUNTIME_MARKER", runtime_init)
+        self.assertEqual(tree_hash(current / "runtime"), tree_hash(framework / "runtime"))
+        installation = current_installation(project, "distinct-selection")
+        self.assertEqual(installation["framework_source"]["status"], "active_external")
+        self.assertEqual(installation["harnesses"], ["codex", "workbuddy"])
+
+    def test_implicit_install_rechecks_an_empty_framework_selection_snapshot(self) -> None:
+        """A default install cannot overwrite a concurrent explicit selection."""
+
+        suite = self.create_suite("selection-interleaving", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        project = self.root / "project"
+        install_suite(source=suite, project_root=project, harness="codex", ref=None)
+
+        import selc.install as install_module
+
+        original_selection = install_module._saved_external_framework_selection
+        injected = False
+
+        def select_then_change(project_root: Path, suite_id: str) -> dict[str, object] | None:
+            nonlocal injected
+            selection = original_selection(project_root, suite_id)
+            self.assertIsNone(selection)
+            if not injected:
+                injected = True
+                selected = install_suite(
+                    source=suite,
+                    project_root=project,
+                    harness="codex",
+                    ref=None,
+                    framework_source=framework,
+                )
+                self.assertTrue(selected["reused"])
+            return selection
+
+        install_module._saved_external_framework_selection = select_then_change
+        try:
+            with self.assertRaises(SelcError) as captured:
+                install_suite(
+                    source=suite,
+                    project_root=project,
+                    harness="workbuddy",
+                    ref=None,
+                )
+        finally:
+            install_module._saved_external_framework_selection = original_selection
+
+        self.assertEqual(captured.exception.code, "STALE_FRAMEWORK_SELECTION")
+        installation = current_installation(project, "selection-interleaving")
+        self.assertEqual(installation["framework_source"]["status"], "active_external")
+        self.assertEqual(installation["harnesses"], ["codex"])
+
+    def test_implicit_install_with_no_external_selection_is_idempotent(self) -> None:
+        suite = self.create_suite("embedded-repeat", ["text-report"])
+        project = self.root / "project"
+        initial = install_suite(source=suite, project_root=project, harness="codex", ref=None)
+
+        repeated = install_suite(
+            source=suite,
+            project_root=project,
+            harness="workbuddy",
+            ref=None,
+        )
+
+        self.assertTrue(repeated["reused"])
+        self.assertEqual(repeated["digest"], initial["digest"])
+        installation = current_installation(project, "embedded-repeat")
+        self.assertEqual(installation["framework_source"]["status"], "active_embedded")
+        self.assertEqual(installation["harnesses"], ["codex", "workbuddy"])
+
+    def test_implicit_install_preserves_external_git_source_baseline(self) -> None:
+        suite = self.create_suite("git-selection", ["text-report"])
+        framework_checkout = self.copy_external_framework(suite, "framework-checkout")
+        git(["init", "-b", "main"], framework_checkout)
+        git(["config", "user.name", "Fixture"], framework_checkout)
+        git(["config", "user.email", "fixture@example.test"], framework_checkout)
+        git(["add", "."], framework_checkout)
+        git(["commit", "-m", "framework baseline"], framework_checkout)
+        git(["tag", "v1.0.0"], framework_checkout)
+        framework_bare = self.root / "framework.git"
+        git(["clone", "--bare", str(framework_checkout), str(framework_bare)], self.root)
+
+        project = self.root / "project"
+        initial = install_suite(
+            source=suite,
+            project_root=project,
+            harness="codex",
+            ref=None,
+            framework_source=framework_bare,
+            framework_ref="v1.0.0",
+        )
+        repeated = install_suite(
+            source=suite,
+            project_root=project,
+            harness="workbuddy",
+            ref=None,
+        )
+
+        self.assertTrue(repeated["reused"])
+        selected = current_installation(project, "git-selection")["framework_source"]
+        self.assertEqual(selected["status"], "active_external")
+        self.assertEqual(selected["repo"], str(framework_bare))
+        self.assertEqual(selected["base"], "v1.0.0")
+        self.assertEqual(selected["commit"], initial["framework"]["commit"])
+
+    def test_same_digest_framework_selection_respects_active_leases(self) -> None:
+        suite = self.create_suite("selection-lease", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        project = self.root / "project"
+        install_suite(source=suite, project_root=project, harness="codex", ref=None)
+        self.cli(
+            "task",
+            "start",
+            "--project-root",
+            str(project),
+            "--id",
+            "active-task",
+            "--suite-id",
+            "selection-lease",
+            "--initiator",
+            "fixture",
+            "--evidence",
+            "fixture",
+            "--test",
+        )
+
+        blocked = self.cli(
+            "updates",
+            "apply",
+            "--suite-id",
+            "selection-lease",
+            "--framework-source",
+            str(framework),
+            "--project-root",
+            str(project),
+            "--harness",
+            "codex",
+            expected=2,
+        )
+        self.assertEqual(blocked["error"]["code"], "ACTIVE_LEASE")
+        self.assertEqual(
+            current_installation(project, "selection-lease")["framework_source"]["status"],
+            "active_embedded",
+        )
+
+    def test_same_digest_framework_selection_recovers_registry_transaction(self) -> None:
+        suite = self.create_suite("selection-recover", ["text-report"])
+        framework = self.copy_external_framework(suite)
+        project = self.root / "project"
+        install_suite(source=suite, project_root=project, harness="codex", ref=None)
+
+        import selc.install as install_module
+
+        original_write_registry = install_module._write_registry
+        calls = 0
+
+        def fail_once(project_root: Path, registry: dict[str, object]) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("injected selection registry interruption")
+            original_write_registry(project_root, registry)
+
+        install_module._write_registry = fail_once
+        try:
+            with self.assertRaises(OSError):
+                install_suite(
+                    source=suite,
+                    project_root=project,
+                    harness="codex",
+                    ref=None,
+                    framework_source=framework,
+                )
+        finally:
+            install_module._write_registry = original_write_registry
+
+        recovered = recover_installation(project, "selection-recover")
+        self.assertTrue(recovered["recovered"])
+        active = current_installation(project, "selection-recover")
+        self.assertEqual(active["framework_source"]["status"], "active_external")
+        self.assertEqual(active["framework_source"]["repo"], str(framework.resolve()))
 
     def test_only_trusted_resource_checker_can_prove_a_real_delivery(self) -> None:
         suite = self.create_suite("checked-suite", ["text-report"])

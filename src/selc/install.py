@@ -117,7 +117,7 @@ def resolve_source(
             "commit": None,
             "base": None,
         }
-    if local_source.is_dir() and (local_source / "suite.json").is_file() and subdir is None:
+    if local_source.is_dir() and (local_source / "suite.json").is_file() and subdir in (None, "."):
         return local_source, {
             "kind": "directory",
             "repo": str(local_source.resolve()),
@@ -437,6 +437,56 @@ def _sync_all_harnesses(
     }
 
 
+def _saved_external_framework_selection(project_root: Path, suite_id: str) -> dict[str, Any] | None:
+    """Read a prior explicit framework choice before assembling a repeat install.
+
+    The caller cannot build the right composite from the business package alone:
+    an omitted framework argument means "keep the selected external source", not
+    "select the business package's embedded runtime".  Read the selection while
+    holding the same registry-then-suite lock order used by activation.  The
+    activation transaction rechecks this snapshot before making any change.
+    """
+
+    root = install_root(project_root) / suite_id
+    journal = root / "journal.json"
+    with ExitStack() as locks:
+        locks.enter_context(exclusive_lock(registry_lock_path(project_root)))
+        locks.enter_context(exclusive_lock(root / ".lock"))
+        if journal.exists():
+            raise SelcError(
+                "PENDING_RECOVERY",
+                "an interrupted installation transaction must be recovered first",
+                "run updates recover for this suite before installing or updating",
+            )
+        installation = _registry(project_root)["installations"].get(suite_id)
+        if not isinstance(installation, dict):
+            return None
+        framework = installation.get("framework_source")
+        if not isinstance(framework, dict) or framework.get("status") != "active_external":
+            return None
+        repository = framework.get("repo")
+        if not isinstance(repository, str) or not repository:
+            raise SelcError(
+                "MISSING_SOURCE_BASELINE",
+                "installed external framework has no reusable source",
+                "select a framework source explicitly before repeating the install",
+            )
+        return dict(framework)
+
+
+def _active_external_framework_selection(
+    installation: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    """Return the external selection represented by an installed suite, if any."""
+
+    if installation is None:
+        return None
+    framework = installation.get("framework_source")
+    if not isinstance(framework, dict) or framework.get("status") != "active_external":
+        return None
+    return framework
+
+
 def install_suite(
     *,
     source: str | Path,
@@ -449,8 +499,14 @@ def install_suite(
     framework_subdir: str | None = None,
 ) -> dict[str, Any]:
     business_root, source_info = resolve_source(source, ref, subdir)
-    if framework_source is None:
-        manifest = load_manifest(business_root)
+    manifest = load_manifest(business_root)
+    implicit_framework_selection_observed = framework_source is None
+    preserved_external_selection: dict[str, Any] | None = None
+    if implicit_framework_selection_observed:
+        preserved_external_selection = _saved_external_framework_selection(
+            project_root, manifest["suite_id"]
+        )
+    if framework_source is None and preserved_external_selection is None:
         framework_info = {
             "kind": "embedded",
             "version": manifest["framework_version"],
@@ -465,7 +521,16 @@ def install_suite(
             business_digest=portable_tree_hash(business_root),
             project_root=project_root,
             harness=harness,
+            preserved_external_selection=preserved_external_selection,
+            implicit_framework_selection_observed=implicit_framework_selection_observed,
         )
+
+    if preserved_external_selection is not None:
+        framework_source = str(preserved_external_selection["repo"])
+        framework_ref = preserved_external_selection.get(
+            "commit"
+        ) or preserved_external_selection.get("base")
+        framework_subdir = preserved_external_selection.get("subdir")
 
     framework_root, framework_source_info = resolve_framework_source(
         framework_source, framework_ref, framework_subdir
@@ -477,6 +542,8 @@ def install_suite(
         "digest": framework["runtime_hash"],
         "status": "active_external",
     }
+    if preserved_external_selection is not None:
+        framework_info["base"] = preserved_external_selection.get("base")
     with temporary_directory("selc-composite-") as temporary:
         composite = temporary / "suite"
         materialize_composite_suite(business_root, framework_root, composite)
@@ -487,6 +554,8 @@ def install_suite(
             business_digest=portable_tree_hash(business_root),
             project_root=project_root,
             harness=harness,
+            preserved_external_selection=preserved_external_selection,
+            implicit_framework_selection_observed=implicit_framework_selection_observed,
         )
 
 
@@ -498,6 +567,8 @@ def _install_materialized_suite(
     business_digest: str,
     project_root: Path,
     harness: str,
+    preserved_external_selection: dict[str, Any] | None = None,
+    implicit_framework_selection_observed: bool = False,
 ) -> dict[str, Any]:
     manifest = load_manifest(suite_root)
     digest = portable_tree_hash(suite_root)
@@ -521,6 +592,16 @@ def _install_materialized_suite(
         leases = active_leases(database, suite_id)
         database.close()
         if existing:
+            current_external_selection = _active_external_framework_selection(existing)
+            if (
+                implicit_framework_selection_observed
+                and current_external_selection != preserved_external_selection
+            ):
+                raise SelcError(
+                    "STALE_FRAMEWORK_SELECTION",
+                    "the framework selection changed while the install was prepared",
+                    "retry the install to use the current framework selection",
+                )
             _assert_not_locally_edited(current, existing["digest"])
             if existing["source"]["repo"] != source_info["repo"]:
                 raise SelcError(
@@ -529,9 +610,25 @@ def _install_materialized_suite(
                     "use the saved source or install under a different suite id",
                 )
             if existing["digest"] == digest and existing["source"]["repo"] == source_info["repo"]:
+                selection_changed = (
+                    existing.get("source") != source_info
+                    or existing.get("framework_source") != framework_info
+                    or existing.get("business_digest") != business_digest
+                )
+                if selection_changed and (leases["tasks"] or leases["calls"] or leases["sessions"]):
+                    raise SelcError(
+                        "ACTIVE_LEASE",
+                        "active tasks, calls, or sessions prevent changing the suite source selection",
+                        "close them explicitly and retry",
+                    )
                 harnesses = sorted(set(existing.get("harnesses", []) + [harness]))
                 _assert_registration_available(project_root, root, manifest, harnesses, existing)
                 new_installation = dict(existing)
+                new_installation["version"] = manifest["version"]
+                new_installation["framework_version"] = manifest["framework_version"]
+                new_installation["framework_source"] = framework_info
+                new_installation["business_digest"] = business_digest
+                new_installation["source"] = source_info
                 new_installation["harnesses"] = harnesses
                 new_installation["registrations"] = {
                     harness_name: _manifest_skill_names(manifest) for harness_name in harnesses
@@ -564,6 +661,7 @@ def _install_materialized_suite(
                     "reused": True,
                     "registered_skills": registrations[harness],
                     "maintenance": str(current / "MAINTENANCE.md"),
+                    "source": source_info,
                     "framework": new_installation["framework_source"],
                 }
             if leases["tasks"] or leases["calls"] or leases["sessions"]:
