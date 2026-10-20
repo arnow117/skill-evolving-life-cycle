@@ -10,14 +10,16 @@ from __future__ import annotations
 import argparse
 import fcntl
 import hashlib
+import hmac
 import json
 import os
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 from contextlib import contextmanager
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 
@@ -28,7 +30,11 @@ PRIVATE_DIRECTORY = ".native_context_probe"
 FIXTURE_FILE = "fixture.json"
 OBSERVATIONS_FILE = "observations.json"
 OBSERVATIONS_LOCK_FILE = "observations.lock"
+RECEIPTS_FILE = "receipts.json"
 RUNS_DIRECTORY = "runs"
+DEFAULT_TRANSPORT = "context"
+UPDATED_INPUT_TRANSPORT = "workbuddy-updated-input"
+RECEIPT_MAX_AGE_SECONDS = 60
 HOOK_EVENTS = (
     "SessionStart",
     "UserPromptSubmit",
@@ -80,6 +86,10 @@ def observations_path(workspace: Path) -> Path:
 
 def observations_lock_path(workspace: Path) -> Path:
     return private_directory(workspace) / OBSERVATIONS_LOCK_FILE
+
+
+def receipts_path(workspace: Path) -> Path:
+    return private_directory(workspace) / RECEIPTS_FILE
 
 
 def runs_directory(workspace: Path) -> Path:
@@ -152,14 +162,18 @@ def read_fixture(workspace_value: str | Path) -> dict[str, str]:
         name: raw_fixture.get(name)
         for name in ("protocol", "workspace", "host", "fixture_id")
     }
+    transport = raw_fixture.get("transport", DEFAULT_TRANSPORT)
     if (
         fixture["protocol"] != PROTOCOL
         or fixture["workspace"] != str(workspace)
         or fixture["host"] not in SUPPORTED_HOSTS
         or not isinstance(fixture["fixture_id"], str)
+        or transport not in {DEFAULT_TRANSPORT, UPDATED_INPUT_TRANSPORT}
     ):
         raise ProbeError("INVALID_FIXTURE", "fixture identity does not match this workspace")
-    return fixture  # type: ignore[return-value]
+    if transport == UPDATED_INPUT_TRANSPORT and fixture["host"] != "workbuddy":
+        raise ProbeError("INVALID_FIXTURE", "updated-input transport requires a WorkBuddy fixture")
+    return {**fixture, "transport": transport}  # type: ignore[return-value]
 
 
 def hook_configuration_path(workspace: Path, host: str) -> Path:
@@ -169,6 +183,7 @@ def hook_configuration_path(workspace: Path, host: str) -> Path:
 
 
 def receive_command(workspace: Path) -> str:
+    workspace = resolve_path(workspace)
     return command_text(
         (
             sys.executable,
@@ -198,6 +213,7 @@ def hook_configuration(workspace: Path, host: str) -> dict[str, object]:
 
 
 def run_command(workspace: Path) -> str:
+    workspace = resolve_path(workspace)
     return command_text(
         (
             sys.executable,
@@ -227,11 +243,23 @@ def running_instructions(workspace: Path) -> str:
     )
 
 
-def prepare(workspace_value: str | Path, host: str) -> dict[str, object]:
+def prepare(
+    workspace_value: str | Path,
+    host: str,
+    *,
+    transport: str = DEFAULT_TRANSPORT,
+) -> dict[str, object]:
     """Create one empty, project-scoped host fixture without touching existing content."""
 
     if host not in SUPPORTED_HOSTS:
         raise ProbeError("UNSUPPORTED_HOST", "host must be codex or workbuddy")
+    if transport not in {DEFAULT_TRANSPORT, UPDATED_INPUT_TRANSPORT}:
+        raise ProbeError(
+            "UNSUPPORTED_TRANSPORT",
+            "transport must be context or workbuddy-updated-input",
+        )
+    if transport == UPDATED_INPUT_TRANSPORT and host != "workbuddy":
+        raise ProbeError("UNSUPPORTED_TRANSPORT", "workbuddy-updated-input requires host workbuddy")
 
     workspace = resolve_path(workspace_value)
     if workspace.exists() and any(workspace.iterdir()):
@@ -244,12 +272,15 @@ def prepare(workspace_value: str | Path, host: str) -> dict[str, object]:
         "protocol": PROTOCOL,
         "workspace": str(workspace),
         "host": host,
+        "transport": transport,
         "fixture_id": secrets.token_hex(16),
         "evidence_label": "candidate",
     }
     write_private_json(fixture_path(workspace), fixture)
     write_private_json(observations_path(workspace), [])
     write_private_bytes(observations_lock_path(workspace), b"")
+    if transport == UPDATED_INPUT_TRANSPORT:
+        write_private_json(receipts_path(workspace), [])
     runs_directory(workspace).mkdir(mode=0o700)
 
     configuration_path = hook_configuration_path(workspace, host)
@@ -262,6 +293,7 @@ def prepare(workspace_value: str | Path, host: str) -> dict[str, object]:
         "protocol": PROTOCOL,
         "workspace": str(workspace),
         "host": host,
+        "transport": transport,
         "config_path": str(configuration_path),
         "run_command": run_command(workspace),
         "evidence_label": "candidate",
@@ -310,6 +342,8 @@ def normalize_payload(
 
     session_id = scalar_text(scalar(payload, "session_id", "sessionId"))
     tool_call_id = scalar_text(scalar(payload, "tool_call_id", "tool_use_id", "call_id"))
+    tool_use_id = scalar_text(scalar(payload, "tool_use_id"))
+    call_id = scalar_text(scalar(payload, "call_id"))
     request_id = scalar_text(scalar(payload, "request_id", "conversation_request_id"))
     generation_id = scalar_text(scalar(payload, "generation_id"))
     turn_id = scalar_text(scalar(payload, "turn_id"))
@@ -335,6 +369,8 @@ def normalize_payload(
         "tool_name": scalar_text(scalar(payload, "tool_name", "tool")),
         "session_id": session_id,
         "tool_call_id": tool_call_id,
+        "tool_use_id": tool_use_id,
+        "call_id": call_id,
         "request_id": request_id,
         "generation_id": generation_id,
         "turn_id": turn_id,
@@ -358,6 +394,277 @@ def load_observations(workspace: Path) -> list[dict[str, object]]:
     ):
         raise ProbeError("INVALID_FIXTURE", "observations must be a JSON array")
     return raw_observations
+
+
+def load_receipts(workspace: Path) -> list[dict[str, object]]:
+    raw_receipts = read_private_json(receipts_path(workspace))
+    if not isinstance(raw_receipts, list) or not all(
+        isinstance(receipt, dict) for receipt in raw_receipts
+    ):
+        raise ProbeError("INVALID_FIXTURE", "receipts must be a JSON array")
+    return raw_receipts
+
+
+def parse_timestamp(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def fixed_runtime_arguments(workspace: Path) -> tuple[str, ...]:
+    canonical_workspace = resolve_path(workspace)
+    return ("run", "--workspace", str(canonical_workspace))
+
+
+def fixed_operation_digest(workspace: Path) -> str:
+    return digest(
+        {
+            "python": str(Path(sys.executable).resolve()),
+            "script": str(Path(__file__).resolve()),
+            "runtime_arguments": fixed_runtime_arguments(workspace),
+        }
+    )
+
+
+def resolves_to_current_python(token: str) -> bool:
+    expected = Path(sys.executable).resolve()
+    if "/" in token:
+        return Path(token).expanduser().resolve() == expected
+    resolved = shutil.which(token)
+    return resolved is not None and Path(resolved).resolve() == expected
+
+
+def parse_fixed_probe_command(
+    command: str,
+    *,
+    workspace: Path,
+    cwd: Path,
+) -> dict[str, str] | None:
+    """Accept only the generated probe command without shell composition."""
+
+    if any(character in command for character in ("\r", "\n", "\x00")):
+        return None
+    try:
+        arguments = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if not within_fixture(cwd, workspace):
+        return None
+    command_arguments = arguments
+    if len(arguments) == 8 and arguments[0] == "cd" and arguments[2] == "&&":
+        cd_target = Path(arguments[1]).expanduser()
+        cd_workspace = (
+            (cwd / cd_target).resolve()
+            if not cd_target.is_absolute()
+            else cd_target.resolve()
+        )
+        if cd_workspace != workspace:
+            return None
+        command_arguments = arguments[3:]
+    if len(command_arguments) != 5:
+        return None
+    python, script, subcommand, workspace_flag, workspace_value = command_arguments
+    if (
+        not resolves_to_current_python(python)
+        or Path(script).expanduser().resolve() != Path(__file__).resolve()
+        or subcommand != "run"
+        or workspace_flag != "--workspace"
+        or Path(workspace_value).expanduser().resolve() != workspace
+    ):
+        return None
+    return {
+        "original_command_digest": digest(command),
+        "operation_digest": fixed_operation_digest(workspace),
+        "runtime_arguments_digest": digest(fixed_runtime_arguments(workspace)),
+    }
+
+
+def bounded_nonempty_text(payload: dict[str, object], name: str) -> str | None:
+    value = payload.get(name)
+    if isinstance(value, str) and 0 < len(value) <= 256:
+        return value
+    return None
+
+
+def workbuddy_session_tool_identity(payload: dict[str, object]) -> dict[str, str] | None:
+    session_id = bounded_nonempty_text(payload, "session_id")
+    tool_use_id = bounded_nonempty_text(payload, "tool_use_id")
+    if session_id is None or tool_use_id is None:
+        return None
+    return {"session_id": session_id, "tool_use_id": tool_use_id}
+
+
+def native_workbuddy_identity(payload: dict[str, object]) -> dict[str, str] | None:
+    identity = workbuddy_session_tool_identity(payload)
+    if identity is None:
+        return None
+    generation_id = bounded_nonempty_text(payload, "generation_id")
+    call_id = bounded_nonempty_text(payload, "call_id")
+    if generation_id is None or call_id is None:
+        return None
+    return {**identity, "generation_id": generation_id, "call_id": call_id}
+
+
+def receipt_payload_conflicts(
+    receipts: list[dict[str, object]],
+    identity: dict[str, str],
+    payload_digest: object,
+) -> bool:
+    return any(
+        receipt.get("session_id") == identity["session_id"]
+        and receipt.get("tool_use_id") == identity["tool_use_id"]
+        and receipt.get("payload_digest") != payload_digest
+        for receipt in receipts
+    )
+
+
+def receipt_identity_is_tainted(
+    receipts: list[dict[str, object]],
+    session_id: str,
+    tool_call_id: str,
+) -> bool:
+    return any(
+        receipt.get("invalidated_at") is not None
+        and receipt.get("session_id") == session_id
+        and (
+            receipt.get("tool_use_id") == tool_call_id
+            or receipt.get("tainted_tool_call_id") == tool_call_id
+        )
+        for receipt in receipts
+    )
+
+
+def invalidate_receipts_for_conflict(
+    fixture: dict[str, str],
+    receipts: list[dict[str, object]],
+    *,
+    session_id: object,
+    tool_call_id: object,
+) -> bool:
+    if (
+        not isinstance(session_id, str)
+        or not isinstance(tool_call_id, str)
+        or not session_id
+        or not tool_call_id
+        or len(session_id) > 256
+        or len(tool_call_id) > 256
+    ):
+        return False
+
+    invalidated_at = utc_now()
+    matching_receipts = [
+        receipt
+        for receipt in receipts
+        if receipt.get("session_id") == session_id
+        and (
+            receipt.get("tool_use_id") == tool_call_id
+            or receipt.get("tainted_tool_call_id") == tool_call_id
+        )
+    ]
+    for receipt in matching_receipts:
+        receipt["invalidated_at"] = invalidated_at
+        receipt["invalidation_reason"] = "conflicting_native_callback"
+
+    if not matching_receipts:
+        receipts.append(
+            {
+                "fixture_id": fixture["fixture_id"],
+                "session_id": session_id,
+                "tainted_tool_call_id": tool_call_id,
+                "invalidated_at": invalidated_at,
+                "invalidation_reason": "conflicting_native_callback",
+            }
+        )
+    return True
+
+
+def updated_command(command: str, receipt: str) -> str:
+    return f"{command} --probe-receipt {shlex.quote(receipt)}"
+
+
+def receipt_hook_output(tool_input: dict[str, object], receipt: str) -> dict[str, object]:
+    command = tool_input.get("command")
+    if not isinstance(command, str):
+        raise ProbeError("UNSUPPORTED_FIXED_COMMAND", "probe command is missing")
+    updated_input = dict(tool_input)
+    updated_input["command"] = updated_command(command, receipt)
+    return {"hookEventName": "PreToolUse", "updatedInput": updated_input}
+
+
+def issue_updated_input_receipt(
+    fixture: dict[str, str],
+    payload: dict[str, object],
+    observation: dict[str, object],
+    receipts: list[dict[str, object]],
+    *,
+    source: str,
+) -> tuple[str, dict[str, object] | None]:
+    """Persist one WorkBuddy receipt before returning a permission-neutral rewrite."""
+
+    if source != "hook":
+        return "fixture_source", None
+    if observation["event_type"] != "PreToolUse":
+        return "not_pre_tool_use", None
+    identity = native_workbuddy_identity(payload)
+    if identity is None:
+        return "missing_native_identity", None
+    if observation["identity_status"] == "conflict":
+        return "conflict", None
+    if receipt_identity_is_tainted(
+        receipts,
+        identity["session_id"],
+        identity["tool_use_id"],
+    ):
+        return "conflict", None
+    matching_identity = [
+        receipt
+        for receipt in receipts
+        if all(receipt.get(name) == value for name, value in identity.items())
+    ]
+    has_different_payload = any(
+        receipt.get("payload_digest") != observation["payload_digest"]
+        for receipt in matching_identity
+    )
+    if has_different_payload:
+        return "conflict", None
+
+    tool_input = payload.get("tool_input")
+    if not isinstance(tool_input, dict):
+        return "unsupported_fixed_command", None
+    command = tool_input.get("command")
+    cwd = Path(str(observation["cwd"]))
+    operation = (
+        parse_fixed_probe_command(command, workspace=Path(fixture["workspace"]), cwd=cwd)
+        if isinstance(command, str)
+        else None
+    )
+    if operation is None:
+        return "unsupported_fixed_command", None
+
+    for receipt in matching_identity:
+        if (
+            receipt.get("payload_digest") == observation["payload_digest"]
+            and receipt.get("operation_digest") == operation["operation_digest"]
+        ):
+            return "reused", receipt_hook_output(tool_input, str(receipt["receipt"]))
+    if matching_identity:
+        return "conflict", None
+
+    issued_at = utc_now()
+    expires_at = parse_timestamp(issued_at) + timedelta(seconds=RECEIPT_MAX_AGE_SECONDS)
+    receipt = {
+        "receipt": secrets.token_hex(32),
+        "fixture_id": fixture["fixture_id"],
+        "source": "hook_candidate",
+        "issued_at": issued_at,
+        "expires_at": expires_at.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "payload_digest": observation["payload_digest"],
+        "original_command_digest": operation["original_command_digest"],
+        "operation_digest": operation["operation_digest"],
+        "runtime_arguments_digest": operation["runtime_arguments_digest"],
+        "consumed_at": None,
+        **identity,
+    }
+    receipts.append(receipt)
+    return "issued", receipt_hook_output(tool_input, str(receipt["receipt"]))
 
 
 @contextmanager
@@ -407,29 +714,169 @@ def receive_payload(
             ]
             for existing in same_identity:
                 if existing["payload_digest"] == observation["payload_digest"]:
-                    return {
-                        "protocol": PROTOCOL,
-                        "status": "deduplicated",
-                        "source": observation["source"],
-                        "evidence_label": "candidate",
-                    }
-            if same_identity:
-                observation["identity_status"] = "conflict"
-                status = "conflict"
+                    status = "deduplicated"
+                    break
             else:
-                status = "recorded"
+                status = "conflict" if same_identity else "recorded"
+            if status == "conflict":
+                observation["identity_status"] = "conflict"
         else:
             status = "recorded"
 
-        observations.append(observation)
-        write_private_json(observations_path(workspace), observations, replace=True)
+        if status != "deduplicated":
+            observations.append(observation)
+            write_private_json(observations_path(workspace), observations, replace=True)
+
+        response: dict[str, object] = {
+            "protocol": PROTOCOL,
+            "status": status,
+            "source": observation["source"],
+            "evidence_label": "candidate",
+            "identity_status": observation["identity_status"],
+        }
+        if fixture["transport"] == UPDATED_INPUT_TRANSPORT:
+            receipts = load_receipts(workspace)
+            stable_native_identity = workbuddy_session_tool_identity(payload)
+            transport_status, hook_output = issue_updated_input_receipt(
+                fixture,
+                payload,
+                observation,
+                receipts,
+                source=source,
+            )
+            invalidated = False
+            if source == "hook" and status == "conflict":
+                invalidated = invalidate_receipts_for_conflict(
+                    fixture,
+                    receipts,
+                    session_id=observation.get("session_id"),
+                    tool_call_id=observation.get("tool_call_id"),
+                )
+            if (
+                source == "hook"
+                and observation["event_type"] == "PreToolUse"
+                and stable_native_identity is not None
+                and (
+                    transport_status == "conflict"
+                    or receipt_payload_conflicts(
+                        receipts,
+                        stable_native_identity,
+                        observation["payload_digest"],
+                    )
+                )
+            ):
+                invalidated = (
+                    invalidate_receipts_for_conflict(
+                        fixture,
+                        receipts,
+                        session_id=stable_native_identity["session_id"],
+                        tool_call_id=stable_native_identity["tool_use_id"],
+                    )
+                    or invalidated
+                )
+            if invalidated:
+                write_private_json(receipts_path(workspace), receipts, replace=True)
+            response["transport_status"] = transport_status
+            if hook_output is not None:
+                write_private_json(receipts_path(workspace), receipts, replace=True)
+                response["hook_output"] = hook_output
+        return response
+
+
+def receipt_comparison(status: str, reason: str) -> dict[str, object]:
     return {
-        "protocol": PROTOCOL,
         "status": status,
-        "source": observation["source"],
+        "reason": reason,
         "evidence_label": "candidate",
-        "identity_status": observation["identity_status"],
     }
+
+
+def receipt_runtime_arguments(workspace: Path, receipt: str) -> tuple[str, ...]:
+    return (*fixed_runtime_arguments(workspace), "--probe-receipt", receipt)
+
+
+def receipt_matches_runtime(
+    receipt: dict[str, object],
+    workspace: Path,
+    runtime_arguments: tuple[str, ...],
+) -> bool:
+    token = receipt.get("receipt")
+    if not isinstance(token, str):
+        return False
+    expected_arguments = receipt_runtime_arguments(workspace, token)
+    return (
+        runtime_arguments == expected_arguments
+        and receipt.get("fixture_id") is not None
+        and receipt.get("operation_digest") == fixed_operation_digest(workspace)
+        and receipt.get("runtime_arguments_digest") == digest(fixed_runtime_arguments(workspace))
+    )
+
+
+def consume_updated_input_receipt(
+    fixture: dict[str, str],
+    workspace: Path,
+    environment: dict[str, str],
+    receipt_token: str | None,
+    runtime_arguments: tuple[str, ...],
+) -> dict[str, object]:
+    """Consume one local WorkBuddy receipt after checking its bound operation."""
+
+    if receipt_token is None:
+        return receipt_comparison("unknown", "missing_probe_receipt")
+    expected_arguments = receipt_runtime_arguments(workspace, receipt_token)
+    if runtime_arguments != expected_arguments:
+        return receipt_comparison("unknown", "probe_receipt_arg_drift")
+
+    with observation_write_lock(workspace):
+        receipts = load_receipts(workspace)
+        receipt = next(
+            (
+                item
+                for item in receipts
+                if isinstance(item.get("receipt"), str)
+                and hmac.compare_digest(str(item["receipt"]), receipt_token)
+            ),
+            None,
+        )
+        if receipt is None:
+            return receipt_comparison("unknown", "probe_receipt_missing")
+        if receipt.get("fixture_id") != fixture["fixture_id"]:
+            return receipt_comparison("unknown", "probe_receipt_fixture_mismatch")
+        if not receipt_matches_runtime(receipt, workspace, runtime_arguments):
+            return receipt_comparison("unknown", "probe_receipt_arg_drift")
+        receipt_session_id = receipt.get("session_id")
+        receipt_tool_use_id = receipt.get("tool_use_id")
+        if (
+            not isinstance(receipt_session_id, str)
+            or not isinstance(receipt_tool_use_id, str)
+            or receipt_identity_is_tainted(receipts, receipt_session_id, receipt_tool_use_id)
+        ):
+            return receipt_comparison("unknown", "probe_receipt_conflicted")
+
+        try:
+            expired = parse_timestamp(str(receipt["expires_at"])) <= datetime.now(UTC)
+        except (KeyError, TypeError, ValueError):
+            return receipt_comparison("unknown", "probe_receipt_invalid")
+        if expired:
+            return receipt_comparison("unknown", "probe_receipt_expired")
+        if receipt.get("consumed_at") is not None:
+            return receipt_comparison("unknown", "probe_receipt_spent")
+
+        session_id = environment.get("CODEBUDDY_SESSION_ID")
+        if not isinstance(session_id, str) or receipt.get("session_id") != session_id:
+            return receipt_comparison("unknown", "probe_receipt_session_mismatch")
+        request_id = environment.get("CONVERSATION_REQUEST_ID")
+        if request_id is not None and receipt.get("generation_id") != request_id:
+            return receipt_comparison("unknown", "probe_receipt_generation_mismatch")
+        if any(
+            not isinstance(receipt.get(name), str)
+            for name in ("generation_id", "tool_use_id", "call_id")
+        ):
+            return receipt_comparison("unknown", "probe_receipt_invalid")
+
+        receipt["consumed_at"] = utc_now()
+        write_private_json(receipts_path(workspace), receipts, replace=True)
+    return receipt_comparison("matched", "updated_input_receipt_consumed")
 
 
 def receive_json_bytes(
@@ -479,8 +926,8 @@ def child_environment(host: str, environment: dict[str, str]) -> dict[str, str |
         "thread_id": None,
         "tool_call_id": environment.get("SANDBOX_BROKER_TOOL_CALL_ID")
         or environment.get("TOOL_CALL_ID"),
-        "request_id": environment.get("CONVERSATION_REQUEST_ID"),
-        "generation_id": None,
+        "request_id": None,
+        "generation_id": environment.get("CONVERSATION_REQUEST_ID"),
         "turn_id": None,
         "message_id": environment.get("CONVERSATION_MESSAGE_ID"),
         "version": None,
@@ -586,7 +1033,12 @@ def observe_child_environment(workspace: Path, environment: dict[str, str]) -> d
     return observed
 
 
-def run(workspace_value: str | Path) -> dict[str, object]:
+def run(
+    workspace_value: str | Path,
+    *,
+    probe_receipt: str | None = None,
+    runtime_arguments: tuple[str, ...] | None = None,
+) -> dict[str, object]:
     """Observe the fixed child process and compare it to exactly one hook candidate."""
 
     workspace = resolve_path(workspace_value)
@@ -597,7 +1049,20 @@ def run(workspace_value: str | Path) -> dict[str, object]:
     environment = allowed_environment()
     child_values = observe_child_environment(workspace, environment)
     observations = load_observations(workspace)
-    comparison = compare_child_context(fixture, observations, child_values)
+    if fixture["transport"] == UPDATED_INPUT_TRANSPORT:
+        expected_runtime_arguments = runtime_arguments or receipt_runtime_arguments(
+            workspace,
+            probe_receipt or "",
+        )
+        comparison = consume_updated_input_receipt(
+            fixture,
+            workspace,
+            child_values,
+            probe_receipt,
+            expected_runtime_arguments,
+        )
+    else:
+        comparison = compare_child_context(fixture, observations, child_values)
     run_record = {
         "protocol": PROTOCOL,
         "fixture_id": fixture["fixture_id"],
@@ -634,11 +1099,15 @@ def inspect(workspace_value: str | Path) -> dict[str, object]:
         "protocol": PROTOCOL,
         "workspace": str(workspace),
         "host": fixture["host"],
+        "transport": fixture["transport"],
         "fixture_id": fixture["fixture_id"],
         "evidence_label": "candidate",
         "config_path": str(configuration_path),
         "config": configuration,
         "observations": load_observations(workspace),
+        "receipts": load_receipts(workspace)
+        if fixture["transport"] == UPDATED_INPUT_TRANSPORT
+        else [],
         "runs": runs,
     }
 
@@ -650,6 +1119,12 @@ def parser() -> argparse.ArgumentParser:
     preparing = commands.add_parser("prepare", help="create an empty local host fixture")
     preparing.add_argument("--workspace", required=True)
     preparing.add_argument("--host", choices=sorted(SUPPORTED_HOSTS), required=True)
+    preparing.add_argument(
+        "--transport",
+        choices=(DEFAULT_TRANSPORT, UPDATED_INPUT_TRANSPORT),
+        default=DEFAULT_TRANSPORT,
+        help="use the opt-in WorkBuddy updatedInput receipt transport",
+    )
 
     receiving = commands.add_parser("receive", help="record bounded hook JSON from stdin")
     receiving.add_argument("--workspace", required=True)
@@ -661,6 +1136,7 @@ def parser() -> argparse.ArgumentParser:
 
     running = commands.add_parser("run", help="compare one fixed child environment to a hook candidate")
     running.add_argument("--workspace", required=True)
+    running.add_argument("--probe-receipt")
 
     inspecting = commands.add_parser("inspect", help="print private fixture metadata as JSON")
     inspecting.add_argument("--workspace", required=True)
@@ -684,15 +1160,20 @@ def public_run_response(response: dict[str, object]) -> dict[str, object]:
 
 
 def main(arguments: list[str] | None = None) -> int:
-    parsed = parser().parse_args(arguments)
+    runtime_arguments = tuple(arguments) if arguments is not None else tuple(sys.argv[1:])
+    parsed = parser().parse_args(runtime_arguments)
     try:
         if parsed.command == "prepare":
-            response = prepare(parsed.workspace, parsed.host)
+            response = prepare(parsed.workspace, parsed.host, transport=parsed.transport)
         elif parsed.command == "receive":
             source = "fixture" if parsed.fixture_source else "hook"
             response = receive_json_bytes(parsed.workspace, read_hook_stdin(), source=source)
         elif parsed.command == "run":
-            response = run(parsed.workspace)
+            response = run(
+                parsed.workspace,
+                probe_receipt=parsed.probe_receipt,
+                runtime_arguments=runtime_arguments,
+            )
         else:
             response = inspect(parsed.workspace)
     except (OSError, subprocess.SubprocessError) as error:
@@ -704,6 +1185,10 @@ def main(arguments: list[str] | None = None) -> int:
         print(json.dumps(response, sort_keys=True), file=sys.stderr)
         return 1
 
+    if parsed.command == "receive" and "hook_output" in response:
+        hook_response = {"hookSpecificOutput": response["hook_output"]}
+        print(json.dumps(hook_response, separators=(",", ":"), sort_keys=True))
+        return 0
     if parsed.command == "run":
         response = public_run_response(response)
     print(json.dumps({"protocol": PROTOCOL, "ok": True, **response}, indent=2, sort_keys=True))

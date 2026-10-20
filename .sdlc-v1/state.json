@@ -147,9 +147,18 @@
           "status": "done",
           "title": "最少native context实验工具准备",
           "updated_at": "2026-10-20T10:05:51Z"
+        },
+        "T013": {
+          "depends_on": [
+            "T012"
+          ],
+          "id": "T013",
+          "status": "done",
+          "title": "WorkBuddy本地command-hook回执传递实验准备",
+          "updated_at": "2026-10-20T10:53:58Z"
         }
       },
-      "updated_at": "2026-10-20T10:05:51Z",
+      "updated_at": "2026-10-20T10:53:58Z",
       "validation": {
         "at": null,
         "command": null,
@@ -183,7 +192,7 @@
       "product_context_ref": ".sdlc-v1/context/REQ-002.product.md",
       "status": "in_delivery",
       "title": "补齐 Codex 与 WorkBuddy 自动统计及业务验证扩展",
-      "updated_at": "2026-10-20T10:05:51Z"
+      "updated_at": "2026-10-20T10:53:58Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

@@ -24,9 +24,12 @@ SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成�
 | --- | --- | --- |
 | 作者 skill/CLI | `.claude/skills/selc/`、`scripts/selc.py`、`src/selc/cli.py` | 创建/creator 改写/seal/打包本地流程通过 |
 | 本机记录 | `src/selc/records.py`，项目 `.selc/records.sqlite3` | task/call 双轴结果、反馈修订、导入去重与删除回归通过，见工程 Validation |
+| 自动观测与业务检查基础 | `observation.py`、`checkers.py`、`checker_integration.py`；manifest可选检查声明 | F-002 T004/T008/T009增量验收通过，131项本地测试；真实宿主正式接入及one-shot完整区间仍未验收 |
 | 安装与宿主适配 | `manifest.py` / `install.py`；实验 `experiments/host_observation/` | F-001 为本地结构与 portable CLI 测试；REQ-002 另有 CLI Codex / WorkBuddy 桌面有限接入证据，未集成生产 runtime |
 | 更新/评估/贡献/发布 | `install.py` / `evolve.py`，portable suite runtime | 框架来源复用、目录恢复、缺省保留与选择并发复核已有返修证据；既有回归仅 public GitHub/GitLab 和 local fixture；本轮已授权真实 GitHub贡献验证，结果待执行 |
 | 验证 | `tests/` 和 README 的 US-001 至 US-005 | aa079e2 正式 Validate PASS，76项测试及 SC001–007 本地范围证据，见工程 Validation |
+
+F-002源码增量已推送`0293358`；[Draft PR #1](https://github.com/arnow117/skill-evolving-life-cycle/pull/1)仍为开发中。native context实验工具准备通过11项本地检查，真实WorkBuddy请求2只暴露session环境，回执运输仍待验证；不能把原有限探针或这次实验视作正式双端接入完成。具体预算、原件和后续运输选择以F-002工程上下文为准。
 
 ## 检查入口
 
@@ -38,4 +41,4 @@ F-002发布目标为公开GitHub源码、SELC框架及简单合成套件的版�
 UV_CACHE_DIR=/private/tmp/selc-uv-cache uv run --no-project --python 3.12 python -m unittest discover -s tests -v
 ```
 
-README 是面向使用者的唯一全局使用指南，CLI help 为参数权威。格式与静态检查采用实现者已记录的 Ruff 和 compileall；官方 skill 格式校验使用当前 creator 工具环境，不能把其 PyYAML 当作 portable 运行依赖。
+README 是面向使用者的唯一全局使用指南，CLI help 为参数权威。F-002已实际执行compileall/py_compile和`git diff --check`；当前Ruff不可用，不把未执行的formatter检查写成通过。官方 skill 格式校验使用当前creator工具环境，不能把其PyYAML当作portable运行依赖。

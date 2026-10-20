@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -78,6 +79,73 @@ class NativeContextProbeTests(unittest.TestCase):
                 else:
                     os.environ[name] = value
 
+    def prepare_updated_input_fixture(self) -> dict[str, object]:
+        return probe.prepare(self.workspace, "workbuddy", transport="workbuddy-updated-input")
+
+    def workbuddy_pre_tool_event(
+        self,
+        *,
+        session_id: str = "workbuddy-session-1",
+        generation_id: str = "generation-1",
+        tool_use_id: str = "tool-use-1",
+        call_id: str = "call-1",
+        command: str | None = None,
+    ) -> dict[str, object]:
+        return {
+            "hook_event_name": "PreToolUse",
+            "cwd": str(self.workspace),
+            "session_id": session_id,
+            "generation_id": generation_id,
+            "tool_use_id": tool_use_id,
+            "call_id": call_id,
+            "client": "workbuddy",
+            "version": "5.7.6",
+            "tool_name": "Bash",
+            "tool_input": {
+                "command": command or probe.run_command(self.workspace),
+                "keep": {"permission": "original"},
+            },
+        }
+
+    def receipt_token(self, received: dict[str, object]) -> str:
+        hook_output = received["hook_output"]
+        self.assertIsInstance(hook_output, dict)
+        updated_input = hook_output["updatedInput"]
+        self.assertIsInstance(updated_input, dict)
+        command = updated_input["command"]
+        self.assertIsInstance(command, str)
+        command_arguments = shlex.split(command)
+        self.assertEqual(command_arguments[-2], "--probe-receipt")
+        return command_arguments[-1]
+
+    def run_updated_input_receipt(
+        self,
+        receipt: str,
+        *,
+        session_id: str = "workbuddy-session-1",
+        request_id: str | None = None,
+        runtime_arguments: tuple[str, ...] | None = None,
+    ) -> dict[str, object]:
+        original_values = {name: os.environ.get(name) for name in probe.ALLOWED_ENVIRONMENT_NAMES}
+        try:
+            for name in probe.ALLOWED_ENVIRONMENT_NAMES:
+                os.environ.pop(name, None)
+            os.environ["CODEBUDDY_SESSION_ID"] = session_id
+            if request_id is not None:
+                os.environ["CONVERSATION_REQUEST_ID"] = request_id
+            os.chdir(self.workspace)
+            return probe.run(
+                self.workspace,
+                probe_receipt=receipt,
+                runtime_arguments=runtime_arguments,
+            )
+        finally:
+            for name, value in original_values.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
     def test_prepare_creates_only_private_fixture_files_and_documented_hook_shapes(self) -> None:
         prepared = self.prepare("codex")
         configuration = json.loads((self.workspace / ".codex" / "hooks.json").read_text())
@@ -121,6 +189,18 @@ class NativeContextProbeTests(unittest.TestCase):
 
         self.assertEqual(sentinel.read_text(encoding="utf-8"), "keep")
         self.assertFalse((self.workspace / ".native_context_probe").exists())
+
+    def test_old_fixture_without_a_transport_uses_default_context(self) -> None:
+        self.prepare()
+        path = probe.fixture_path(self.workspace)
+        fixture = json.loads(path.read_text(encoding="utf-8"))
+        del fixture["transport"]
+        probe.write_private_json(path, fixture, replace=True)
+
+        inspection = probe.inspect(self.workspace)
+
+        self.assertEqual(inspection["transport"], "context")
+        self.assertEqual(inspection["receipts"], [])
 
     def test_receive_rejects_cwd_outside_the_fixture(self) -> None:
         self.prepare()
@@ -329,6 +409,363 @@ class NativeContextProbeTests(unittest.TestCase):
         observations = probe.inspect(self.workspace)["observations"]
         self.assertEqual(len(observations), 8)
         self.assertEqual({item["tool_call_id"] for item in observations}, {f"tool-{index}" for index in range(8)})
+
+    def test_updated_input_transport_rewrites_only_the_fixed_probe_command(self) -> None:
+        self.prepare_updated_input_fixture()
+        payload = self.workbuddy_pre_tool_event()
+        original_input = payload["tool_input"]
+        received = probe.receive_payload(self.workspace, payload)
+        token = self.receipt_token(received)
+        hook_output = received["hook_output"]
+
+        self.assertEqual(received["transport_status"], "issued")
+        self.assertEqual(set(hook_output), {"hookEventName", "updatedInput"})
+        self.assertEqual(hook_output["hookEventName"], "PreToolUse")
+        self.assertEqual(hook_output["updatedInput"]["keep"], original_input["keep"])
+        self.assertEqual(
+            shlex.split(hook_output["updatedInput"]["command"])[:-2],
+            shlex.split(original_input["command"]),
+        )
+        self.assertNotIn("permissionDecision", hook_output)
+        self.assertNotIn("decision", hook_output)
+        self.assertNotIn("continue", hook_output)
+        self.assertNotIn("updatedPermissions", hook_output)
+        self.assertEqual(len(probe.inspect(self.workspace)["receipts"]), 1)
+
+        run = self.run_updated_input_receipt(token)
+        self.assertEqual(run["comparison"]["status"], "matched")
+        self.assertEqual(run["comparison"]["reason"], "updated_input_receipt_consumed")
+
+    def test_updated_input_accepts_only_a_same_fixture_cd_prefix(self) -> None:
+        self.prepare_updated_input_fixture()
+        fixed_command = probe.run_command(self.workspace)
+        cd_command = f"cd {shlex.quote(str(self.workspace.resolve()))} && {fixed_command}"
+        received = probe.receive_payload(
+            self.workspace,
+            self.workbuddy_pre_tool_event(command=cd_command),
+        )
+        token = self.receipt_token(received)
+        updated_command = received["hook_output"]["updatedInput"]["command"]
+
+        self.assertEqual(received["transport_status"], "issued")
+        self.assertEqual(updated_command, f"{cd_command} --probe-receipt {token}")
+
+    def test_updated_input_receipt_requires_the_native_session_and_generation_namespace(self) -> None:
+        self.prepare_updated_input_fixture()
+        received = probe.receive_payload(self.workspace, self.workbuddy_pre_tool_event())
+        token = self.receipt_token(received)
+
+        session_mismatch = self.run_updated_input_receipt(token, session_id="other-session")
+        generation_mismatch = self.run_updated_input_receipt(token, request_id="other-generation")
+        matched = self.run_updated_input_receipt(token, request_id="generation-1")
+
+        self.assertEqual(session_mismatch["comparison"]["reason"], "probe_receipt_session_mismatch")
+        self.assertEqual(generation_mismatch["comparison"]["reason"], "probe_receipt_generation_mismatch")
+        self.assertEqual(matched["comparison"]["status"], "matched")
+
+    def test_updated_input_receive_cli_returns_only_hook_json(self) -> None:
+        self.prepare_updated_input_fixture()
+        payload = self.workbuddy_pre_tool_event(
+            session_id="session-sentinel-private",
+            generation_id="generation-sentinel-private",
+            tool_use_id="tool-sentinel-private",
+            call_id="call-sentinel-private",
+        )
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(PROBE_PATH),
+                "receive",
+                "--workspace",
+                str(self.workspace),
+            ],
+            cwd=self.workspace,
+            input=json.dumps(payload),
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        response = json.loads(completed.stdout)
+
+        self.assertEqual(set(response), {"hookSpecificOutput"})
+        hook_output = response["hookSpecificOutput"]
+        self.assertEqual(set(hook_output), {"hookEventName", "updatedInput"})
+        self.assertEqual(hook_output["hookEventName"], "PreToolUse")
+        self.assertNotIn("permissionDecision", hook_output)
+        self.assertNotIn("decision", hook_output)
+        self.assertNotIn("continue", hook_output)
+        self.assertNotIn("updatedPermissions", hook_output)
+        for private_value in (
+            payload["session_id"],
+            payload["generation_id"],
+            payload["tool_use_id"],
+            payload["call_id"],
+        ):
+            self.assertNotIn(private_value, completed.stdout)
+
+    def test_updated_input_run_cli_hides_native_identity_values(self) -> None:
+        self.prepare_updated_input_fixture()
+        payload = self.workbuddy_pre_tool_event(
+            session_id="session-sentinel-private",
+            generation_id="generation-sentinel-private",
+            tool_use_id="tool-sentinel-private",
+            call_id="call-sentinel-private",
+        )
+        received = probe.receive_payload(self.workspace, payload)
+        self.receipt_token(received)
+        command = received["hook_output"]["updatedInput"]["command"]
+        self.assertIsInstance(command, str)
+        environment = {
+            **os.environ,
+            "CODEBUDDY_SESSION_ID": payload["session_id"],
+            "CONVERSATION_REQUEST_ID": payload["generation_id"],
+        }
+
+        completed = subprocess.run(
+            shlex.split(command),
+            cwd=self.workspace,
+            env=environment,
+            capture_output=True,
+            check=True,
+            text=True,
+        )
+        response = json.loads(completed.stdout)
+
+        self.assertEqual(response["status"], "matched")
+        for private_value in (
+            payload["session_id"],
+            payload["generation_id"],
+            payload["tool_use_id"],
+            payload["call_id"],
+        ):
+            self.assertNotIn(private_value, completed.stdout)
+
+    def test_updated_input_replay_reuses_a_token_and_conflicting_callback_is_rejected(self) -> None:
+        self.prepare_updated_input_fixture()
+        payload = self.workbuddy_pre_tool_event()
+        first = probe.receive_payload(self.workspace, payload)
+        replay = probe.receive_payload(self.workspace, payload)
+        conflicting = self.workbuddy_pre_tool_event(command="printf changed-command")
+        conflict = probe.receive_payload(self.workspace, conflicting)
+
+        self.assertEqual(self.receipt_token(first), self.receipt_token(replay))
+        self.assertEqual(replay["transport_status"], "reused")
+        self.assertEqual(conflict["status"], "conflict")
+        self.assertEqual(conflict["transport_status"], "conflict")
+        self.assertNotIn("hook_output", conflict)
+        self.assertEqual(len(probe.inspect(self.workspace)["receipts"]), 1)
+
+    def test_updated_input_conflict_invalidates_a_receipt_and_taints_its_identity(self) -> None:
+        self.prepare_updated_input_fixture()
+        payload = self.workbuddy_pre_tool_event()
+        first = probe.receive_payload(self.workspace, payload)
+        token = self.receipt_token(first)
+        conflicting = self.workbuddy_pre_tool_event()
+        conflicting_input = dict(conflicting["tool_input"])
+        conflicting_input["description"] = "different callback payload"
+        conflicting["tool_input"] = conflicting_input
+
+        conflict = probe.receive_payload(self.workspace, conflicting)
+        after_conflict = self.run_updated_input_receipt(token)
+        replay = probe.receive_payload(self.workspace, payload)
+        after_replay = self.run_updated_input_receipt(token)
+        inspection = probe.inspect(self.workspace)
+
+        self.assertEqual(conflict["status"], "conflict")
+        self.assertEqual(conflict["transport_status"], "conflict")
+        self.assertEqual(after_conflict["comparison"]["reason"], "probe_receipt_conflicted")
+        self.assertEqual(replay["status"], "deduplicated")
+        self.assertEqual(replay["transport_status"], "conflict")
+        self.assertNotIn("hook_output", replay)
+        self.assertEqual(after_replay["comparison"]["reason"], "probe_receipt_conflicted")
+        self.assertEqual(len(inspection["receipts"]), 1)
+        self.assertIsNotNone(inspection["receipts"][0]["invalidated_at"])
+
+    def test_normal_post_tool_use_does_not_invalidate_a_consumed_pretool_receipt(self) -> None:
+        self.prepare_updated_input_fixture()
+        payload = self.workbuddy_pre_tool_event()
+        first = probe.receive_payload(self.workspace, payload)
+        token = self.receipt_token(first)
+        consumed = self.run_updated_input_receipt(token)
+        post_tool_use = dict(payload)
+        post_tool_use["hook_event_name"] = "PostToolUse"
+        post_tool_use["tool_response"] = {"exit_code": 0}
+
+        post = probe.receive_payload(self.workspace, post_tool_use)
+        replay = probe.receive_payload(self.workspace, post_tool_use)
+        inspection = probe.inspect(self.workspace)
+
+        self.assertEqual(consumed["comparison"]["status"], "matched")
+        self.assertEqual(post["status"], "recorded")
+        self.assertEqual(post["transport_status"], "not_pre_tool_use")
+        self.assertEqual(replay["status"], "deduplicated")
+        self.assertEqual(replay["transport_status"], "not_pre_tool_use")
+        self.assertNotIn("hook_output", replay)
+        self.assertIsNone(inspection["receipts"][0].get("invalidated_at"))
+
+    def test_partial_conflicting_callback_taints_only_its_stable_identity(self) -> None:
+        self.prepare_updated_input_fixture()
+        payload = self.workbuddy_pre_tool_event()
+        first = probe.receive_payload(self.workspace, payload)
+        token = self.receipt_token(first)
+        malformed = dict(payload)
+        malformed.pop("generation_id")
+
+        conflict = probe.receive_payload(self.workspace, malformed)
+        after_conflict = self.run_updated_input_receipt(token)
+        replay = probe.receive_payload(self.workspace, payload)
+        after_replay = self.run_updated_input_receipt(token)
+        unrelated = probe.receive_payload(
+            self.workspace,
+            self.workbuddy_pre_tool_event(
+                session_id="unrelated-session",
+                generation_id="unrelated-generation",
+                tool_use_id="unrelated-tool",
+                call_id="unrelated-call",
+            ),
+        )
+        unrelated_token = self.receipt_token(unrelated)
+        unrelated_run = self.run_updated_input_receipt(
+            unrelated_token,
+            session_id="unrelated-session",
+            request_id="unrelated-generation",
+        )
+        inspection = probe.inspect(self.workspace)
+
+        self.assertEqual(conflict["status"], "conflict")
+        self.assertEqual(conflict["transport_status"], "missing_native_identity")
+        self.assertEqual(after_conflict["comparison"]["reason"], "probe_receipt_conflicted")
+        self.assertEqual(replay["transport_status"], "conflict")
+        self.assertNotIn("hook_output", replay)
+        self.assertEqual(after_replay["comparison"]["reason"], "probe_receipt_conflicted")
+        self.assertEqual(unrelated["transport_status"], "issued")
+        self.assertEqual(unrelated_run["comparison"]["status"], "matched")
+        self.assertEqual(len(inspection["receipts"]), 2)
+        self.assertIsNotNone(inspection["receipts"][0]["invalidated_at"])
+        self.assertIsNone(inspection["receipts"][1].get("invalidated_at"))
+
+    def test_tool_call_alias_conflict_taints_the_native_tool_use_receipt(self) -> None:
+        self.prepare_updated_input_fixture()
+        payload = self.workbuddy_pre_tool_event()
+        first = probe.receive_payload(self.workspace, payload)
+        token = self.receipt_token(first)
+        conflicting = dict(payload)
+        conflicting["tool_call_id"] = "different-alias"
+
+        conflict = probe.receive_payload(self.workspace, conflicting)
+        after_conflict = self.run_updated_input_receipt(token)
+        replay = probe.receive_payload(self.workspace, payload)
+        after_replay = self.run_updated_input_receipt(token)
+        inspection = probe.inspect(self.workspace)
+
+        self.assertEqual(conflict["status"], "recorded")
+        self.assertEqual(conflict["transport_status"], "conflict")
+        self.assertEqual(after_conflict["comparison"]["reason"], "probe_receipt_conflicted")
+        self.assertEqual(replay["transport_status"], "conflict")
+        self.assertNotIn("hook_output", replay)
+        self.assertEqual(after_replay["comparison"]["reason"], "probe_receipt_conflicted")
+        self.assertEqual(len(inspection["receipts"]), 1)
+        self.assertIsNotNone(inspection["receipts"][0]["invalidated_at"])
+
+    def test_partial_tool_call_alias_conflict_taints_the_native_tool_use_receipt(self) -> None:
+        self.prepare_updated_input_fixture()
+        payload = self.workbuddy_pre_tool_event()
+        first = probe.receive_payload(self.workspace, payload)
+        token = self.receipt_token(first)
+        conflicting = dict(payload)
+        conflicting.pop("generation_id")
+        conflicting["tool_call_id"] = "different-alias"
+
+        conflict = probe.receive_payload(self.workspace, conflicting)
+        after_conflict = self.run_updated_input_receipt(token)
+        replay = probe.receive_payload(self.workspace, payload)
+        after_replay = self.run_updated_input_receipt(token)
+
+        self.assertEqual(conflict["status"], "recorded")
+        self.assertEqual(conflict["transport_status"], "missing_native_identity")
+        self.assertEqual(after_conflict["comparison"]["reason"], "probe_receipt_conflicted")
+        self.assertEqual(replay["transport_status"], "conflict")
+        self.assertNotIn("hook_output", replay)
+        self.assertEqual(after_replay["comparison"]["reason"], "probe_receipt_conflicted")
+
+    def test_updated_input_rejects_non_fixed_commands_missing_native_ids_and_fixture_source(self) -> None:
+        self.prepare_updated_input_fixture()
+        fixed_command = probe.run_command(self.workspace)
+        invalid_commands = (
+            f"echo unrelated && {fixed_command}",
+            f"cd {self.workspace} && {fixed_command} --unknown",
+            f"cd {self.root.resolve()} && {fixed_command}",
+            f"cd {self.workspace.resolve()} && {fixed_command} && true",
+            f"cd $(pwd) && {fixed_command}",
+            f"$(printf unexpected) {fixed_command}",
+            f"/bin/sh outside.py run --workspace {self.workspace}",
+            f"{fixed_command}\ntrue",
+            f"{fixed_command}\rtrue",
+            f"{fixed_command}\x00true",
+        )
+        for index, command in enumerate(invalid_commands):
+            received = probe.receive_payload(
+                self.workspace,
+                self.workbuddy_pre_tool_event(
+                    command=command,
+                    tool_use_id=f"invalid-tool-{index}",
+                    call_id=f"invalid-call-{index}",
+                ),
+            )
+            self.assertEqual(received["transport_status"], "unsupported_fixed_command")
+            self.assertNotIn("hook_output", received)
+
+        missing_ids = self.workbuddy_pre_tool_event()
+        del missing_ids["generation_id"]
+        missing = probe.receive_payload(self.workspace, missing_ids)
+        empty_ids = self.workbuddy_pre_tool_event(tool_use_id="", call_id="")
+        empty = probe.receive_payload(self.workspace, empty_ids)
+        fixture_source = probe.receive_payload(
+            self.workspace,
+            self.workbuddy_pre_tool_event(tool_use_id="fixture-tool", call_id="fixture-call"),
+            source="fixture",
+        )
+
+        self.assertEqual(missing["transport_status"], "missing_native_identity")
+        self.assertEqual(empty["transport_status"], "missing_native_identity")
+        self.assertEqual(fixture_source["transport_status"], "fixture_source")
+        self.assertNotIn("hook_output", missing)
+        self.assertNotIn("hook_output", fixture_source)
+
+    def test_updated_input_receipt_rejects_spent_expired_and_drifted_runtime_arguments(self) -> None:
+        self.prepare_updated_input_fixture()
+        first = probe.receive_payload(self.workspace, self.workbuddy_pre_tool_event())
+        token = self.receipt_token(first)
+        drifted = self.run_updated_input_receipt(
+            token,
+            runtime_arguments=(
+                "run",
+                "--workspace",
+                str(self.workspace),
+                "--probe-receipt",
+                token,
+                "--unexpected",
+            ),
+        )
+        consumed = self.run_updated_input_receipt(token)
+        spent = self.run_updated_input_receipt(token)
+
+        self.assertEqual(drifted["comparison"]["status"], "unknown")
+        self.assertEqual(drifted["comparison"]["reason"], "probe_receipt_arg_drift")
+        self.assertEqual(consumed["comparison"]["status"], "matched")
+        self.assertEqual(spent["comparison"]["reason"], "probe_receipt_spent")
+
+        second = probe.receive_payload(
+            self.workspace,
+            self.workbuddy_pre_tool_event(tool_use_id="tool-use-2", call_id="call-2"),
+        )
+        receipts = probe.load_receipts(self.workspace)
+        receipts[-1]["expires_at"] = "2000-01-01T00:00:00Z"
+        probe.write_private_json(probe.receipts_path(self.workspace), receipts, replace=True)
+        expired = self.run_updated_input_receipt(self.receipt_token(second))
+
+        self.assertEqual(expired["comparison"]["status"], "unknown")
+        self.assertEqual(expired["comparison"]["reason"], "probe_receipt_expired")
 
 
 if __name__ == "__main__":
