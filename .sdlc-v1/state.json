@@ -41,10 +41,10 @@
           "id": "T-003",
           "status": "done",
           "title": "修正独立评审的摘要、记录与维护完整性",
-          "updated_at": "2026-10-20T05:10:37Z"
+          "updated_at": "2026-10-20T05:43:48Z"
         }
       },
-      "updated_at": "2026-10-20T05:10:37Z",
+      "updated_at": "2026-10-20T05:43:48Z",
       "validation": {
         "at": null,
         "command": null,
@@ -65,7 +65,7 @@
       "product_context_ref": ".sdlc-v1/context/REQ-001.product.md",
       "status": "in_delivery",
       "title": "Skill Evolving Life Cycle 的创建、观测与迭代方案",
-      "updated_at": "2026-10-20T05:10:37Z"
+      "updated_at": "2026-10-20T05:43:48Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

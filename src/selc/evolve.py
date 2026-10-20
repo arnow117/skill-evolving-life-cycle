@@ -1084,13 +1084,21 @@ def _parse_contribution_request(
             "provider request query did not return structured JSON",
             "inspect the fixed repository before retrying",
         ) from error
-    entries = parsed if isinstance(parsed, list) else [parsed]
-    if not entries or not all(isinstance(item, dict) for item in entries):
+    if not isinstance(parsed, list):
         raise SelcError(
             "REQUEST_QUERY_AMBIGUOUS",
             "provider request query has an unsupported JSON shape",
             "inspect the fixed repository before retrying",
         )
+    if not parsed:
+        return "absent"
+    if not all(isinstance(item, dict) for item in parsed):
+        raise SelcError(
+            "REQUEST_QUERY_AMBIGUOUS",
+            "provider request query has an unsupported JSON shape",
+            "inspect the fixed repository before retrying",
+        )
+    entries: list[dict[str, Any]] = parsed
     expected_repository = repository.split("/", maxsplit=1)[1]
     if provider == "github":
         for item in entries:
@@ -1102,27 +1110,33 @@ def _parse_contribution_request(
                     "GitHub request query lacks head repository identity",
                     "inspect the fixed repository before retrying",
                 )
-            if (
+            matches_identity = (
                 item.get("headRefName") == branch
                 and item.get("baseRefName") == base_branch
                 and item.get("headRefOid") == commit
                 and head_repository.get("nameWithOwner") == expected_repository
                 and head_owner.get("login") == expected_repository.split("/", maxsplit=1)[0]
-            ):
-                state = item.get("state")
-                if not isinstance(state, str):
-                    raise SelcError(
-                        "REQUEST_QUERY_AMBIGUOUS",
-                        "GitHub request query lacks an open-state value",
-                        "inspect the fixed repository before retrying",
-                    )
-                if state != "OPEN":
-                    raise SelcError(
-                        "REQUEST_INACTIVE",
-                        "GitHub returned a matching contribution request that is not open",
-                        "inspect the inactive request and prepare a new contribution if needed",
-                    )
-                return "matching"
+            )
+            if not matches_identity:
+                raise SelcError(
+                    "REQUEST_CONFLICT",
+                    "provider returned a request that does not match the prepared repository, head, and base",
+                    "inspect the fixed repository before retrying",
+                )
+            state = item.get("state")
+            if not isinstance(state, str):
+                raise SelcError(
+                    "REQUEST_QUERY_AMBIGUOUS",
+                    "GitHub request query lacks an open-state value",
+                    "inspect the fixed repository before retrying",
+                )
+            if state != "OPEN":
+                raise SelcError(
+                    "REQUEST_INACTIVE",
+                    "GitHub returned a matching contribution request that is not open",
+                    "inspect the inactive request and prepare a new contribution if needed",
+                )
+        return "matching"
     elif provider == "gitlab":
         for item in entries:
             source_project = item.get("source_project_id")
@@ -1140,7 +1154,11 @@ def _parse_contribution_request(
                 and source_project == target_project
             )
             if not matches_identity:
-                continue
+                raise SelcError(
+                    "REQUEST_CONFLICT",
+                    "provider returned a request that does not match the prepared repository, head, and base",
+                    "inspect the fixed repository before retrying",
+                )
             state = item.get("state")
             if not isinstance(state, str):
                 raise SelcError(
@@ -1154,7 +1172,7 @@ def _parse_contribution_request(
                     "GitLab returned a matching contribution request that is not opened",
                     "inspect the inactive request and prepare a new contribution if needed",
                 )
-            return "matching"
+        return "matching"
     else:
         raise SelcError(
             "UNSUPPORTED_PROVIDER",

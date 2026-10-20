@@ -171,6 +171,42 @@ class BoundaryContractTests(unittest.TestCase):
                         commit,
                     )
                 self.assertEqual(inactive.exception.code, expected_code)
+
+        github_inactive = json.loads(github)[0]
+        github_inactive["state"] = "CLOSED"
+        github_unknown = json.loads(github)[0]
+        del github_unknown["state"]
+        github_conflict = json.loads(github)[0]
+        github_conflict["headRefName"] = "codex/other-plan"
+        for label, extra, expected_code in (
+            ("inactive", github_inactive, "REQUEST_INACTIVE"),
+            ("unknown", github_unknown, "REQUEST_QUERY_AMBIGUOUS"),
+            ("conflict", github_conflict, "REQUEST_CONFLICT"),
+        ):
+            for entries in ([json.loads(github)[0], extra], [extra, json.loads(github)[0]]):
+                with self.subTest(provider="github", label=label, entries=entries):
+                    with self.assertRaises(SelcError) as mixed_response:
+                        _parse_contribution_request(
+                            "github",
+                            json.dumps(entries),
+                            "github.com/owner/center",
+                            "codex/contribution-suite",
+                            "main",
+                            commit,
+                        )
+                    self.assertEqual(mixed_response.exception.code, expected_code)
+
+        self.assertEqual(
+            _parse_contribution_request(
+                "github",
+                json.dumps([json.loads(github)[0], json.loads(github)[0]]),
+                "github.com/owner/center",
+                "codex/contribution-suite",
+                "main",
+                commit,
+            ),
+            "matching",
+        )
         for unverified in ("", "null"):
             with self.subTest(unverified=unverified):
                 with self.assertRaises(SelcError) as ambiguous:
@@ -239,6 +275,42 @@ class BoundaryContractTests(unittest.TestCase):
                         commit,
                     )
                 self.assertEqual(inactive.exception.code, expected_code)
+
+        gitlab_inactive = json.loads(gitlab)[0]
+        gitlab_inactive["state"] = "closed"
+        gitlab_unknown = json.loads(gitlab)[0]
+        del gitlab_unknown["state"]
+        gitlab_conflict = json.loads(gitlab)[0]
+        gitlab_conflict["source_branch"] = "codex/other-plan"
+        for label, extra, expected_code in (
+            ("inactive", gitlab_inactive, "REQUEST_INACTIVE"),
+            ("unknown", gitlab_unknown, "REQUEST_QUERY_AMBIGUOUS"),
+            ("conflict", gitlab_conflict, "REQUEST_CONFLICT"),
+        ):
+            for entries in ([json.loads(gitlab)[0], extra], [extra, json.loads(gitlab)[0]]):
+                with self.subTest(provider="gitlab", label=label, entries=entries):
+                    with self.assertRaises(SelcError) as mixed_response:
+                        _parse_contribution_request(
+                            "gitlab",
+                            json.dumps(entries),
+                            "gitlab.com/owner/center",
+                            "codex/contribution-suite",
+                            "main",
+                            commit,
+                        )
+                    self.assertEqual(mixed_response.exception.code, expected_code)
+
+        self.assertEqual(
+            _parse_contribution_request(
+                "gitlab",
+                json.dumps([json.loads(gitlab)[0], json.loads(gitlab)[0]]),
+                "gitlab.com/owner/center",
+                "codex/contribution-suite",
+                "main",
+                commit,
+            ),
+            "matching",
+        )
 
         github_argv = contribution_query_argv(
             "github", "gh", "github.com/owner/center", "branch", "main"
@@ -384,6 +456,120 @@ class BoundaryContractTests(unittest.TestCase):
                 total_timeout_seconds=60,
             )
         self.assertEqual(invalid_candidate.exception.code, "INVALID_SKILL")
+
+    def test_frontmatter_rejects_invalid_keys_across_shared_consumers(self) -> None:
+        skill_directory = self.root / "key-syntax"
+        skill_directory.mkdir()
+        skill_file = skill_directory / "SKILL.md"
+
+        def write_skill(extra_line: str) -> None:
+            skill_file.write_text(
+                "---\n"
+                "name: text-report\n"
+                "description: valid portable description\n"
+                f"{extra_line}\n"
+                "---\n"
+                "Body\n",
+                encoding="utf-8",
+            )
+
+        write_skill('optional-field: "ordinary metadata"')
+        validate_skill_structure(skill_file, "text-report")
+
+        for invalid_key in (
+            "description : null",
+            '"description": null',
+            "name : null",
+            '"name": other-skill',
+            "<<: merged value",
+            "!tag: tagged value",
+            "&anchor: anchored value",
+        ):
+            with self.subTest(invalid_key=invalid_key):
+                write_skill(invalid_key)
+                with self.assertRaises(SelcError) as invalid:
+                    validate_skill_structure(skill_file, "text-report")
+                self.assertEqual(invalid.exception.code, "INVALID_SKILL")
+
+        repository, suite = self.create_repository("key-syntax-suite", "suite")
+        source_skill = suite / "skills" / "text-report" / "SKILL.md"
+        source_skill.write_text(
+            "---\n"
+            "name: text-report\n"
+            "description: valid portable description\n"
+            "description : null\n"
+            "---\n"
+            "Body\n",
+            encoding="utf-8",
+        )
+        for operation in (
+            lambda: load_manifest(suite),
+            lambda: seal_suite(suite),
+            lambda: package_suite(suite, self.root / "key-syntax-suite.zip"),
+        ):
+            with self.assertRaises(SelcError) as invalid_source:
+                operation()
+            self.assertEqual(invalid_source.exception.code, "INVALID_SKILL")
+
+        source_skill.write_text(
+            "---\nname: text-report\ndescription: valid source description\n---\nBody\n",
+            encoding="utf-8",
+        )
+        seal_suite(suite)
+        candidate = Path(prepare_candidate(suite, self.root / "key-syntax-candidate")["candidate"])
+        candidate_skill = candidate / "skills" / "text-report" / "SKILL.md"
+        candidate_skill.write_text(
+            "---\n"
+            "name: text-report\n"
+            "description: valid candidate description\n"
+            '"description": null\n'
+            "---\n"
+            "Body\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(SelcError) as invalid_candidate:
+            evaluate_candidate(
+                candidate,
+                self.root / "key-syntax-evaluation.json",
+                max_runs=8,
+                model_calls=0,
+                candidate_number=1,
+                candidate_limit=2,
+                run_timeout_seconds=10,
+                total_timeout_seconds=60,
+            )
+        self.assertEqual(invalid_candidate.exception.code, "INVALID_SKILL")
+
+        consumer_repository, consumer_suite = self.create_repository("key-syntax-consumer", "suite")
+        consumer_candidate, consumer_evaluation = self.candidate_and_evaluation(
+            consumer_suite, "key-syntax-consumer"
+        )
+        consumer_skill = consumer_candidate / "skills" / "text-report" / "SKILL.md"
+        consumer_skill.write_text(
+            "---\n"
+            "name: text-report\n"
+            "description: valid consumer description\n"
+            "name : null\n"
+            "---\n"
+            "Body\n",
+            encoding="utf-8",
+        )
+        forged_evaluation = json.loads(consumer_evaluation.read_text(encoding="utf-8"))
+        forged_evaluation["candidate_hash"] = tree_hash(consumer_candidate)
+        consumer_evaluation.write_text(
+            json.dumps(forged_evaluation, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(SelcError) as invalid_contribution:
+            prepare_contribution(
+                consumer_candidate,
+                consumer_suite,
+                consumer_evaluation,
+                consumer_repository,
+                self.root / "key-syntax-consumer-workspace",
+                self.root / "key-syntax-consumer-plan.json",
+            )
+        self.assertEqual(invalid_contribution.exception.code, "INVALID_SKILL")
 
     def test_frontmatter_character_boundaries_are_ascii_and_reject_raw_controls(self) -> None:
         skill_directory = self.root / "frontmatter-characters"

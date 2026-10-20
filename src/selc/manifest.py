@@ -24,6 +24,7 @@ from .util import (
 )
 
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
+FRONTMATTER_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 RUNTIME_PROTOCOL = 1
 SOURCE_BASELINE_NAME = "source-baseline.json"
 ASCII_SPACE = " "
@@ -387,6 +388,12 @@ def validate_skill_structure(skill_file: Path, declared_name: str) -> None:
                 "use simple scalar name and description fields",
             )
         key, raw_value = line.split(":", maxsplit=1)
+        if not FRONTMATTER_KEY.fullmatch(key):
+            raise SelcError(
+                "INVALID_SKILL",
+                "portable skill frontmatter has an unsupported top-level key",
+                "use an unquoted ASCII identifier key without surrounding whitespace",
+            )
         if key not in {"name", "description"}:
             continue
         if raw_value and raw_value[0] != ASCII_SPACE:

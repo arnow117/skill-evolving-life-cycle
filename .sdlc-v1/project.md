@@ -6,7 +6,7 @@
 
 SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成物面向 Codex 与 WorkBuddy；产品权威为 `context/REQ-001.product.md`，当前工程方案为 `context/F-001.engineering.md`。AiTaxs 为延后试点，不是当前实现依赖。进度仅由 `state.json` 表示。
 
-用户已确认本地提交及继续验证/评审。历史验证/Review记录保留。API013字符级与生成端修正已接受Build（75 tests、README66操作、creator及保留名实际CLI对照），待新commit正式验证/评审。技术栈为 Python >=3.11 标准库 CLI + SQLite + Git/uv；实际功能范围和证据以工程上下文的独立实际记录为准。
+用户已确认本地提交及继续验证/评审，历史验证与评审记录保留。`691725c` 的正式验证通过（75 项测试、README 的 66 条实际操作、creator 及保留名 CLI 对照）；独立评审发现键别名和多请求集合两项缺陷，当前按 API014 修正。技术栈为 Python >=3.11 标准库 CLI + SQLite + Git/uv；实际功能范围和证据以工程上下文为准。
 
 ## 约定与环境
 
@@ -21,14 +21,14 @@ SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成�
 | surface | 规划位置 | 当前证据 |
 | --- | --- | --- |
 | 作者 skill/CLI | `.claude/skills/selc/`、`scripts/selc.py`、`src/selc/cli.py` | 创建/creator 改写/seal/打包本地流程通过 |
-| 本机记录 | `src/selc/records.py`，项目 `.selc/records.sqlite3` | 行为测试候选见工程实际记录 |
+| 本机记录 | `src/selc/records.py`，项目 `.selc/records.sqlite3` | task/call 双轴结果、反馈修订、导入去重与删除回归通过，见工程 Validation |
 | 安装与宿主适配 | `manifest.py` / `install.py`，生成物独立 entry | 本地结构与 portable CLI 测试；真实宿主 smoke 未运行 |
 | 更新/评估/贡献/发布 | `install.py` / `evolve.py`，portable suite runtime | 框架来源复用、目录恢复、缺省保留与选择并发复核已有返修证据；贡献仅 public GitHub/GitLab 和 local，真实外部执行未授权 |
-| 验证 | `tests/` 和 README 的 US-001 至 US-005 | a5c0605 正式 Validate PASS，71 项测试及 SC001–007 本地范围证据，见工程 Validation |
+| 验证 | `tests/` 和 README 的 US-001 至 US-005 | 691725c 正式 Validate PASS，75项测试及 SC001–007 本地范围证据，见工程 Validation |
 
 ## 检查入口
 
-实现者已执行的代表性命令如下，完整原始证据和适用范围留在工程上下文；它们不等于 commit-bound lifecycle 验证已通过。
+正式验证使用的主要命令如下，完整原始证据、绑定 commit 和适用范围见工程上下文。
 
 ```bash
 UV_CACHE_DIR=/private/tmp/selc-uv-cache uv run --no-project --python 3.12 python -m unittest discover -s tests -v
