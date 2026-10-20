@@ -6,7 +6,7 @@
 
 SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成物面向 Codex 与 WorkBuddy；产品权威为 `context/REQ-001.product.md`，当前工程方案为 `context/F-001.engineering.md`。AiTaxs 为延后试点，不是当前实现依赖。进度仅由 `state.json` 表示。
 
-用户已确认本地提交及继续验证/评审。前四轮正式验证失败和全部 Review 记录保留。第三轮 Review 的三项输入/副作用缺口已按 API013 修正并接受 Build（73 tests、README 实际旅程），待新 commit 正式验证/评审。技术栈为 Python >=3.11 标准库 CLI + SQLite + Git/uv；实际功能范围和证据以工程上下文的独立实际记录为准。
+用户已确认本地提交及继续验证/评审。历史验证/Review记录保留。API013字符级与生成端修正已接受Build（75 tests、README66操作、creator及保留名实际CLI对照），待新commit正式验证/评审。技术栈为 Python >=3.11 标准库 CLI + SQLite + Git/uv；实际功能范围和证据以工程上下文的独立实际记录为准。
 
 ## 约定与环境
 

@@ -40,6 +40,7 @@ from selc.manifest import (
     suite_content_hash,
     validate_skill_structure,
 )
+from selc.util import tree_hash
 
 
 def git(arguments: list[str], cwd: Path) -> str:
@@ -383,6 +384,114 @@ class BoundaryContractTests(unittest.TestCase):
                 total_timeout_seconds=60,
             )
         self.assertEqual(invalid_candidate.exception.code, "INVALID_SKILL")
+
+    def test_frontmatter_character_boundaries_are_ascii_and_reject_raw_controls(self) -> None:
+        skill_directory = self.root / "frontmatter-characters"
+        skill_directory.mkdir()
+        skill_file = skill_directory / "SKILL.md"
+
+        def write_skill(name_line: str, description_line: str) -> None:
+            skill_file.write_text(
+                f"---\n{name_line}\n{description_line}\n---\nBody\n",
+                encoding="utf-8",
+            )
+
+        write_skill("name: text-report", "description: ordinary text")
+        validate_skill_structure(skill_file, "text-report")
+
+        write_skill("name: text-report", 'description: "ordinary\u00a0text"')
+        validate_skill_structure(skill_file, "text-report")
+
+        write_skill("name: text-report", "description: 'ordinary\ttext'")
+        validate_skill_structure(skill_file, "text-report")
+
+        write_skill("name: text-report", r'description: "ordinary\u0000text"')
+        validate_skill_structure(skill_file, "text-report")
+
+        for name, description in (
+            ("name:\ttext-report", "description: ordinary text"),
+            ("name: text-report", "description:\tordinary text"),
+            ("name: text-report", "description: ordinary\ttext"),
+            ("name: text-report", "description:\u00a0ordinary text"),
+            ("name: text-report", "description: ordinary text\f# note"),
+            ("name: text-report", "description: 'ordinary\x00text'"),
+        ):
+            with self.subTest(name=repr(name), description=repr(description)):
+                write_skill(name, description)
+                with self.assertRaises(SelcError) as invalid:
+                    validate_skill_structure(skill_file, "text-report")
+                self.assertEqual(invalid.exception.code, "INVALID_SKILL")
+
+        repository, suite = self.create_repository("character-pipeline-suite", "suite")
+        source_skill = suite / "skills" / "text-report" / "SKILL.md"
+        source_skill.write_text(
+            "---\nname: text-report\ndescription: 'ordinary\x00text'\n---\nBody\n",
+            encoding="utf-8",
+        )
+        for operation in (
+            lambda: load_manifest(suite),
+            lambda: seal_suite(suite),
+            lambda: package_suite(suite, self.root / "character-pipeline-suite.zip"),
+        ):
+            with self.assertRaises(SelcError) as invalid_source:
+                operation()
+            self.assertEqual(invalid_source.exception.code, "INVALID_SKILL")
+
+        source_skill.write_text(
+            "---\nname: text-report\ndescription: valid source description\n---\nBody\n",
+            encoding="utf-8",
+        )
+        seal_suite(suite)
+        candidate = Path(
+            prepare_candidate(suite, self.root / "character-pipeline-candidate")["candidate"]
+        )
+        candidate_skill = candidate / "skills" / "text-report" / "SKILL.md"
+        candidate_skill.write_text(
+            "---\nname: text-report\ndescription:\u00a0candidate separator\n---\nBody\n",
+            encoding="utf-8",
+        )
+        evaluation_path = self.root / "character-pipeline-evaluation.json"
+        with self.assertRaises(SelcError) as invalid_candidate:
+            evaluate_candidate(
+                candidate,
+                evaluation_path,
+                max_runs=8,
+                model_calls=0,
+                candidate_number=1,
+                candidate_limit=2,
+                run_timeout_seconds=10,
+                total_timeout_seconds=60,
+            )
+        self.assertEqual(invalid_candidate.exception.code, "INVALID_SKILL")
+        self.assertFalse(evaluation_path.exists())
+
+        consumer_repository, consumer_suite = self.create_repository(
+            "character-consumer-suite", "suite"
+        )
+        consumer_candidate, consumer_evaluation = self.candidate_and_evaluation(
+            consumer_suite, "character-consumer"
+        )
+        consumer_skill = consumer_candidate / "skills" / "text-report" / "SKILL.md"
+        consumer_skill.write_text(
+            "---\nname: text-report\ndescription:\u00a0candidate separator\n---\nBody\n",
+            encoding="utf-8",
+        )
+        forged_evaluation = json.loads(consumer_evaluation.read_text(encoding="utf-8"))
+        forged_evaluation["candidate_hash"] = tree_hash(consumer_candidate)
+        consumer_evaluation.write_text(
+            json.dumps(forged_evaluation, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        with self.assertRaises(SelcError) as invalid_contribution:
+            prepare_contribution(
+                consumer_candidate,
+                consumer_suite,
+                consumer_evaluation,
+                consumer_repository,
+                self.root / "character-consumer-workspace",
+                self.root / "character-consumer-plan.json",
+            )
+        self.assertEqual(invalid_contribution.exception.code, "INVALID_SKILL")
 
     def test_contribution_push_uses_the_verified_commit_not_a_later_head(self) -> None:
         repository, suite = self.create_repository("push-object-suite", "suite")

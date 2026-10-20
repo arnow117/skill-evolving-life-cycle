@@ -108,6 +108,20 @@ class SealContractsTests(unittest.TestCase):
         self.assertEqual(descriptor_path.read_bytes(), original_descriptor)
         self.assertEqual((suite / "suite.json").read_bytes(), original_manifest)
 
+    def test_create_quotes_legal_reserved_skill_names_for_portable_validation(self) -> None:
+        for skill_name in ("off", "null"):
+            with self.subTest(skill_name=skill_name):
+                suite = self.root / f"generated-{skill_name}"
+                package = self.root / f"generated-{skill_name}.zip"
+                create_suite("generated-names", "1.0.0", suite, [skill_name])
+
+                manifest = load_manifest(suite)
+                self.assertEqual(
+                    manifest["skills"], [{"name": skill_name, "path": f"skills/{skill_name}"}]
+                )
+                package_suite(suite, package)
+                self.assertTrue(package.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

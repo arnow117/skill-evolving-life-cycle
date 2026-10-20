@@ -26,6 +26,7 @@ from .util import (
 NAME = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 RUNTIME_PROTOCOL = 1
 SOURCE_BASELINE_NAME = "source-baseline.json"
+ASCII_SPACE = " "
 
 
 def manifest_path(suite_root: Path) -> Path:
@@ -346,13 +347,15 @@ def validate_skill_structure(skill_file: Path, declared_name: str) -> None:
     """
 
     try:
-        lines = skill_file.read_text(encoding="utf-8").splitlines()
-    except OSError as error:
+        source = skill_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
         raise SelcError(
             "INVALID_SKILL",
             f"cannot read declared skill: {skill_file}",
             "restore the declared SKILL.md file",
         ) from error
+    _validate_portable_frontmatter_characters(_raw_frontmatter_source(source))
+    lines = source.splitlines()
     if not lines or lines[0] != "---":
         raise SelcError(
             "INVALID_SKILL",
@@ -369,9 +372,9 @@ def validate_skill_structure(skill_file: Path, declared_name: str) -> None:
         ) from error
     values: dict[str, str] = {}
     for line in lines[1:closing_index]:
-        if not line.strip() or line.lstrip().startswith("#"):
+        if not line.strip(ASCII_SPACE) or line.lstrip(ASCII_SPACE).startswith("#"):
             continue
-        if line[0].isspace():
+        if line[0] == ASCII_SPACE:
             raise SelcError(
                 "INVALID_SKILL",
                 f"skill frontmatter has an unsupported nested field: {skill_file}",
@@ -386,7 +389,7 @@ def validate_skill_structure(skill_file: Path, declared_name: str) -> None:
         key, raw_value = line.split(":", maxsplit=1)
         if key not in {"name", "description"}:
             continue
-        if raw_value and not raw_value[0].isspace():
+        if raw_value and raw_value[0] != ASCII_SPACE:
             raise SelcError(
                 "INVALID_SKILL",
                 "portable skill frontmatter requires whitespace after a required field colon",
@@ -429,7 +432,7 @@ def _portable_frontmatter_scalar(raw_value: str) -> str:
     scalar accepted by the authoring validator.
     """
 
-    value = raw_value.lstrip()
+    value = raw_value.lstrip(ASCII_SPACE)
     if not value or value.startswith("#"):
         return ""
     if value.startswith('"'):
@@ -440,6 +443,12 @@ def _portable_frontmatter_scalar(raw_value: str) -> str:
     plain = _plain_frontmatter_string(value)
     if not plain:
         return ""
+    if "\t" in plain:
+        raise SelcError(
+            "INVALID_SKILL",
+            "portable skill frontmatter permits tabs only inside quoted strings",
+            "quote text containing a tab or replace it with an ASCII space",
+        )
     if not (plain[0].isalpha() or plain[0] == "_"):
         raise SelcError(
             "INVALID_SKILL",
@@ -452,7 +461,7 @@ def _portable_frontmatter_scalar(raw_value: str) -> str:
             "portable skill frontmatter needs a string scalar",
             "quote reserved YAML values",
         )
-    if re.search(r":(?=\s|$)", plain):
+    if re.search(r":(?= |$)", plain):
         raise SelcError(
             "INVALID_SKILL",
             "portable skill frontmatter has an ambiguous mapping value",
@@ -479,7 +488,7 @@ def _double_quoted_frontmatter_string(value: str) -> str:
             "quote the value as a JSON string",
         )
     _assert_scalar_tail(value[end:])
-    return decoded.strip()
+    return decoded.strip(ASCII_SPACE)
 
 
 def _single_quoted_frontmatter_string(value: str) -> str:
@@ -498,7 +507,7 @@ def _single_quoted_frontmatter_string(value: str) -> str:
             index += 2
             continue
         _assert_scalar_tail(value[index + 1 :])
-        return "".join(characters).strip()
+        return "".join(characters).strip(ASCII_SPACE)
     raise SelcError(
         "INVALID_SKILL",
         "portable skill frontmatter has an unterminated single-quoted string",
@@ -511,13 +520,13 @@ def _assert_scalar_tail(tail: str) -> None:
 
     if not tail:
         return
-    if not tail[0].isspace():
+    if tail[0] != ASCII_SPACE:
         raise SelcError(
             "INVALID_SKILL",
             "portable skill frontmatter has text after a quoted string",
             "separate a trailing comment with whitespace",
         )
-    remainder = tail.lstrip()
+    remainder = tail.lstrip(ASCII_SPACE)
     if remainder and not remainder.startswith("#"):
         raise SelcError(
             "INVALID_SKILL",
@@ -530,9 +539,57 @@ def _plain_frontmatter_string(value: str) -> str:
     """Strip only a YAML comment whose hash has a preceding whitespace boundary."""
 
     for index, character in enumerate(value):
-        if character == "#" and index > 0 and value[index - 1].isspace():
-            return value[:index].rstrip()
-    return value.rstrip()
+        if character == "#" and index > 0 and value[index - 1] == ASCII_SPACE:
+            return value[:index].rstrip(ASCII_SPACE)
+    return value.rstrip(ASCII_SPACE)
+
+
+def _raw_frontmatter_source(source: str) -> str:
+    """Return frontmatter source without normalizing control characters first."""
+
+    offset = 0
+    first_newline = source.find("\n")
+    if first_newline < 0 or source[:first_newline].rstrip("\r") != "---":
+        return source
+    offset = first_newline + 1
+    while offset <= len(source):
+        newline = source.find("\n", offset)
+        line_end = len(source) if newline < 0 else newline
+        raw_line = source[offset:line_end]
+        if raw_line.rstrip("\r") == "---":
+            return source[: line_end if newline < 0 else newline + 1]
+        if newline < 0:
+            return source
+        offset = newline + 1
+    return source
+
+
+def _validate_portable_frontmatter_characters(source: str) -> None:
+    """Reject raw frontmatter characters outside YAML's printable character set.
+
+    This check intentionally sees source characters before JSON or single-quote
+    escape handling. A legal JSON escape such as ``\\u0000`` remains ordinary
+    printable source text; a literal NUL remains invalid source input.
+    """
+
+    for character in source:
+        code_point = ord(character)
+        is_printable = (
+            code_point == 0x09
+            or code_point == 0x0A
+            or code_point == 0x0D
+            or 0x20 <= code_point <= 0x7E
+            or code_point == 0x85
+            or 0xA0 <= code_point <= 0xD7FF
+            or 0xE000 <= code_point <= 0xFFFD
+            or 0x10000 <= code_point <= 0x10FFFF
+        )
+        if not is_printable:
+            raise SelcError(
+                "INVALID_SKILL",
+                "portable skill frontmatter contains an unsupported control character",
+                "remove the raw control character or use a supported quoted escape",
+            )
 
 
 def render_text_report(text: str, resources_root: Path) -> str:
@@ -674,7 +731,7 @@ def create_suite(suite_id: str, version: str, output: Path, skills: list[str]) -
         skill_directory.mkdir(parents=True)
         (skill_directory / "SKILL.md").write_text(
             "---\n"
-            f"name: {skill}\n"
+            f"name: {json.dumps(skill)}\n"
             f"description: {skill} from the {suite_id} suite.\n"
             "---\n\n"
             f"# {skill}\n\n"
