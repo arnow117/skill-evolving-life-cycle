@@ -476,6 +476,103 @@ class InstallationContractsTests(unittest.TestCase):
 
                 self.assertEqual(captured.exception.code, "UNSAFE_SYMLINK")
 
+    def test_public_cli_rejects_framework_runtime_root_symlinks(self) -> None:
+        suite = self.create_suite("framework-root-symlink", ["text-report"])
+
+        directory_framework = self.copy_external_framework(suite, "directory-framework")
+        directory_control = self.cli(
+            "install",
+            "--source",
+            str(suite),
+            "--framework-source",
+            str(directory_framework),
+            "--project-root",
+            str(self.root / "directory-control"),
+            "--harness",
+            "codex",
+        )
+        self.assertTrue(directory_control["ok"])
+
+        directory_link = self.copy_external_framework(suite, "directory-framework-link")
+        directory_runtime = directory_link / "runtime"
+        directory_outside = self.root / "directory-outside-runtime"
+        shutil.move(str(directory_runtime), directory_outside)
+        directory_runtime.symlink_to(directory_outside, target_is_directory=True)
+        directory_project = self.root / "directory-link-project"
+        directory_rejected = self.cli(
+            "install",
+            "--source",
+            str(suite),
+            "--framework-source",
+            str(directory_link),
+            "--project-root",
+            str(directory_project),
+            "--harness",
+            "codex",
+            expected=2,
+        )
+        self.assertEqual(directory_rejected["error"]["code"], "UNSAFE_SYMLINK")
+        self.assertFalse((directory_project / ".selc" / "installations.json").exists())
+        self.assertFalse((directory_project / ".agents" / "skills" / "text-report").exists())
+
+        def framework_repository(name: str, *, root_link: bool) -> Path:
+            repository = self.root / name
+            repository.mkdir()
+            git(["init"], repository)
+            git(["config", "user.email", "fixture@example.invalid"], repository)
+            git(["config", "user.name", "SELC fixture"], repository)
+            framework = repository / "framework"
+            framework.mkdir()
+            shutil.copytree(suite / "runtime", framework / "runtime")
+            shutil.copy2(suite / "framework.json", framework / "framework.json")
+            if root_link:
+                outside = self.root / f"{name}-outside-runtime"
+                shutil.move(str(framework / "runtime"), outside)
+                (framework / "runtime").symlink_to(outside, target_is_directory=True)
+            git(["add", "."], repository)
+            git(["commit", "-m", "framework fixture"], repository)
+            return repository
+
+        git_control = framework_repository("framework-git-control", root_link=False)
+        git_control_result = self.cli(
+            "install",
+            "--source",
+            str(suite),
+            "--framework-source",
+            str(git_control),
+            "--framework-ref",
+            "HEAD",
+            "--framework-subdir",
+            "framework",
+            "--project-root",
+            str(self.root / "git-control"),
+            "--harness",
+            "codex",
+        )
+        self.assertTrue(git_control_result["ok"])
+
+        git_link = framework_repository("framework-git-link", root_link=True)
+        git_link_project = self.root / "git-link-project"
+        git_link_rejected = self.cli(
+            "install",
+            "--source",
+            str(suite),
+            "--framework-source",
+            str(git_link),
+            "--framework-ref",
+            "HEAD",
+            "--framework-subdir",
+            "framework",
+            "--project-root",
+            str(git_link_project),
+            "--harness",
+            "codex",
+            expected=2,
+        )
+        self.assertEqual(git_link_rejected["error"]["code"], "UNSAFE_SYMLINK")
+        self.assertFalse((git_link_project / ".selc" / "installations.json").exists())
+        self.assertFalse((git_link_project / ".agents" / "skills" / "text-report").exists())
+
     def test_successful_install_cleans_its_owned_input_snapshot(self) -> None:
         suite = self.create_suite("framework-input-cleanup", ["text-report"])
         project = self.root / "project"

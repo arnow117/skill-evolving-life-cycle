@@ -182,6 +182,7 @@ def resolve_framework_source(
     if local_source.is_file() and local_source.suffix == ".zip":
         temporary = Path(tempfile.mkdtemp(prefix="selc-framework-package-"))
         _safe_extract(local_source, temporary)
+        _assert_framework_runtime_root_is_not_symlink(temporary)
         return temporary, {
             "kind": "framework_package",
             "repo": str(local_source.resolve()),
@@ -190,6 +191,7 @@ def resolve_framework_source(
             "base": None,
         }
     if local_source.is_dir() and framework_path(local_source).is_file():
+        _assert_framework_runtime_root_is_not_symlink(local_source)
         return local_source, {
             "kind": "framework_directory",
             "repo": str(local_source.resolve()),
@@ -198,6 +200,7 @@ def resolve_framework_source(
             "base": None,
         }
     if local_source.is_dir() and (local_source / "suite.json").is_file() and subdir is None:
+        _assert_framework_runtime_root_is_not_symlink(local_source)
         return local_source, {
             "kind": "framework_suite",
             "repo": str(local_source.resolve()),
@@ -246,6 +249,7 @@ def resolve_framework_source(
                 "specify a framework subdirectory",
             )
         framework_root = candidates[0]
+        _assert_framework_runtime_root_is_not_symlink(framework_root)
         stable_parent = Path(tempfile.mkdtemp(prefix="selc-git-framework-"))
         stable = stable_parent / "framework"
         descriptor = framework_path(framework_root)
@@ -262,6 +266,17 @@ def resolve_framework_source(
             "commit": commit,
             "base": selected_ref,
         }
+
+
+def _assert_framework_runtime_root_is_not_symlink(root: Path) -> None:
+    """Reject a framework runtime root link before any copy can follow it."""
+
+    if (root / "runtime").is_symlink():
+        raise SelcError(
+            "UNSAFE_SYMLINK",
+            "framework runtime cannot be a symlink",
+            "copy the runtime directory into the framework package",
+        )
 
 
 def _is_git_source(source_text: str, local_source: Path) -> bool:
@@ -579,6 +594,7 @@ def _snapshot_framework_source(source_root: Path, destination: Path) -> dict[str
     partially changed descriptor/runtime pair instead of resealing it.
     """
 
+    _assert_framework_runtime_root_is_not_symlink(source_root)
     descriptor = framework_path(source_root)
     if descriptor.is_file():
         destination.mkdir(parents=True)
