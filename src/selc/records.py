@@ -75,6 +75,13 @@ def open_database(project_root: Path) -> sqlite3.Connection:
           artifact_hash TEXT NOT NULL,
           rule_version TEXT NOT NULL,
           checker_id TEXT,
+          checker_verified INTEGER NOT NULL DEFAULT 0,
+          checker_result TEXT,
+          checker_input_hash TEXT,
+          checker_artifact_hash TEXT,
+          checker_resource_hash TEXT,
+          checker_composite_hash TEXT,
+          checker_identity_version INTEGER NOT NULL DEFAULT 0,
           declared_result TEXT NOT NULL,
           effective_result TEXT NOT NULL,
           complete_fixture INTEGER NOT NULL,
@@ -157,6 +164,13 @@ def open_database(project_root: Path) -> sqlite3.Connection:
     _ensure_column(database, "calls", "declared_result", "TEXT")
     _ensure_column(database, "deliveries", "call_id", "TEXT")
     _ensure_column(database, "deliveries", "checker_id", "TEXT")
+    _ensure_column(database, "deliveries", "checker_verified", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(database, "deliveries", "checker_result", "TEXT")
+    _ensure_column(database, "deliveries", "checker_input_hash", "TEXT")
+    _ensure_column(database, "deliveries", "checker_artifact_hash", "TEXT")
+    _ensure_column(database, "deliveries", "checker_resource_hash", "TEXT")
+    _ensure_column(database, "deliveries", "checker_composite_hash", "TEXT")
+    _ensure_column(database, "deliveries", "checker_identity_version", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(database, "deliveries", "sequence", "INTEGER NOT NULL DEFAULT 0")
     _ensure_column(database, "feedback", "delivery_id", "TEXT")
     _ensure_column(database, "imported_samples", "started_at", "TEXT NOT NULL DEFAULT ''")
@@ -260,7 +274,15 @@ def start_task(
     with database:
         current = database.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
         if current is not None:
-            if current["suite_id"] == suite_id and current["initiator"] == initiator:
+            expected = {
+                "suite_id": suite_id,
+                "suite_version": suite_version,
+                "harness": harness,
+                "initiator": initiator,
+                "evidence": evidence,
+                "is_test": int(is_test),
+            }
+            if all(current[key] == value for key, value in expected.items()):
                 return {"task_id": task_id, "replayed": True}
             raise SelcError(
                 "ID_CONFLICT",
@@ -347,20 +369,30 @@ def start_call(
     actual_harness = executor if executor in {"codex", "workbuddy"} else "unknown"
     with database:
         task = _task(database, task_id)
-        if task["status"] != "active":
-            raise SelcError(
-                "TASK_CLOSED",
-                f"cannot start a call for closed task: {task_id}",
-                "start a new task before recording another invocation",
-            )
         current = database.execute("SELECT * FROM calls WHERE call_id = ?", (call_id,)).fetchone()
         if current is not None:
-            if current["task_id"] == task_id and current["skill"] == skill:
+            expected = {
+                "task_id": task_id,
+                "skill": skill,
+                "executor": executor,
+                "actual_harness": actual_harness,
+                "evidence": evidence,
+                "expected_version": expected_version,
+                "expected_hash": expected_hash,
+                "trigger_kind": trigger_kind,
+            }
+            if all(current[key] == value for key, value in expected.items()):
                 return {"call_id": call_id, "replayed": True}
             raise SelcError(
                 "ID_CONFLICT",
                 f"call id already belongs to another call: {call_id}",
                 "choose a new call id",
+            )
+        if task["status"] != "active":
+            raise SelcError(
+                "TASK_CLOSED",
+                f"cannot start a call for closed task: {task_id}",
+                "start a new task before recording another invocation",
             )
         database.execute(
             """INSERT INTO calls(call_id, task_id, skill, executor, actual_harness, evidence, expected_version, expected_hash, trigger_kind, status, created_at)
@@ -424,6 +456,7 @@ def record_delivery(
     checker_id: str | None = None,
     checker_verified: bool = False,
     checker_result: str | None = None,
+    checker_identity: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     _validate_result(declared_result)
     if checker_result is not None:
@@ -446,11 +479,43 @@ def record_delivery(
                 "complete observation fixtures are limited to test tasks",
                 "record normal host evidence as unknown or create an isolated test task",
             )
+        normalized_identity = checker_identity or {}
+        identity_keys = {
+            "checker_input_hash",
+            "checker_artifact_hash",
+            "checker_resource_hash",
+            "checker_composite_hash",
+        }
+        if any(
+            key not in identity_keys or not isinstance(value, str)
+            for key, value in normalized_identity.items()
+        ):
+            raise SelcError(
+                "INVALID_DELIVERY_CHECK",
+                "checker identity contains an unsupported value",
+                "record only content hashes from the trusted checker",
+            )
         current = database.execute(
             "SELECT * FROM deliveries WHERE delivery_id = ?", (delivery_id,)
         ).fetchone()
         if current is not None:
-            if current["task_id"] == task_id and current["artifact_hash"] == artifact_hash:
+            expected = {
+                "task_id": task_id,
+                "call_id": call_id,
+                "artifact_hash": artifact_hash,
+                "rule_version": rule_version,
+                "checker_id": checker_id,
+                "declared_result": declared_result,
+                "complete_fixture": int(complete_fixture),
+                "checker_verified": int(checker_verified),
+                "checker_result": checker_result,
+                "checker_input_hash": normalized_identity.get("checker_input_hash"),
+                "checker_artifact_hash": normalized_identity.get("checker_artifact_hash"),
+                "checker_resource_hash": normalized_identity.get("checker_resource_hash"),
+                "checker_composite_hash": normalized_identity.get("checker_composite_hash"),
+                "checker_identity_version": 1,
+            }
+            if all(current[key] == value for key, value in expected.items()):
                 return {"delivery_id": delivery_id, "replayed": True}
             raise SelcError(
                 "ID_CONFLICT",
@@ -468,8 +533,12 @@ def record_delivery(
             (task_id,),
         ).fetchone()[0]
         database.execute(
-            """INSERT INTO deliveries(delivery_id, task_id, call_id, artifact_hash, rule_version, checker_id, declared_result, effective_result, complete_fixture, sequence, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            """INSERT INTO deliveries(
+            delivery_id, task_id, call_id, artifact_hash, rule_version, checker_id,
+            checker_verified, checker_result, checker_input_hash, checker_artifact_hash,
+            checker_resource_hash, checker_composite_hash, declared_result, effective_result,
+            checker_identity_version, complete_fixture, sequence, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 delivery_id,
                 task_id,
@@ -477,8 +546,15 @@ def record_delivery(
                 artifact_hash,
                 rule_version,
                 checker_id,
+                int(checker_verified),
+                checker_result,
+                normalized_identity.get("checker_input_hash"),
+                normalized_identity.get("checker_artifact_hash"),
+                normalized_identity.get("checker_resource_hash"),
+                normalized_identity.get("checker_composite_hash"),
                 declared_result,
                 effective,
+                1,
                 int(complete_fixture),
                 sequence,
                 utc_now(),
@@ -517,6 +593,7 @@ def record_feedback(
         raise SelcError(
             "INVALID_INPUT", "feedback revision must be positive", "start at revision 1"
         )
+    body_hash = json_hash(body) if body is not None else None
     with database:
         _task(database, task_id)
         delivery = database.execute(
@@ -540,6 +617,7 @@ def record_feedback(
                 and same_revision["delivery_id"] == delivery_id
                 and same_revision["scope"] == scope
                 and same_revision["result"] == result
+                and same_revision["body_hash"] == body_hash
             ):
                 return {"feedback_id": feedback_id, "revision": revision, "replayed": True}
             raise SelcError(
@@ -584,7 +662,7 @@ def record_feedback(
                 revision,
                 scope,
                 result,
-                json_hash(body) if body is not None else None,
+                body_hash,
                 utc_now(),
             ),
         )
@@ -838,6 +916,7 @@ def _deduplicated_samples(
         ]
     values: dict[str, dict[str, Any]] = {}
     for row in [*local_rows, *imported_rows]:
+        row = _normalize_sample_provenance(row)
         if not include_test and row["is_test"]:
             continue
         current = values.get(row["subject_id"])
@@ -870,6 +949,25 @@ def _deduplicated_samples(
             if current.get(key) != row.get(key):
                 current[key] = "unknown"
     return list(values.values())
+
+
+def _normalize_sample_provenance(row: dict[str, Any]) -> dict[str, Any]:
+    """Keep pre-API009 nullable provenance visible as ``unknown`` in metrics."""
+
+    normalized = dict(row)
+    for key in (
+        "suite_version",
+        "harness",
+        "initiator",
+        "skill",
+        "executor",
+        "evidence",
+        "trigger_kind",
+        "expected_hash",
+    ):
+        if normalized.get(key) is None:
+            normalized[key] = "unknown"
+    return normalized
 
 
 def stats(database: sqlite3.Connection, *, include_test: bool) -> dict[str, Any]:
@@ -988,7 +1086,14 @@ def export_snapshot(database: sqlite3.Connection, output: Path) -> dict[str, Any
     }
 
 
-def _validate_snapshot(snapshot: dict[str, Any]) -> None:
+def _validate_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Validate every snapshot field before deciding whether it is a no-op.
+
+    Imported files are an external boundary.  Validation therefore happens before
+    origin/revision handling and produces normalized provenance values only after
+    the supplied hash has been checked.  A malformed same-origin file cannot hide
+    behind a no-op response or partially replace prior imported samples.
+    """
     required = {
         "schema_version",
         "origin_id",
@@ -1003,32 +1108,137 @@ def _validate_snapshot(snapshot: dict[str, Any]) -> None:
         raise SelcError(
             "INVALID_SNAPSHOT", "snapshot misses required fields", "export a fresh snapshot"
         )
-    if snapshot["schema_version"] != SCHEMA_VERSION:
+    if type(snapshot["schema_version"]) is not int or snapshot["schema_version"] != SCHEMA_VERSION:
         raise SelcError(
             "UNSUPPORTED_SCHEMA", "snapshot schema is unsupported", "use a compatible snapshot"
         )
     unsigned = dict(snapshot)
     supplied_hash = unsigned.pop("snapshot_hash")
-    if supplied_hash != json_hash(unsigned):
+    if not isinstance(supplied_hash, str) or supplied_hash != json_hash(unsigned):
         raise SelcError(
             "SNAPSHOT_HASH_MISMATCH",
             "snapshot content hash does not match",
             "do not modify exported files",
         )
-    if not isinstance(snapshot["snapshot_revision"], int) or snapshot["snapshot_revision"] < 1:
+    if type(snapshot["snapshot_revision"]) is not int or snapshot["snapshot_revision"] < 1:
         raise SelcError(
             "INVALID_SNAPSHOT",
             "snapshot revision must be a positive integer",
             "export a fresh snapshot",
         )
+    if not isinstance(snapshot["origin_id"], str) or not snapshot["origin_id"]:
+        raise SelcError(
+            "INVALID_SNAPSHOT", "snapshot origin id is invalid", "export a fresh snapshot"
+        )
+    if not isinstance(snapshot["as_of"], str) or not snapshot["as_of"]:
+        raise SelcError("INVALID_SNAPSHOT", "snapshot as_of is invalid", "export a fresh snapshot")
+    contract = snapshot["metric_contract"]
+    expected_groups = {"tasks.one_shot", "tasks.final", "calls.one_shot", "calls.final"}
+    expected_measures = {"N", "S", "K", "U", "S_over_N", "S_over_K", "K_over_N"}
+    if (
+        not isinstance(contract, dict)
+        or not isinstance(contract.get("groups"), list)
+        or not isinstance(contract.get("measures"), list)
+        or not all(isinstance(value, str) for value in contract["groups"])
+        or not all(isinstance(value, str) for value in contract["measures"])
+        or set(contract["groups"]) != expected_groups
+        or set(contract["measures"]) != expected_measures
+        or not isinstance(contract.get("privacy"), str)
+    ):
+        raise SelcError(
+            "INVALID_SNAPSHOT",
+            "snapshot metric contract is unsupported",
+            "export a fresh snapshot",
+        )
+    normalized: dict[str, Any] = dict(snapshot)
     for kind in ("tasks", "calls"):
         if not isinstance(snapshot[kind], list):
             raise SelcError("INVALID_SNAPSHOT", f"{kind} must be a list", "export a fresh snapshot")
+        normalized[kind] = _validate_snapshot_samples(kind, snapshot[kind])
+    return normalized
+
+
+def _validate_snapshot_samples(kind: str, samples: list[Any]) -> list[dict[str, Any]]:
+    id_key = "task_id" if kind == "tasks" else "call_id"
+    required = {id_key, "suite_id", "is_test", "started_at", "first_result", "current_result"}
+    if kind == "calls":
+        required.update({"task_id", "skill"})
+    provenance = {
+        "suite_version",
+        "harness",
+        "initiator",
+        "skill",
+        "executor",
+        "evidence",
+        "trigger_kind",
+        "expected_hash",
+    }
+    seen_ids: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for sample in samples:
+        if not isinstance(sample, dict) or required.difference(sample):
+            raise SelcError(
+                "INVALID_SNAPSHOT",
+                f"{kind} sample misses required identity or result fields",
+                "export a fresh snapshot",
+            )
+        subject_id = sample[id_key]
+        if not isinstance(subject_id, str) or not subject_id or subject_id in seen_ids:
+            raise SelcError(
+                "INVALID_SNAPSHOT",
+                f"{kind} contains an invalid or duplicate id",
+                "export a fresh snapshot",
+            )
+        seen_ids.add(subject_id)
+        if not isinstance(sample["suite_id"], str) or not sample["suite_id"]:
+            raise SelcError(
+                "INVALID_SNAPSHOT", f"{kind} suite id is invalid", "export a fresh snapshot"
+            )
+        if not isinstance(sample["started_at"], str) or not sample["started_at"]:
+            raise SelcError(
+                "INVALID_SNAPSHOT", f"{kind} start time is invalid", "export a fresh snapshot"
+            )
+        if type(sample["is_test"]) not in {bool, int} or int(sample["is_test"]) not in {0, 1}:
+            raise SelcError(
+                "INVALID_SNAPSHOT", f"{kind} test flag is invalid", "export a fresh snapshot"
+            )
+        for result_key in ("first_result", "current_result"):
+            result = sample[result_key]
+            if result is not None and (
+                not isinstance(result, str) or result not in {"pass", "fail", "unknown"}
+            ):
+                raise SelcError(
+                    "INVALID_SNAPSHOT",
+                    f"{kind} result is invalid",
+                    "export a fresh snapshot",
+                )
+        if kind == "calls":
+            if not isinstance(sample["task_id"], str) or not sample["task_id"]:
+                raise SelcError(
+                    "INVALID_SNAPSHOT", "call task link is invalid", "export a fresh snapshot"
+                )
+            if not isinstance(sample["skill"], str) or not sample["skill"]:
+                raise SelcError(
+                    "INVALID_SNAPSHOT", "call skill is invalid", "export a fresh snapshot"
+                )
+        value = dict(sample)
+        value["is_test"] = int(sample["is_test"])
+        for field in provenance:
+            if field not in value or value[field] is None:
+                value[field] = "unknown"
+            elif not isinstance(value[field], str):
+                raise SelcError(
+                    "INVALID_SNAPSHOT",
+                    f"{kind} provenance field {field} is invalid",
+                    "export a fresh snapshot",
+                )
+        normalized.append(value)
+    return normalized
 
 
 def import_snapshot(database: sqlite3.Connection, input_path: Path) -> dict[str, Any]:
     snapshot = read_json(input_path)
-    _validate_snapshot(snapshot)
+    snapshot = _validate_snapshot(snapshot)
     origin_id = str(snapshot["origin_id"])
     revision = int(snapshot["snapshot_revision"])
     snapshot_hash = str(snapshot["snapshot_hash"])

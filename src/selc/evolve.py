@@ -5,13 +5,14 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
+import os
 import shutil
 import tempfile
 import time
 import zipfile
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 from .errors import SelcError
 from .manifest import (
@@ -21,8 +22,10 @@ from .manifest import (
     portable_tree_hash,
     render_text_report,
     suite_content_hash,
+    validate_declared_skills,
 )
 from .util import (
+    exclusive_lock,
     file_hash,
     json_hash,
     read_json,
@@ -53,12 +56,17 @@ def prepare_candidate(suite_root: Path, output: Path) -> dict[str, Any]:
     shutil.copytree(suite_root / "resources", candidate / "resources")
     shutil.copytree(suite_root / "resources", output / "baseline-resources")
     baseline_hash = tree_hash(suite_root)
+    declared_skills = [
+        {"name": str(skill["name"]), "path": str(skill["path"])} for skill in manifest["skills"]
+    ]
     protected = {
         "schema_version": 1,
         "suite_id": manifest["suite_id"],
         "baseline_hash": baseline_hash,
         "oracle_hash": json_hash(CASES),
         "baseline_resources_hash": tree_hash(output / "baseline-resources"),
+        "declared_skills": declared_skills,
+        "declared_skills_hash": json_hash(declared_skills),
         "defaults": {
             "candidate_limit": 2,
             "run_timeout_seconds": 10,
@@ -130,6 +138,16 @@ def evaluate_candidate(
             "candidate has no editable skills directory",
             "run evolve prepare again",
         )
+    declared_skills = protected.get("declared_skills")
+    if not isinstance(declared_skills, list) or protected.get("declared_skills_hash") != json_hash(
+        declared_skills
+    ):
+        raise SelcError(
+            "PROTECTED_ORACLE_CHANGED",
+            "candidate skill declarations are missing or changed outside the candidate",
+            "prepare a fresh candidate",
+        )
+    validate_declared_skills(candidate_root, declared_skills)
     total_cases = sum(len(cases) for cases in CASES.values())
     required_runs = total_cases * 2
     if max_runs < required_runs:
@@ -192,6 +210,7 @@ def evaluate_candidate(
         "status": "passed" if all(item["candidate_pass"] for item in results) else "failed",
         "baseline_hash": protected["baseline_hash"],
         "candidate_hash": candidate_hash,
+        "declared_skills_hash": protected["declared_skills_hash"],
         "oracle_hash": protected["oracle_hash"],
         "runs": len(results) * 2,
         "candidate_number": candidate_number,
@@ -246,6 +265,7 @@ def prepare_contribution(
             "a passed evaluation is required before contribution preparation",
             "evaluate the candidate before preparing a contribution",
         )
+    _validate_candidate_structure(candidate_root, evaluation)
     candidate_hash = tree_hash(candidate_root)
     if evaluation.get("candidate_hash") != candidate_hash:
         raise SelcError(
@@ -310,6 +330,30 @@ def prepare_contribution(
     plan["plan_hash"] = contribution_plan_hash(plan)
     write_json(output, plan)
     return plan
+
+
+def _validate_candidate_structure(candidate_root: Path, binding: dict[str, Any]) -> None:
+    """Recheck candidate skill entries against the protected evaluated mapping."""
+
+    protected = read_json(candidate_root.parent / "protected-oracle.json")
+    declared_skills = protected.get("declared_skills")
+    declared_hash = protected.get("declared_skills_hash")
+    if not isinstance(declared_skills, list) or not isinstance(declared_hash, str):
+        raise SelcError(
+            "INVALID_CANDIDATE",
+            "candidate has no protected declared skill mapping",
+            "prepare a fresh candidate",
+        )
+    if (
+        declared_hash != json_hash(declared_skills)
+        or binding.get("declared_skills_hash") != declared_hash
+    ):
+        raise SelcError(
+            "EVALUATION_STALE",
+            "candidate skill declaration binding changed after evaluation",
+            "prepare and evaluate a fresh candidate",
+        )
+    validate_declared_skills(candidate_root, declared_skills)
 
 
 def _contribution_baseline(
@@ -529,6 +573,7 @@ def execute_contribution(
             "contribution no longer has a passed evaluation for its candidate",
             "evaluate the candidate and prepare a new contribution workspace",
         )
+    _validate_candidate_structure(candidate_root, evaluation)
     if not diff_path.is_file() or file_hash(diff_path) != plan["diff_hash"]:
         raise SelcError(
             "CONTRIBUTION_STALE",
@@ -549,16 +594,6 @@ def execute_contribution(
             "contribution workspace is not on the prepared branch",
             "restore the prepared workspace or prepare a new contribution",
         )
-    if run_argv(["git", "rev-parse", "HEAD"], cwd=workspace) != plan["workspace_base_head"]:
-        raise SelcError(
-            "CONTRIBUTION_STALE",
-            "contribution workspace no longer starts at the prepared baseline commit",
-            "recreate the contribution workspace from the saved source baseline",
-        )
-    _assert_workspace_matches_plan(workspace, plan)
-    _assert_workspace_changes_are_safe(workspace, plan)
-    remote_query: list[str] | None = None
-    remote_query_output: str | None = None
     push_upstream = plan.get("push_upstream")
     if not isinstance(push_upstream, str) or not push_upstream:
         raise SelcError(
@@ -567,6 +602,7 @@ def execute_contribution(
             "prepare a new contribution workspace",
         )
     upstream_identity: dict[str, str] | None = None
+    provider_repository: str | None = None
     if provider != "local":
         if not client:
             raise SelcError(
@@ -577,43 +613,9 @@ def execute_contribution(
         push_upstream, upstream_identity, provider_repository = (
             _validate_remote_contribution_destination(plan, provider, repository)
         )
-        remote_query = contribution_query_argv(
-            provider, client, provider_repository, plan["branch"]
-        )
-        remote_query_output = run_argv(remote_query)
-        if remote_query_output not in {"", "[]", "null"}:
-            return {
-                "workspace": str(workspace),
-                "branch": plan["branch"],
-                "provider": provider,
-                "repository": repository,
-                "provider_repository": provider_repository,
-                "upstream_identity": upstream_identity,
-                "request": "reused",
-                "query": remote_query,
-                "query_output": remote_query_output,
-            }
-    author_name = run_argv(["git", "config", "user.name"], cwd=workspace)
-    author_email = run_argv(["git", "config", "user.email"], cwd=workspace)
-    run_argv(["git", "config", "user.name", author_name], cwd=workspace)
-    run_argv(["git", "config", "user.email", author_email], cwd=workspace)
-    suite_subdir = str(plan["suite_subdir"])
-    suite_path = Path(suite_subdir)
-    staged_paths = [
-        str(suite_path / "skills"),
-        str(suite_path / "resources"),
-        str(suite_path / "suite.json"),
-    ]
-    if suite_subdir == ".":
-        staged_paths = ["skills", "resources", "suite.json"]
-    run_argv(
-        ["git", "add", "--", *staged_paths],
-        cwd=workspace,
-    )
-    run_argv(["git", "commit", "-m", f"SELC contribution for {plan['suite_id']}"], cwd=workspace)
-    contribution_commit = run_argv(["git", "rev-parse", "HEAD"], cwd=workspace)
-    _assert_committed_workspace_matches_plan(workspace, contribution_commit, plan)
+    contribution_commit = _prepare_or_reuse_contribution_commit(workspace, plan)
     run_argv(["git", "push", push_upstream, f"HEAD:refs/heads/{plan['branch']}"], cwd=workspace)
+    _assert_remote_branch_points_to_commit(push_upstream, str(plan["branch"]), contribution_commit)
     result: dict[str, Any] = {
         "workspace": str(workspace),
         "branch": plan["branch"],
@@ -626,11 +628,39 @@ def execute_contribution(
         return result
     assert repository is not None
     assert client is not None
-    assert remote_query is not None
-    assert remote_query_output is not None
     assert upstream_identity is not None
+    assert provider_repository is not None
+    remote_query = contribution_query_argv(
+        provider,
+        client,
+        provider_repository,
+        str(plan["branch"]),
+        str(plan["base_branch"]),
+    )
+    remote_query_output = run_argv(remote_query)
+    request_state = _parse_contribution_request(
+        provider,
+        remote_query_output,
+        provider_repository,
+        str(plan["branch"]),
+        str(plan["base_branch"]),
+        contribution_commit,
+    )
+    if request_state == "matching":
+        result.update(
+            {
+                "provider": provider,
+                "repository": repository,
+                "provider_repository": provider_repository,
+                "upstream_identity": upstream_identity,
+                "request": "reused",
+                "query": remote_query,
+                "query_output": remote_query_output,
+            }
+        )
+        return result
     note_path = workspace / "SELC_CONTRIBUTION.md"
-    note_path.write_text(plan["summary"], encoding="utf-8")
+    note_path.write_text(_contribution_note(plan), encoding="utf-8")
     create = contribution_create_argv(
         provider,
         client,
@@ -639,7 +669,49 @@ def execute_contribution(
         plan["base_branch"],
         note_path,
     )
-    create_output = run_argv(create)
+    try:
+        create_output = run_argv(create)
+    except SelcError as error:
+        follow_up = run_argv(remote_query)
+        if (
+            _parse_contribution_request(
+                provider,
+                follow_up,
+                provider_repository,
+                str(plan["branch"]),
+                str(plan["base_branch"]),
+                contribution_commit,
+            )
+            == "matching"
+        ):
+            result.update(
+                {
+                    "provider": provider,
+                    "repository": repository,
+                    "provider_repository": provider_repository,
+                    "upstream_identity": upstream_identity,
+                    "request": "recovered_after_ambiguous_create",
+                    "query": remote_query,
+                    "query_output": follow_up,
+                }
+            )
+            return result
+        raise error
+    verification_output = run_argv(remote_query)
+    verification_state = _parse_contribution_request(
+        provider,
+        verification_output,
+        provider_repository,
+        str(plan["branch"]),
+        str(plan["base_branch"]),
+        contribution_commit,
+    )
+    if verification_state != "matching":
+        raise SelcError(
+            "REQUEST_CREATE_UNVERIFIED",
+            "provider did not return the created contribution request",
+            "query the fixed repository before retrying",
+        )
     result.update(
         {
             "provider": provider,
@@ -647,7 +719,7 @@ def execute_contribution(
             "provider_repository": provider_repository,
             "upstream_identity": upstream_identity,
             "query": remote_query,
-            "query_output": remote_query_output,
+            "query_output": verification_output,
             "create": create,
             "create_output": create_output,
         }
@@ -667,7 +739,7 @@ def verify_contribution(plan_path: Path, provider: str, client: str) -> dict[str
         )
     identity = plan.get("upstream_identity")
     repository = identity.get("repository") if isinstance(identity, dict) else None
-    _push_upstream, _identity, provider_repository = _validate_remote_contribution_destination(
+    push_upstream, _identity, provider_repository = _validate_remote_contribution_destination(
         plan, provider, repository
     )
     branch = plan.get("branch")
@@ -677,30 +749,74 @@ def verify_contribution(plan_path: Path, provider: str, client: str) -> dict[str
             "contribution plan has no fixed branch",
             "prepare a new contribution workspace",
         )
-    argv = contribution_verify_argv(provider, client, provider_repository, branch)
+    workspace = Path(str(plan["workspace"]))
+    commit = run_argv(["git", "rev-parse", "HEAD"], cwd=workspace)
+    baseline = str(plan["workspace_base_head"])
+    parents = run_argv(["git", "rev-list", "--parents", "-n", "1", commit], cwd=workspace).split()
+    if commit == baseline or len(parents) != 2 or parents[1] != baseline:
+        raise SelcError(
+            "CONTRIBUTION_UNVERIFIED",
+            "contribution workspace has no verified single contribution commit",
+            "execute the prepared contribution before verification",
+        )
+    _assert_committed_workspace_matches_plan(workspace, commit, plan)
+    _assert_workspace_matches_plan(workspace, plan)
+    _assert_remote_branch_points_to_commit(push_upstream, branch, commit)
+    argv = contribution_query_argv(
+        provider, client, provider_repository, branch, str(plan["base_branch"])
+    )
+    output = run_argv(argv)
+    request_state = _parse_contribution_request(
+        provider,
+        output,
+        provider_repository,
+        branch,
+        str(plan["base_branch"]),
+        commit,
+    )
+    if request_state != "matching":
+        raise SelcError(
+            "CONTRIBUTION_UNVERIFIED",
+            "no matching contribution request exists at the fixed upstream",
+            "create or recover the request before verification",
+        )
     return {
         "provider": provider,
         "repository": repository,
         "provider_repository": provider_repository,
         "branch": branch,
-        "output": run_argv(argv),
+        "commit": commit,
+        "output": output,
     }
 
 
-def contribution_query_argv(provider: str, client: str, repository: str, branch: str) -> list[str]:
+def contribution_query_argv(
+    provider: str, client: str, repository: str, branch: str, base_branch: str
+) -> list[str]:
     if provider == "github":
-        return [client, "pr", "list", "--repo", repository, "--head", branch, "--state", "open"]
-    if provider == "gitlab":
         return [
             client,
-            "mr",
+            "pr",
             "list",
             "--repo",
             repository,
-            "--source-branch",
+            "--head",
             branch,
-            "--state",
-            "opened",
+            "--base",
+            base_branch,
+            "--json",
+            "number,headRefName,baseRefName,headRepository,headRepositoryOwner,headRefOid",
+        ]
+    if provider == "gitlab":
+        host, namespace = repository.split("/", maxsplit=1)
+        encoded_namespace = quote(namespace, safe="")
+        return [
+            client,
+            "api",
+            "--hostname",
+            host,
+            f"projects/{encoded_namespace}/merge_requests"
+            f"?source_branch={quote(branch, safe='')}&target_branch={quote(base_branch, safe='')}",
         ]
     raise SelcError(
         "UNSUPPORTED_PROVIDER", f"unsupported provider: {provider}", "choose github or gitlab"
@@ -838,6 +954,8 @@ def _assert_workspace_changes_are_safe(workspace: Path, plan: dict[str, Any]) ->
     ).splitlines()
     suite_subdir = str(plan["suite_subdir"])
     for name in sorted({*tracked, *untracked}):
+        if name == "SELC_CONTRIBUTION.md" and _is_expected_contribution_note(workspace, plan):
+            continue
         path = Path(name)
         if not _is_controlled_contribution_path(path, suite_subdir):
             raise SelcError(
@@ -845,6 +963,156 @@ def _assert_workspace_changes_are_safe(workspace: Path, plan: dict[str, Any]) ->
                 f"prepared workspace contains an unexpected change: {name}",
                 "recreate the contribution workspace",
             )
+
+
+def _contribution_note(plan: dict[str, Any]) -> str:
+    """Return the sole tool-owned untracked note allowed during request recovery."""
+
+    return (
+        f"# SELC contribution\n\n"
+        f"Plan: {plan['plan_hash']}\n"
+        f"Suite: {plan['suite_id']}\n"
+        f"Candidate: {plan['candidate_hash']}\n"
+    )
+
+
+def _is_expected_contribution_note(workspace: Path, plan: dict[str, Any]) -> bool:
+    note = workspace / "SELC_CONTRIBUTION.md"
+    try:
+        return note.is_file() and note.read_text(encoding="utf-8") == _contribution_note(plan)
+    except OSError:
+        return False
+
+
+def _prepare_or_reuse_contribution_commit(workspace: Path, plan: dict[str, Any]) -> str:
+    """Commit once, or verify the one prior commit after an interrupted retry."""
+
+    head = run_argv(["git", "rev-parse", "HEAD"], cwd=workspace)
+    baseline = str(plan["workspace_base_head"])
+    if head == baseline:
+        _assert_workspace_matches_plan(workspace, plan)
+        _assert_workspace_changes_are_safe(workspace, plan)
+        author_name = run_argv(["git", "config", "user.name"], cwd=workspace)
+        author_email = run_argv(["git", "config", "user.email"], cwd=workspace)
+        run_argv(["git", "config", "user.name", author_name], cwd=workspace)
+        run_argv(["git", "config", "user.email", author_email], cwd=workspace)
+        suite_subdir = str(plan["suite_subdir"])
+        suite_path = Path(suite_subdir)
+        staged_paths = [
+            str(suite_path / "skills"),
+            str(suite_path / "resources"),
+            str(suite_path / "suite.json"),
+        ]
+        if suite_subdir == ".":
+            staged_paths = ["skills", "resources", "suite.json"]
+        run_argv(["git", "add", "--", *staged_paths], cwd=workspace)
+        run_argv(
+            ["git", "commit", "-m", f"SELC contribution for {plan['suite_id']}"], cwd=workspace
+        )
+        contribution_commit = run_argv(["git", "rev-parse", "HEAD"], cwd=workspace)
+        _assert_committed_workspace_matches_plan(workspace, contribution_commit, plan)
+        return contribution_commit
+
+    parents = run_argv(["git", "rev-list", "--parents", "-n", "1", head], cwd=workspace).split()
+    if len(parents) != 2 or parents[1] != baseline:
+        raise SelcError(
+            "CONTRIBUTION_STALE",
+            "contribution workspace has commits outside the prepared baseline and contribution",
+            "recreate the contribution workspace from the saved source baseline",
+        )
+    _assert_committed_workspace_matches_plan(workspace, head, plan)
+    _assert_workspace_matches_plan(workspace, plan)
+    _assert_workspace_changes_are_safe(workspace, plan)
+    return head
+
+
+def _assert_remote_branch_points_to_commit(
+    push_upstream: str, branch: str, contribution_commit: str
+) -> None:
+    output = run_argv(["git", "ls-remote", push_upstream, f"refs/heads/{branch}"])
+    fields = output.split()
+    if len(fields) < 2 or fields[0] != contribution_commit:
+        raise SelcError(
+            "CONTRIBUTION_PUSH_UNVERIFIED",
+            "contribution branch does not point to the verified contribution commit",
+            "inspect the fixed upstream branch before retrying",
+        )
+
+
+def _parse_contribution_request(
+    provider: str,
+    output: str,
+    repository: str,
+    branch: str,
+    base_branch: str,
+    commit: str,
+) -> str:
+    """Accept only a structured request bound to the prepared head and base."""
+
+    if output.strip() == "[]":
+        return "absent"
+    try:
+        parsed = json.loads(output)
+    except json.JSONDecodeError as error:
+        raise SelcError(
+            "REQUEST_QUERY_AMBIGUOUS",
+            "provider request query did not return structured JSON",
+            "inspect the fixed repository before retrying",
+        ) from error
+    entries = parsed if isinstance(parsed, list) else [parsed]
+    if not entries or not all(isinstance(item, dict) for item in entries):
+        raise SelcError(
+            "REQUEST_QUERY_AMBIGUOUS",
+            "provider request query has an unsupported JSON shape",
+            "inspect the fixed repository before retrying",
+        )
+    expected_repository = repository.split("/", maxsplit=1)[1]
+    if provider == "github":
+        for item in entries:
+            head_repository = item.get("headRepository")
+            head_owner = item.get("headRepositoryOwner")
+            if not isinstance(head_repository, dict) or not isinstance(head_owner, dict):
+                raise SelcError(
+                    "REQUEST_QUERY_AMBIGUOUS",
+                    "GitHub request query lacks head repository identity",
+                    "inspect the fixed repository before retrying",
+                )
+            if (
+                item.get("headRefName") == branch
+                and item.get("baseRefName") == base_branch
+                and item.get("headRefOid") == commit
+                and head_repository.get("nameWithOwner") == expected_repository
+                and head_owner.get("login") == expected_repository.split("/", maxsplit=1)[0]
+            ):
+                return "matching"
+    elif provider == "gitlab":
+        for item in entries:
+            source_project = item.get("source_project_id")
+            target_project = item.get("target_project_id")
+            if not isinstance(source_project, int) or not isinstance(target_project, int):
+                raise SelcError(
+                    "REQUEST_QUERY_AMBIGUOUS",
+                    "GitLab request query lacks source or target project identity",
+                    "inspect the fixed repository before retrying",
+                )
+            if (
+                item.get("source_branch") == branch
+                and item.get("target_branch") == base_branch
+                and item.get("sha") == commit
+                and source_project == target_project
+            ):
+                return "matching"
+    else:
+        raise SelcError(
+            "UNSUPPORTED_PROVIDER",
+            f"unsupported provider: {provider}",
+            "choose github or gitlab",
+        )
+    raise SelcError(
+        "REQUEST_CONFLICT",
+        "provider returned a request that does not match the prepared repository, head, and base",
+        "inspect the fixed repository before retrying",
+    )
 
 
 def _is_controlled_contribution_path(path: Path, suite_subdir: str) -> bool:
@@ -973,6 +1241,7 @@ def prepare_release(
             "candidate changed after evaluation",
             "evaluate the current candidate again",
         )
+    _validate_candidate_structure(candidate_root, evaluation)
     package_path = output.with_suffix(".zip")
     with tempfile.TemporaryDirectory(prefix="selc-release-suite-") as temporary:
         checkout = Path(temporary) / "checkout"
@@ -1254,31 +1523,115 @@ def release_local(plan_path: Path, confirmation_path: Path, center: Path) -> dic
             "prepare and confirm a plan for the requested release center",
         )
     package = Path(plan["package"])
-    _, _, release_directory = _local_release_paths(center, str(plan["tag"]))
-    metadata = release_directory / "release.json"
-    if metadata.exists():
-        existing = read_json(metadata)
-        if existing.get("package_hash") == plan["package_hash"]:
+    center_root, releases_root, release_directory = _local_release_paths(center, str(plan["tag"]))
+    center_root.mkdir(parents=True, exist_ok=True)
+    with exclusive_lock(center_root / ".selc-release.lock"):
+        if release_directory.exists() or release_directory.is_symlink():
+            _assert_existing_local_release_matches_plan(release_directory, center_root, plan)
             return {"released": "reused", "tag": plan["tag"], "location": str(release_directory)}
-        raise SelcError(
-            "RELEASE_CONFLICT", "a different package already uses this tag", "choose a new tag"
-        )
-    release_directory.mkdir(parents=True, exist_ok=False)
-    destination = release_directory / package.name
-    shutil.copy2(package, destination)
-    metadata_value = {
+
+        releases_root.mkdir(parents=True, exist_ok=True)
+        release_directory.parent.mkdir(parents=True, exist_ok=True)
+        stage = Path(tempfile.mkdtemp(prefix=".selc-release-", dir=center_root))
+        try:
+            staged_package = stage / package.name
+            shutil.copy2(package, staged_package)
+            metadata_value = _local_release_metadata(plan, staged_package.name)
+            write_json(stage / "release.json", metadata_value)
+            _assert_local_release_directory(stage, center_root, expected=metadata_value)
+            os.replace(stage, release_directory)
+        except Exception:
+            shutil.rmtree(stage, ignore_errors=True)
+            raise
+    return {"released": "created", "tag": plan["tag"], "location": str(release_directory)}
+
+
+def _local_release_metadata(plan: dict[str, Any], package_name: str) -> dict[str, Any]:
+    """Persist the confirmation-bound local target identity beside its asset."""
+
+    return {
         "schema_version": 1,
         "tag": plan["tag"],
         "suite_id": plan["suite_id"],
-        "package": destination.name,
+        "package": package_name,
         "package_hash": plan["package_hash"],
         "target_commit": plan["target_commit"],
+        "target_suite_hash": plan["target_suite_hash"],
+        "suite_hash": plan["suite_hash"],
+        "framework": plan["framework"],
         "source_upstream": plan["source_upstream"],
         "suite_subdir": plan["suite_subdir"],
         "contribution_base": plan["contribution_base"],
+        "plan_hash": plan["plan_hash"],
     }
-    write_json(metadata, metadata_value)
-    return {"released": "created", "tag": plan["tag"], "location": str(release_directory)}
+
+
+def _assert_existing_local_release_matches_plan(
+    release_directory: Path, center_root: Path, plan: dict[str, Any]
+) -> None:
+    metadata_path = release_directory / "release.json"
+    if not release_directory.is_dir() or not metadata_path.is_file():
+        raise SelcError(
+            "RELEASE_RECOVERY_REQUIRED",
+            "release tag exists without a complete SELC release",
+            "inspect or remove the incomplete tag directory before retrying",
+        )
+    expected = _local_release_metadata(plan, Path(str(plan["package"])).name)
+    _assert_local_release_directory(release_directory, center_root, expected=expected)
+
+
+def _assert_local_release_directory(
+    release_directory: Path,
+    center_root: Path,
+    *,
+    expected: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metadata = read_json(release_directory / "release.json")
+    required = {
+        "schema_version",
+        "tag",
+        "suite_id",
+        "package",
+        "package_hash",
+        "target_commit",
+        "target_suite_hash",
+        "suite_hash",
+        "framework",
+        "source_upstream",
+        "suite_subdir",
+        "contribution_base",
+        "plan_hash",
+    }
+    if required.difference(metadata):
+        raise SelcError(
+            "RELEASE_INVALID",
+            "local release metadata is incomplete",
+            "repair or recreate the release from its confirmed plan",
+        )
+    package_name = require_relative_path(str(metadata["package"]))
+    package = (release_directory / package_name).resolve()
+    try:
+        package.relative_to(release_directory.resolve())
+        package.relative_to(center_root.resolve())
+    except ValueError as error:
+        raise SelcError(
+            "RELEASE_INVALID",
+            "local release metadata points outside its release directory",
+            "repair or recreate the release",
+        ) from error
+    if not package.is_file() or file_hash(package) != metadata["package_hash"]:
+        raise SelcError(
+            "RELEASE_INVALID",
+            "local release package does not match its metadata",
+            "repair or recreate the release",
+        )
+    if expected is not None and metadata != expected:
+        raise SelcError(
+            "RELEASE_CONFLICT",
+            "existing release tag does not match the confirmed release target",
+            "choose a new tag or repair the existing release",
+        )
+    return metadata
 
 
 def _assert_package_business_matches_candidate(package: Path, candidate_root: Path) -> None:
@@ -1305,24 +1658,8 @@ def _assert_package_business_matches_candidate(package: Path, candidate_root: Pa
 
 def verify_local_release(center: Path, tag: str) -> dict[str, Any]:
     center_root, _, release_directory = _local_release_paths(center, tag)
-    metadata = read_json(release_directory / "release.json")
-    package_name = require_relative_path(str(metadata.get("package", "")))
-    package = (release_directory / package_name).resolve()
-    try:
-        package.relative_to(release_directory)
-        package.relative_to(center_root)
-    except ValueError as error:
-        raise SelcError(
-            "RELEASE_INVALID",
-            "local release metadata points outside its release directory",
-            "repair or recreate the release",
-        ) from error
-    if not package.is_file() or file_hash(package) != metadata["package_hash"]:
-        raise SelcError(
-            "RELEASE_INVALID",
-            "local release package does not match its metadata",
-            "repair or recreate the release",
-        )
+    metadata = _assert_local_release_directory(release_directory, center_root)
+    package = release_directory / str(metadata["package"])
     return {"verified": True, "tag": tag, "package": str(package)}
 
 

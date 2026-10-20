@@ -4,12 +4,11 @@ from __future__ import annotations
 
 import os
 import shutil
-import tempfile
 import time
 import zipfile
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .errors import SelcError
 from .manifest import (
@@ -87,44 +86,59 @@ def _safe_extract(archive_path: Path, destination: Path) -> Path:
     return destination
 
 
+@contextmanager
 def resolve_source(
     source: str | Path, ref: str | None, subdir: str | None = None
-) -> tuple[Path, dict[str, Any]]:
-    """Return a disposable/read-only suite root and explicit source baseline metadata."""
+) -> Iterator[tuple[Path, dict[str, Any]]]:
+    """Yield a suite root while owning temporary package and Git resolver data."""
 
     source_text = str(source)
     local_source = Path(source_text.removeprefix("file://")).expanduser()
     if local_source.is_file() and local_source.suffix == ".zip":
-        temporary = Path(tempfile.mkdtemp(prefix="selc-package-"))
-        _safe_extract(local_source, temporary)
-        baseline_path = temporary / SOURCE_BASELINE_NAME
-        if baseline_path.is_file():
-            baseline = read_json(baseline_path)
-            required = {"kind", "repo", "subdir", "commit", "base"}
-            if required.issubset(baseline) and baseline.get("kind") == "git":
-                return temporary, {
-                    "kind": "git",
-                    "repo": str(baseline["repo"]),
-                    "subdir": str(baseline["subdir"]),
-                    "commit": str(baseline["commit"]),
-                    "base": str(baseline["base"]),
-                    "contribution_base": str(baseline.get("contribution_base") or baseline["base"]),
-                }
-        return temporary, {
-            "kind": "package",
-            "repo": str(local_source),
-            "subdir": ".",
-            "commit": None,
-            "base": None,
-        }
+        with temporary_directory("selc-package-") as temporary:
+            _safe_extract(local_source, temporary)
+            baseline_path = temporary / SOURCE_BASELINE_NAME
+            if baseline_path.is_file():
+                baseline = read_json(baseline_path)
+                required = {"kind", "repo", "subdir", "commit", "base"}
+                if required.issubset(baseline) and baseline.get("kind") == "git":
+                    yield (
+                        temporary,
+                        {
+                            "kind": "git",
+                            "repo": str(baseline["repo"]),
+                            "subdir": str(baseline["subdir"]),
+                            "commit": str(baseline["commit"]),
+                            "base": str(baseline["base"]),
+                            "contribution_base": str(
+                                baseline.get("contribution_base") or baseline["base"]
+                            ),
+                        },
+                    )
+                    return
+            yield (
+                temporary,
+                {
+                    "kind": "package",
+                    "repo": str(local_source),
+                    "subdir": ".",
+                    "commit": None,
+                    "base": None,
+                },
+            )
+        return
     if local_source.is_dir() and (local_source / "suite.json").is_file() and subdir in (None, "."):
-        return local_source, {
-            "kind": "directory",
-            "repo": str(local_source.resolve()),
-            "subdir": ".",
-            "commit": None,
-            "base": None,
-        }
+        yield (
+            local_source,
+            {
+                "kind": "directory",
+                "repo": str(local_source.resolve()),
+                "subdir": ".",
+                "commit": None,
+                "base": None,
+            },
+        )
+        return
     is_git_source = _is_git_source(source_text, local_source)
     if is_git_source:
         with temporary_directory("selc-source-") as temporary:
@@ -154,17 +168,20 @@ def resolve_source(
                     "Git source must contain exactly one suite.json",
                     "specify a suite subdirectory package",
                 )
-            stable_parent = Path(tempfile.mkdtemp(prefix="selc-git-suite-"))
-            stable = stable_parent / "suite"
+            stable = temporary / "stable-suite"
             copy_tree(suite_root, stable)
-            return stable, {
-                "kind": "git",
-                "repo": source_text,
-                "subdir": suite_root.relative_to(checkout).as_posix(),
-                "commit": commit,
-                "base": selected_ref,
-                "contribution_base": _contribution_base(checkout, commit),
-            }
+            yield (
+                stable,
+                {
+                    "kind": "git",
+                    "repo": source_text,
+                    "subdir": suite_root.relative_to(checkout).as_posix(),
+                    "commit": commit,
+                    "base": selected_ref,
+                    "contribution_base": _contribution_base(checkout, commit),
+                },
+            )
+            return
     raise SelcError(
         "INVALID_SOURCE",
         f"unsupported suite source: {source}",
@@ -172,42 +189,55 @@ def resolve_source(
     )
 
 
+@contextmanager
 def resolve_framework_source(
     source: str | Path, ref: str | None, subdir: str | None = None
-) -> tuple[Path, dict[str, Any]]:
-    """Resolve a runtime-only package or a complete suite with an embedded framework."""
+) -> Iterator[tuple[Path, dict[str, Any]]]:
+    """Yield a framework root while owning any package or Git resolver data."""
 
     source_text = str(source)
     local_source = Path(source_text.removeprefix("file://")).expanduser()
     if local_source.is_file() and local_source.suffix == ".zip":
-        temporary = Path(tempfile.mkdtemp(prefix="selc-framework-package-"))
-        _safe_extract(local_source, temporary)
-        _assert_framework_runtime_root_is_not_symlink(temporary)
-        return temporary, {
-            "kind": "framework_package",
-            "repo": str(local_source.resolve()),
-            "subdir": ".",
-            "commit": None,
-            "base": None,
-        }
+        with temporary_directory("selc-framework-package-") as temporary:
+            _safe_extract(local_source, temporary)
+            _assert_framework_runtime_root_is_not_symlink(temporary)
+            yield (
+                temporary,
+                {
+                    "kind": "framework_package",
+                    "repo": str(local_source.resolve()),
+                    "subdir": ".",
+                    "commit": None,
+                    "base": None,
+                },
+            )
+        return
     if local_source.is_dir() and framework_path(local_source).is_file():
         _assert_framework_runtime_root_is_not_symlink(local_source)
-        return local_source, {
-            "kind": "framework_directory",
-            "repo": str(local_source.resolve()),
-            "subdir": ".",
-            "commit": None,
-            "base": None,
-        }
+        yield (
+            local_source,
+            {
+                "kind": "framework_directory",
+                "repo": str(local_source.resolve()),
+                "subdir": ".",
+                "commit": None,
+                "base": None,
+            },
+        )
+        return
     if local_source.is_dir() and (local_source / "suite.json").is_file() and subdir is None:
         _assert_framework_runtime_root_is_not_symlink(local_source)
-        return local_source, {
-            "kind": "framework_suite",
-            "repo": str(local_source.resolve()),
-            "subdir": ".",
-            "commit": None,
-            "base": None,
-        }
+        yield (
+            local_source,
+            {
+                "kind": "framework_suite",
+                "repo": str(local_source.resolve()),
+                "subdir": ".",
+                "commit": None,
+                "base": None,
+            },
+        )
+        return
     is_git_source = _is_git_source(source_text, local_source)
     if not is_git_source:
         raise SelcError(
@@ -250,8 +280,7 @@ def resolve_framework_source(
             )
         framework_root = candidates[0]
         _assert_framework_runtime_root_is_not_symlink(framework_root)
-        stable_parent = Path(tempfile.mkdtemp(prefix="selc-git-framework-"))
-        stable = stable_parent / "framework"
+        stable = temporary / "stable-framework"
         descriptor = framework_path(framework_root)
         if descriptor.is_file():
             stable.mkdir()
@@ -259,13 +288,17 @@ def resolve_framework_source(
             shutil.copytree(framework_root / "runtime", stable / "runtime", symlinks=True)
         else:
             copy_portable_suite(framework_root, stable)
-        return stable, {
-            "kind": "framework_git",
-            "repo": source_text,
-            "subdir": framework_root.relative_to(checkout).as_posix(),
-            "commit": commit,
-            "base": selected_ref,
-        }
+        yield (
+            stable,
+            {
+                "kind": "framework_git",
+                "repo": source_text,
+                "subdir": framework_root.relative_to(checkout).as_posix(),
+                "commit": commit,
+                "base": selected_ref,
+            },
+        )
+        return
 
 
 def _assert_framework_runtime_root_is_not_symlink(root: Path) -> None:
@@ -631,8 +664,10 @@ def install_suite(
     framework_subdir: str | None = None,
     prepared_business_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    business_source_root, source_info = resolve_source(source, ref, subdir)
-    with temporary_directory("selc-install-input-") as temporary:
+    with (
+        resolve_source(source, ref, subdir) as (business_source_root, source_info),
+        temporary_directory("selc-install-input-") as temporary,
+    ):
         business_root = temporary / "business"
         manifest, business_digest = _snapshot_business_source(business_source_root, business_root)
         if prepared_business_snapshot is not None:
@@ -678,39 +713,41 @@ def install_suite(
             ) or preserved_external_selection.get("base")
             framework_subdir = preserved_external_selection.get("subdir")
 
-        framework_source_root, framework_source_info = resolve_framework_source(
-            framework_source, framework_ref, framework_subdir
-        )
-        framework_root = temporary / "framework"
-        framework = _snapshot_framework_source(framework_source_root, framework_root)
-        framework_info = framework_source_info | {
-            "version": framework["framework_version"],
-            "runtime_protocol": framework["runtime_protocol"],
-            "digest": framework["runtime_hash"],
-            "status": "active_external",
-        }
-        if preserved_external_selection is not None:
-            framework_info["base"] = preserved_external_selection.get("base")
-            if not _framework_matches_selection(framework_info, preserved_external_selection):
-                raise SelcError(
-                    "STALE_FRAMEWORK_SELECTION",
-                    "the saved external framework source changed before this install",
-                    "select the changed framework explicitly to apply its new runtime",
+        assert framework_source is not None
+        with resolve_framework_source(framework_source, framework_ref, framework_subdir) as (
+            framework_source_root,
+            framework_source_info,
+        ):
+            framework_root = temporary / "framework"
+            framework = _snapshot_framework_source(framework_source_root, framework_root)
+            framework_info = framework_source_info | {
+                "version": framework["framework_version"],
+                "runtime_protocol": framework["runtime_protocol"],
+                "digest": framework["runtime_hash"],
+                "status": "active_external",
+            }
+            if preserved_external_selection is not None:
+                framework_info["base"] = preserved_external_selection.get("base")
+                if not _framework_matches_selection(framework_info, preserved_external_selection):
+                    raise SelcError(
+                        "STALE_FRAMEWORK_SELECTION",
+                        "the saved external framework source changed before this install",
+                        "select the changed framework explicitly to apply its new runtime",
+                    )
+            with temporary_directory("selc-composite-") as composite_temporary:
+                composite = composite_temporary / "suite"
+                materialize_composite_suite(business_root, framework_root, composite)
+                return _install_materialized_suite(
+                    suite_root=composite,
+                    source_info=source_info,
+                    framework_info=framework_info,
+                    business_digest=business_digest,
+                    project_root=project_root,
+                    harness=harness,
+                    preserved_external_selection=preserved_external_selection,
+                    implicit_framework_selection_observed=implicit_framework_selection_observed,
+                    prepared_business_snapshot=prepared_business_snapshot,
                 )
-        with temporary_directory("selc-composite-") as composite_temporary:
-            composite = composite_temporary / "suite"
-            materialize_composite_suite(business_root, framework_root, composite)
-            return _install_materialized_suite(
-                suite_root=composite,
-                source_info=source_info,
-                framework_info=framework_info,
-                business_digest=business_digest,
-                project_root=project_root,
-                harness=harness,
-                preserved_external_selection=preserved_external_selection,
-                implicit_framework_selection_observed=implicit_framework_selection_observed,
-                prepared_business_snapshot=prepared_business_snapshot,
-            )
 
 
 def _install_materialized_suite(
@@ -1060,7 +1097,13 @@ def verify_expected_version(
             f"expected suite version {expected_version}, found {installation['version']}",
             "reload the skill entry and retry with the current version",
         )
-    if expected_hash is not None and installation["digest"] != expected_hash:
+    if not isinstance(expected_hash, str) or not expected_hash:
+        raise SelcError(
+            "STALE_RUNTIME",
+            "installed calls must provide the composite suite content hash",
+            "reload the installed skill entry and retry with its current hash",
+        )
+    if installation["digest"] != expected_hash:
         raise SelcError(
             "STALE_RUNTIME",
             "expected suite content hash does not match the installed suite",
@@ -1069,31 +1112,31 @@ def verify_expected_version(
 
 
 def update_check(source: str | Path, ref: str | None, subdir: str | None = None) -> dict[str, Any]:
-    suite_root, source_info = resolve_source(source, ref, subdir)
-    manifest = load_manifest(suite_root)
-    return {
-        "checked": True,
-        "suite_id": manifest["suite_id"],
-        "version": manifest["version"],
-        "digest": portable_tree_hash(suite_root),
-        "source": source_info,
-        "applied": False,
-    }
+    with resolve_source(source, ref, subdir) as (suite_root, source_info):
+        manifest = load_manifest(suite_root)
+        return {
+            "checked": True,
+            "suite_id": manifest["suite_id"],
+            "version": manifest["version"],
+            "digest": portable_tree_hash(suite_root),
+            "source": source_info,
+            "applied": False,
+        }
 
 
 def framework_update_check(
     source: str | Path, ref: str | None, subdir: str | None = None
 ) -> dict[str, Any]:
-    framework_root, source_info = resolve_framework_source(source, ref, subdir)
-    framework = load_framework(framework_root)
-    return {
-        "checked": True,
-        "framework_version": framework["framework_version"],
-        "runtime_protocol": framework["runtime_protocol"],
-        "runtime_hash": framework["runtime_hash"],
-        "source": source_info,
-        "applied": False,
-    }
+    with resolve_framework_source(source, ref, subdir) as (framework_root, source_info):
+        framework = load_framework(framework_root)
+        return {
+            "checked": True,
+            "framework_version": framework["framework_version"],
+            "runtime_protocol": framework["runtime_protocol"],
+            "runtime_hash": framework["runtime_hash"],
+            "source": source_info,
+            "applied": False,
+        }
 
 
 def recover_installation(project_root: Path, suite_id: str) -> dict[str, Any]:

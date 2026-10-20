@@ -29,9 +29,16 @@ from selc.evolve import (
     release_local,
     verify_local_release,
 )
-from selc.install import current_installation, install_suite, recover_installation
+from selc.install import (
+    current_installation,
+    framework_update_check,
+    install_suite,
+    recover_installation,
+    update_check,
+)
 from selc.manifest import (
     create_suite,
+    load_manifest,
     package_suite,
     portable_tree_hash,
     render_text_report,
@@ -598,6 +605,53 @@ class InstallationContractsTests(unittest.TestCase):
         self.assertTrue(owned_snapshots)
         self.assertTrue(all(not snapshot.exists() for snapshot in owned_snapshots))
 
+    def test_resolvers_release_owned_zip_and_git_directories_without_touching_inputs(self) -> None:
+        suite = self.create_suite("resolver-cleanup", ["text-report"])
+        archive = self.root / "resolver-cleanup.zip"
+        package_suite(suite, archive)
+        repository = self.root / "resolver-cleanup-repository"
+        shutil.copytree(suite, repository)
+        git(["init", "-b", "main"], repository)
+        git(["config", "user.name", "SELC Fixture"], repository)
+        git(["config", "user.email", "fixture@example.test"], repository)
+        git(["add", "."], repository)
+        git(["commit", "-m", "suite"], repository)
+        git(["tag", "v1.0.0"], repository)
+
+        import selc.install as install_module
+
+        original_temporary_directory = install_module.temporary_directory
+        owned_directories: list[Path] = []
+
+        @contextlib.contextmanager
+        def track_temporary_directory(prefix: str):
+            with original_temporary_directory(prefix) as temporary:
+                if prefix in {
+                    "selc-package-",
+                    "selc-source-",
+                    "selc-framework-source-",
+                }:
+                    owned_directories.append(temporary)
+                yield temporary
+
+        install_module.temporary_directory = track_temporary_directory
+        try:
+            self.assertTrue(update_check(archive, None)["checked"])
+            self.assertTrue(update_check(repository, "v1.0.0")["checked"])
+            self.assertTrue(framework_update_check(repository, "v1.0.0")["checked"])
+            invalid_archive = self.root / "invalid-suite.zip"
+            with zipfile.ZipFile(invalid_archive, "w"):
+                pass
+            with self.assertRaises(SelcError):
+                update_check(invalid_archive, None)
+        finally:
+            install_module.temporary_directory = original_temporary_directory
+
+        self.assertTrue(owned_directories)
+        self.assertTrue(all(not temporary.exists() for temporary in owned_directories))
+        self.assertTrue(suite.is_dir())
+        self.assertTrue(archive.is_file())
+
     def test_implicit_install_rechecks_an_empty_framework_selection_snapshot(self) -> None:
         """A default install cannot overwrite a concurrent explicit selection."""
 
@@ -1117,6 +1171,47 @@ class InstallationContractsTests(unittest.TestCase):
         with self.assertRaisesRegex(SelcError, "must define string"):
             render_text_report("line", suite / "resources")
 
+    def test_portable_skill_validator_rejects_non_string_descriptions(self) -> None:
+        suite = self.create_suite("skill-structure-suite", ["text-report"])
+        skill_file = suite / "skills" / "text-report" / "SKILL.md"
+        original = skill_file.read_text(encoding="utf-8")
+
+        for description in ("123", "# only a comment", "TRUE", "[not, a, string]"):
+            with self.subTest(description=description):
+                skill_file.write_text(
+                    original.replace(
+                        "description: text-report from the skill-structure-suite suite.",
+                        f"description: {description}",
+                    ),
+                    encoding="utf-8",
+                )
+                with self.assertRaisesRegex(SelcError, "description|string") as captured:
+                    load_manifest(suite)
+                self.assertEqual(captured.exception.code, "INVALID_SKILL")
+
+        skill_file.write_text(original, encoding="utf-8")
+        self.assertEqual(load_manifest(suite)["suite_id"], "skill-structure-suite")
+
+    def test_tree_hashes_frame_paths_and_content_without_marker_collisions(self) -> None:
+        first = self.root / "first-tree"
+        second = self.root / "second-tree"
+        first.mkdir()
+        second.mkdir()
+        (first / "a.py").write_bytes(b"prefix\x00b.py\x00suffix")
+        (second / "a.py").write_bytes(b"prefix")
+        (second / "b.py").write_bytes(b"suffix")
+        self.assertNotEqual(tree_hash(first), tree_hash(second))
+
+        first_suite = self.root / "first-suite"
+        second_suite = self.root / "second-suite"
+        create_suite("hash-suite", "1.0.0", first_suite, ["text-report"])
+        create_suite("hash-suite", "1.0.0", second_suite, ["text-report"])
+        (first_suite / "resources" / "a.py").write_bytes(b"prefix\x00resources/b.py\x00suffix")
+        (second_suite / "resources" / "a.py").write_bytes(b"prefix")
+        (second_suite / "resources" / "b.py").write_bytes(b"suffix")
+        self.assertNotEqual(portable_tree_hash(first_suite), portable_tree_hash(second_suite))
+        self.assertNotEqual(suite_content_hash(first_suite), suite_content_hash(second_suite))
+
     def test_embedded_future_runtime_protocol_is_rejected(self) -> None:
         suite = self.create_suite("protocol-suite", ["text-report"])
         manifest_path = suite / "suite.json"
@@ -1175,7 +1270,15 @@ class InstallationContractsTests(unittest.TestCase):
 
         shutil.rmtree(suite / "skills" / "beta")
         (suite / "skills" / "gamma").mkdir()
-        (suite / "skills" / "gamma" / "SKILL.md").write_text("# gamma\n", encoding="utf-8")
+        (suite / "skills" / "gamma" / "SKILL.md").write_text(
+            "---\n"
+            "name: gamma\n"
+            "description: A replacement portable report skill.\n"
+            "---\n\n"
+            "# Gamma\n\n"
+            "Use the suite wrapper to produce a checked report.\n",
+            encoding="utf-8",
+        )
         manifest_path = suite / "suite.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["version"] = "2.0.0"

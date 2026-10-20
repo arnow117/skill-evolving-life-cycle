@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from .errors import SelcError
 
@@ -41,18 +41,39 @@ def tree_hash(root: Path) -> str:
         raise SelcError(
             "INVALID_PATH", f"directory does not exist: {root}", "choose an existing directory"
         )
-    digest = hashlib.sha256()
+    entries: list[tuple[str, str, bytes]] = []
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
         if _is_runtime_cache(path.relative_to(root)):
             continue
         if path.is_symlink():
-            digest.update(f"link:{relative}:{os.readlink(path)}".encode("utf-8"))
+            entries.append((relative, "symlink", os.fsencode(os.readlink(path))))
             continue
         if path.is_file():
-            digest.update(f"file:{relative}:".encode("utf-8"))
-            digest.update(path.read_bytes())
-    return digest.hexdigest()
+            entries.append((relative, "file", path.read_bytes()))
+    return typed_tree_hash(entries)
+
+
+def typed_tree_hash(entries: Iterable[tuple[str, str, bytes]]) -> str:
+    """Hash typed tree entries with unambiguous, canonical record boundaries.
+
+    Earlier development snapshots concatenated textual path markers and file
+    bytes.  A file body could therefore imitate the marker for a following
+    file.  First-release SELC uses this canonical record form everywhere a
+    tree digest represents portable or candidate content.  It intentionally
+    has no compatibility fallback for the abandoned development algorithm.
+    """
+
+    records = [
+        {
+            "path": relative,
+            "type": entry_type,
+            "content_sha256": hashlib.sha256(contents).hexdigest(),
+        }
+        for relative, entry_type, contents in entries
+    ]
+    records.sort(key=lambda record: (record["path"], record["type"]))
+    return json_hash({"algorithm": "selc-tree-v1", "entries": records})
 
 
 def _is_runtime_cache(relative: Path) -> bool:

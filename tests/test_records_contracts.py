@@ -296,7 +296,11 @@ class RecordContractTests(unittest.TestCase):
                 "origin_id": origin,
                 "snapshot_revision": 1,
                 "as_of": "2026-10-20T02:00:00Z",
-                "metric_contract": "fixture-v1",
+                "metric_contract": {
+                    "groups": ["tasks.one_shot", "tasks.final", "calls.one_shot", "calls.final"],
+                    "measures": ["N", "S", "K", "U", "S_over_N", "S_over_K", "K_over_N"],
+                    "privacy": "fixture",
+                },
                 "tasks": [
                     {
                         "task_id": "shared",
@@ -358,7 +362,11 @@ class RecordContractTests(unittest.TestCase):
                 "origin_id": origin,
                 "snapshot_revision": 1,
                 "as_of": "2026-10-20T02:00:00Z",
-                "metric_contract": "fixture-v1",
+                "metric_contract": {
+                    "groups": ["tasks.one_shot", "tasks.final", "calls.one_shot", "calls.final"],
+                    "measures": ["N", "S", "K", "U", "S_over_N", "S_over_K", "K_over_N"],
+                    "privacy": "fixture",
+                },
                 "tasks": [],
                 "calls": [
                     {
@@ -572,6 +580,110 @@ class RecordContractTests(unittest.TestCase):
             )
         records.close_task(database, test_task)
         self.assertTrue(records.close_task(database, test_task)["replayed"])
+
+    def test_completed_call_replay_precedes_closed_task_rejection(self) -> None:
+        database = self.database("completed-call-replay")
+        self.start_task(database)
+        call = {
+            "call_id": "call",
+            "task_id": "task",
+            "skill": "report",
+            "executor": "codex",
+            "evidence": "fixture",
+            "expected_version": "1.0.0",
+            "expected_hash": "digest",
+            "trigger_kind": "explicit",
+        }
+        records.start_call(database, **call)
+        records.complete_call(database, "call", "unknown")
+        records.close_task(database, "task")
+
+        self.assertTrue(records.start_call(database, **call)["replayed"])
+        with self.assertRaises(SelcError) as new_call:
+            records.start_call(database, **{**call, "call_id": "new-call"})
+        self.assertEqual(new_call.exception.code, "TASK_CLOSED")
+        with self.assertRaises(SelcError) as changed_call:
+            records.start_call(database, **{**call, "evidence": "other evidence"})
+        self.assertEqual(changed_call.exception.code, "ID_CONFLICT")
+
+    def test_delivery_replay_binds_checker_identity_and_legacy_rows_are_unverifiable(self) -> None:
+        database = self.database("delivery-replay")
+        self.start_task(database)
+        delivery = {
+            "delivery_id": "delivery",
+            "task_id": "task",
+            "artifact_hash": "artifact",
+            "rule_version": "text-report-v1",
+            "declared_result": "pass",
+            "complete_fixture": False,
+            "checker_id": "text-report-v1",
+            "checker_verified": True,
+            "checker_result": "pass",
+            "checker_identity": {
+                "checker_input_hash": "input-a",
+                "checker_artifact_hash": "artifact-a",
+                "checker_resource_hash": "resource-a",
+                "checker_composite_hash": "digest-a",
+            },
+        }
+        self.assertFalse(records.record_delivery(database, **delivery)["replayed"])
+        self.assertTrue(records.record_delivery(database, **delivery)["replayed"])
+        changed = dict(delivery)
+        changed["checker_identity"] = {
+            **delivery["checker_identity"],
+            "checker_input_hash": "input-b",
+        }
+        with self.assertRaises(SelcError) as checker_conflict:
+            records.record_delivery(database, **changed)
+        self.assertEqual(checker_conflict.exception.code, "ID_CONFLICT")
+        stored = database.execute(
+            "SELECT checker_input_hash FROM deliveries WHERE delivery_id = 'delivery'"
+        ).fetchone()
+        self.assertEqual(stored["checker_input_hash"], "input-a")
+
+        database.execute(
+            "UPDATE deliveries SET checker_identity_version = 0 WHERE delivery_id = 'delivery'"
+        )
+        database.commit()
+        with self.assertRaises(SelcError) as legacy_replay:
+            records.record_delivery(database, **delivery)
+        self.assertEqual(legacy_replay.exception.code, "ID_CONFLICT")
+
+    def test_import_rejects_malformed_types_before_noop_or_write(self) -> None:
+        source = self.database("malformed-source")
+        self.start_task(source, is_test=False)
+        snapshot_path = self.root / "valid-snapshot.json"
+        records.export_snapshot(source, snapshot_path)
+        original = read_json(snapshot_path)
+        target = self.database("malformed-target")
+
+        malformed_payloads = []
+        bool_schema = dict(original)
+        bool_schema["schema_version"] = True
+        malformed_payloads.append(bool_schema)
+        bool_revision = dict(original)
+        bool_revision["snapshot_revision"] = True
+        malformed_payloads.append(bool_revision)
+        list_result = json.loads(json.dumps(original))
+        list_result["tasks"][0]["first_result"] = []
+        malformed_payloads.append(list_result)
+
+        for index, payload in enumerate(malformed_payloads):
+            with self.subTest(index=index):
+                payload["snapshot_hash"] = json_hash(
+                    {key: value for key, value in payload.items() if key != "snapshot_hash"}
+                )
+                invalid_path = self.root / f"invalid-{index}.json"
+                write_json(invalid_path, payload)
+                with self.assertRaises(SelcError) as captured:
+                    records.import_snapshot(target, invalid_path)
+                self.assertIn(captured.exception.code, {"UNSUPPORTED_SCHEMA", "INVALID_SNAPSHOT"})
+                self.assertEqual(
+                    target.execute("SELECT COUNT(*) FROM imported_snapshots").fetchone()[0], 0
+                )
+                self.assertEqual(
+                    records.stats(target, include_test=False)["tasks"]["final"]["N"], 0
+                )
 
     def test_snapshot_revisions_reject_tampering_and_keep_newer_samples(self) -> None:
         source = self.database("snapshot-source")

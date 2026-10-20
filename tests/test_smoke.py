@@ -34,7 +34,12 @@ def run_cli(*arguments: str, expected: int = 0) -> dict[str, object]:
 
 
 def write_release_fake(
-    path: Path, state: Path, provider: str, *, ambiguous_create: bool = False
+    path: Path,
+    state: Path,
+    provider: str,
+    *,
+    ambiguous_create: bool = False,
+    contribution_center: Path | None = None,
 ) -> None:
     """Provide the documented query/create/download shape without a real provider."""
 
@@ -43,6 +48,51 @@ def write_release_fake(
     else:
         metadata = (
             'printf \'{\\"tag_name\\":\\"%s\\",\\"commit\\":{\\"id\\":\\"%s\\"}}\' "$tag" "$target"'
+        )
+    contribution_adapter = ""
+    if provider == "github" and contribution_center is not None:
+        request_state = state.with_suffix(".contribution-request")
+        contribution_adapter = (
+            'if [ "$1" = pr ] && [ "$2" = list ]; then\n'
+            f'  if [ ! -f "{request_state}" ]; then printf "[]"; exit 0; fi\n'
+            f'  IFS="|" read branch commit < "{request_state}"\n'
+            '  printf \'[{"number":1,"headRefName":"%s","baseRefName":"main","headRefOid":"%s","headRepository":{"nameWithOwner":"owner/control-repository"},"headRepositoryOwner":{"login":"owner"}}]\' "$branch" "$commit"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = pr ] && [ "$2" = create ]; then\n'
+            "  branch=\n"
+            "  previous=\n"
+            '  for argument in "$@"; do\n'
+            '    if [ "$previous" = --head ]; then branch=$argument; break; fi\n'
+            "    previous=$argument\n"
+            "  done\n"
+            f'  commit=$(git --git-dir "{contribution_center}" rev-parse "refs/heads/$branch")\n'
+            f'  printf "%s|%s\\n" "$branch" "$commit" > "{request_state}"\n'
+            "  printf 'created\\n'\n"
+            "  exit 0\n"
+            "fi\n"
+        )
+    if provider == "gitlab" and contribution_center is not None:
+        request_state = state.with_suffix(".contribution-request")
+        contribution_adapter = (
+            'if [ "$1" = api ]; then\n'
+            f'  if [ ! -f "{request_state}" ]; then printf "[]"; exit 0; fi\n'
+            f'  IFS="|" read branch commit < "{request_state}"\n'
+            '  printf \'[{"source_branch":"%s","target_branch":"main","sha":"%s","source_project_id":17,"target_project_id":17}]\' "$branch" "$commit"\n'
+            "  exit 0\n"
+            "fi\n"
+            'if [ "$1" = mr ] && [ "$2" = create ]; then\n'
+            "  branch=\n"
+            "  previous=\n"
+            '  for argument in "$@"; do\n'
+            '    if [ "$previous" = --source-branch ]; then branch=$argument; break; fi\n'
+            "    previous=$argument\n"
+            "  done\n"
+            f'  commit=$(git --git-dir "{contribution_center}" rev-parse "refs/heads/$branch")\n'
+            f'  printf "%s|%s\\n" "$branch" "$commit" > "{request_state}"\n'
+            "  printf 'created\\n'\n"
+            "  exit 0\n"
+            "fi\n"
         )
     path.write_text(
         "#!/bin/sh\n"
@@ -77,11 +127,12 @@ def write_release_fake(
         '  cp "$package" "$directory/$(basename "$package")"\n'
         "  exit 0\n"
         "fi\n"
-        'if [ "$1" = pr ] || [ "$1" = mr ]; then\n'
-        '  if [ "$2" = list ]; then exit 0; fi\n'
-        f"  printf '{provider} adapter invoked\\n'\n"
-        "  exit 0\n"
-        "fi\n"
+        + contribution_adapter
+        + 'if [ "$1" = pr ] || [ "$1" = mr ]; then\n'
+        + '  if [ "$2" = list ]; then printf "[]"; exit 0; fi\n'
+        + f"  printf '{provider} adapter invoked\\n'\n"
+        + "  exit 0\n"
+        + "fi\n"
         f"printf '{provider} adapter invoked\\n'\n",
         encoding="utf-8",
     )
@@ -173,6 +224,7 @@ class SelcSmokeTests(unittest.TestCase):
                 "codex",
             )
             self.assertEqual(installed["installation"]["version"], "1.0.0")
+            expected_hash = str(installed["installation"]["digest"])
             workbuddy = run_cli(
                 "install",
                 "--source",
@@ -266,6 +318,8 @@ class SelcSmokeTests(unittest.TestCase):
                 "fixture",
                 "--expected-version",
                 "1.0.0",
+                "--expected-hash",
+                expected_hash,
             )
             run_cli(
                 "event",
@@ -908,9 +962,19 @@ class SelcSmokeTests(unittest.TestCase):
             self.addCleanup(restore_git_url_rewrite)
 
             fake_github = temporary / "fake-gh"
-            write_release_fake(fake_github, temporary / "github-release.state", "github")
+            write_release_fake(
+                fake_github,
+                temporary / "github-release.state",
+                "github",
+                contribution_center=central,
+            )
             fake_gitlab = temporary / "fake-glab"
-            write_release_fake(fake_gitlab, temporary / "gitlab-release.state", "gitlab")
+            write_release_fake(
+                fake_gitlab,
+                temporary / "gitlab-release.state",
+                "gitlab",
+                contribution_center=central,
+            )
 
             candidate_parent = temporary / "candidate-one"
             run_cli("evolve", "prepare", "--suite", str(suite), "--output", str(candidate_parent))
@@ -964,7 +1028,10 @@ class SelcSmokeTests(unittest.TestCase):
                 "--client",
                 str(fake_github),
             )
-            self.assertIn("github", verified_contribution["output"])
+            self.assertEqual(
+                json.loads(verified_contribution["output"])[0]["headRepository"]["nameWithOwner"],
+                "owner/control-repository",
+            )
             prepared = run_cli(
                 "release",
                 "prepare",
@@ -1091,7 +1158,10 @@ class SelcSmokeTests(unittest.TestCase):
                 "--client",
                 str(fake_gitlab),
             )
-            self.assertIn("gitlab", verified_contribution["output"])
+            self.assertEqual(
+                json.loads(verified_contribution["output"])[0]["target_project_id"],
+                17,
+            )
             prepared = run_cli(
                 "release",
                 "prepare",

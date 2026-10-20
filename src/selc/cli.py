@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sqlite3
 import sys
@@ -43,6 +44,7 @@ from .manifest import (
     package_framework,
     package_suite,
     render_text_report,
+    render_text_report_bytes,
     seal_suite,
 )
 from .records import (
@@ -140,7 +142,11 @@ def _parser() -> argparse.ArgumentParser:
     call_start.add_argument("--executor", required=True)
     call_start.add_argument("--evidence", required=True)
     call_start.add_argument("--expected-version", required=True)
-    call_start.add_argument("--expected-hash")
+    call_start.add_argument(
+        "--expected-hash",
+        required=True,
+        help="installed composite digest returned by install; stale or missing entries are rejected",
+    )
     call_start.add_argument(
         "--trigger", default="explicit", choices=["explicit", "automatic", "retry"]
     )
@@ -345,15 +351,17 @@ def _render_text_report(
     }
 
 
-def _verify_delivery_checker(arguments: argparse.Namespace) -> tuple[bool, str | None]:
+def _verify_delivery_checker(
+    arguments: argparse.Namespace,
+) -> tuple[bool, str | None, dict[str, str] | None]:
     """Run the one v0.1 trusted checker without executing caller-provided code."""
 
     if arguments.checker != "text-report-v1":
-        return False, None
+        return False, None, None
     if arguments.rule_version != "text-report-v1":
-        return False, None
+        return False, None, None
     if arguments.input is None or arguments.output is None:
-        return False, None
+        return False, None, None
     database = open_database(arguments.project_root)
     try:
         task = database.execute(
@@ -362,7 +370,7 @@ def _verify_delivery_checker(arguments: argparse.Namespace) -> tuple[bool, str |
     finally:
         database.close()
     if task is None:
-        return False, None
+        return False, None, None
     try:
         installation = current_installation(arguments.project_root, task["suite_id"])
         resources_root = (
@@ -372,14 +380,22 @@ def _verify_delivery_checker(arguments: argparse.Namespace) -> tuple[bool, str |
             / installation["digest"]
             / "resources"
         )
-        expected = render_text_report(arguments.input.read_text(encoding="utf-8"), resources_root)
-        actual = arguments.output.read_text(encoding="utf-8")
-    except (OSError, SelcError):
-        return False, None
-    output_hash_matches = (
-        arguments.output.is_file() and file_hash(arguments.output) == arguments.artifact_hash
-    )
-    return True, "pass" if output_hash_matches and actual == expected else "fail"
+        input_bytes = arguments.input.read_bytes()
+        output_bytes = arguments.output.read_bytes()
+        resource_bytes = (resources_root / "text-report.json").read_bytes()
+        expected = render_text_report_bytes(input_bytes.decode("utf-8"), resource_bytes)
+        actual = output_bytes.decode("utf-8")
+    except (OSError, UnicodeDecodeError, SelcError):
+        return False, None, None
+    actual_artifact_hash = hashlib.sha256(output_bytes).hexdigest()
+    identity = {
+        "checker_input_hash": hashlib.sha256(input_bytes).hexdigest(),
+        "checker_artifact_hash": actual_artifact_hash,
+        "checker_resource_hash": hashlib.sha256(resource_bytes).hexdigest(),
+        "checker_composite_hash": str(installation["digest"]),
+    }
+    output_hash_matches = actual_artifact_hash == arguments.artifact_hash
+    return True, "pass" if output_hash_matches and actual == expected else "fail", identity
 
 
 def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) -> dict[str, Any]:
@@ -547,7 +563,7 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
         finally:
             database.close()
     if command == "delivery":
-        checker_verified, checker_result = _verify_delivery_checker(arguments)
+        checker_verified, checker_result, checker_identity = _verify_delivery_checker(arguments)
         database = open_database(arguments.project_root)
         try:
             return {
@@ -563,6 +579,7 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
                     checker_id=arguments.checker,
                     checker_verified=checker_verified,
                     checker_result=checker_result,
+                    checker_identity=checker_identity,
                 )
             }
         finally:

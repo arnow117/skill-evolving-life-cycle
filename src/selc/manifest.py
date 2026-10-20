@@ -7,7 +7,6 @@ import re
 import shutil
 import zipfile
 from contextlib import suppress
-from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +19,7 @@ from .util import (
     run_argv,
     run_argv_result,
     tree_hash,
+    typed_tree_hash,
     write_json,
 )
 
@@ -35,17 +35,17 @@ def manifest_path(suite_root: Path) -> Path:
 def suite_content_hash(suite_root: Path) -> str:
     """Hash all suite content while avoiding a self-referential manifest hash."""
 
-    digest = sha256()
+    entries: list[tuple[str, str, bytes]] = []
     for path in _suite_files(suite_root):
         relative = path.relative_to(suite_root).as_posix()
-        digest.update(f"file:{relative}:".encode("utf-8"))
         if path == manifest_path(suite_root):
             contents = json.loads(path.read_text(encoding="utf-8"))
             contents.pop("content_hash", None)
-            digest.update(canonical_json(contents).encode("utf-8"))
+            payload = canonical_json(contents).encode("utf-8")
         else:
-            digest.update(path.read_bytes())
-    return digest.hexdigest()
+            payload = path.read_bytes()
+        entries.append((relative, "file", payload))
+    return typed_tree_hash(entries)
 
 
 def _suite_files(suite_root: Path) -> list[Path]:
@@ -228,12 +228,10 @@ def read_manifest(suite_root: Path) -> dict[str, Any]:
 def portable_tree_hash(suite_root: Path) -> str:
     """Hash the same explicit portable surface copied by package and installation."""
 
-    digest = sha256()
-    for path in _suite_files(suite_root):
-        relative = path.relative_to(suite_root).as_posix()
-        digest.update(f"file:{relative}:".encode("utf-8"))
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+    return typed_tree_hash(
+        (path.relative_to(suite_root).as_posix(), "file", path.read_bytes())
+        for path in _suite_files(suite_root)
+    )
 
 
 def copy_portable_suite(source: Path, destination: Path) -> None:
@@ -286,6 +284,12 @@ def validate_manifest(manifest: dict[str, Any], suite_root: Path) -> None:
     skills = manifest["skills"]
     if not isinstance(skills, list) or not skills:
         raise SelcError("INVALID_MANIFEST", "skills must contain at least one skill", "add a skill")
+    validate_declared_skills(suite_root, skills)
+
+
+def validate_declared_skills(suite_root: Path, skills: list[Any]) -> None:
+    """Validate manifest-owned skill names, paths, and portable bodies."""
+
     names: set[str] = set()
     for skill in skills:
         if not isinstance(skill, dict) or not isinstance(skill.get("name"), str):
@@ -298,7 +302,14 @@ def validate_manifest(manifest: dict[str, Any], suite_root: Path) -> None:
                 "use unique kebab-case names",
             )
         names.add(name)
-        relative = require_relative_path(skill.get("path", f"skills/{name}"))
+        relative_value = skill.get("path", f"skills/{name}")
+        if not isinstance(relative_value, str):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"skill path must be a string: {name}",
+                "repair the declared skill path",
+            )
+        relative = require_relative_path(relative_value)
         skill_file = suite_root / relative / "SKILL.md"
         if not skill_file.is_file():
             raise SelcError(
@@ -306,6 +317,122 @@ def validate_manifest(manifest: dict[str, Any], suite_root: Path) -> None:
                 f"missing skill file: {relative}/SKILL.md",
                 "create the declared skill",
             )
+        validate_skill_structure(skill_file, name)
+
+
+def validate_skill_structure(skill_file: Path, declared_name: str) -> None:
+    """Validate the small portable SKILL.md contract without a YAML dependency.
+
+    SELC needs only three portable guarantees: a bounded frontmatter block, a
+    matching scalar ``name``, and non-empty scalar ``description`` and body.
+    This deliberately is not a replacement for skill-creator's full YAML
+    validation, which remains an authoring-tool check outside the runtime.
+    """
+
+    try:
+        lines = skill_file.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise SelcError(
+            "INVALID_SKILL",
+            f"cannot read declared skill: {skill_file}",
+            "restore the declared SKILL.md file",
+        ) from error
+    if not lines or lines[0] != "---":
+        raise SelcError(
+            "INVALID_SKILL",
+            f"skill frontmatter must start at the first line: {skill_file}",
+            "add supported name and description frontmatter",
+        )
+    try:
+        closing_index = lines.index("---", 1)
+    except ValueError as error:
+        raise SelcError(
+            "INVALID_SKILL",
+            f"skill frontmatter has no closing boundary: {skill_file}",
+            "close the supported frontmatter block",
+        ) from error
+    values: dict[str, str] = {}
+    for line in lines[1:closing_index]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if ":" not in line:
+            raise SelcError(
+                "INVALID_SKILL",
+                f"skill frontmatter has an unsupported field: {skill_file}",
+                "use simple scalar name and description fields",
+            )
+        key, raw_value = line.split(":", maxsplit=1)
+        key = key.strip()
+        value = _portable_frontmatter_scalar(raw_value.strip())
+        if key in {"name", "description"}:
+            if key in values:
+                raise SelcError(
+                    "INVALID_SKILL",
+                    f"skill frontmatter repeats {key}: {skill_file}",
+                    "keep one supported name and description field",
+                )
+            values[key] = value
+    if values.get("name") != declared_name:
+        raise SelcError(
+            "INVALID_SKILL",
+            f"skill name does not match its declared manifest name: {skill_file}",
+            "make frontmatter name match suite.json",
+        )
+    if not values.get("description"):
+        raise SelcError(
+            "INVALID_SKILL",
+            f"skill description must be a non-empty string: {skill_file}",
+            "provide a supported scalar description",
+        )
+    if not "\n".join(lines[closing_index + 1 :]).strip():
+        raise SelcError(
+            "INVALID_SKILL",
+            f"skill body must be non-empty: {skill_file}",
+            "write the portable skill instructions below frontmatter",
+        )
+
+
+def _portable_frontmatter_scalar(value: str) -> str:
+    """Parse the intentionally narrow scalar form supported by the runtime."""
+
+    if not value or value.startswith("#"):
+        return ""
+    if value[0] in "[{|>&*!" or value.casefold() in {
+        "~",
+        "null",
+        "true",
+        "false",
+        "yes",
+        "no",
+        ".nan",
+        ".inf",
+        "-.inf",
+        "+.inf",
+    }:
+        raise SelcError(
+            "INVALID_SKILL",
+            "portable skill frontmatter needs a string scalar",
+            "use an unquoted or simply quoted string value",
+        )
+    if value[0] in {"'", '"'}:
+        if len(value) < 2 or value[-1] != value[0]:
+            raise SelcError(
+                "INVALID_SKILL",
+                "portable skill frontmatter has an unterminated string",
+                "use a complete quoted string value",
+            )
+        value = value[1:-1]
+        return value.strip()
+    if re.fullmatch(
+        r"[-+]?(?:0[xob][0-9a-fA-F_]+|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)",
+        value,
+    ):
+        raise SelcError(
+            "INVALID_SKILL",
+            "portable skill frontmatter needs a string scalar",
+            "quote numeric-looking values or use a descriptive string",
+        )
+    return value.strip()
 
 
 def render_text_report(text: str, resources_root: Path) -> str:
@@ -318,8 +445,14 @@ def render_text_report(text: str, resources_root: Path) -> str:
             "text report resource is missing",
             "restore resources/text-report.json from the installed suite",
         )
+    return render_text_report_bytes(text, configuration_path.read_bytes())
+
+
+def render_text_report_bytes(text: str, configuration_bytes: bytes) -> str:
+    """Render from one caller-owned resource snapshot used for verification hashes."""
+
     try:
-        configuration = json.loads(configuration_path.read_text(encoding="utf-8"))
+        configuration = json.loads(configuration_bytes.decode("utf-8"))
     except json.JSONDecodeError as error:
         raise SelcError(
             "INVALID_RESOURCE",

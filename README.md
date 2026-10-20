@@ -44,6 +44,8 @@ selc package --suite /tmp/simple-reports --output /tmp/simple-reports.zip
 
 `SELC_CREATOR_PYTHON` names the active Codex creator environment, which supplies PyYAML, and `SELC_SKILL_CREATOR` names its `skill-creator` directory. They are authoring-tool inputs, not portable runtime dependencies. `seal` is explicit: before it succeeds, `validate` and `package` reject creator edits with `CONTENT_HASH_MISMATCH`. It validates manifest paths, portable content, runtime protocol, and the existing `framework.json` runtime hash, then changes only `suite.json`'s content hash. It cannot repair a modified runtime or make an installed local edit clean. The result has `suite.json`, independent `skills/*/SKILL.md`, portable `runtime/`, `bin/selc-suite.py`, `install.py`, and `MAINTENANCE.md`. The package operation includes those portable code and declared-resource entries and, when packaging from a valid Git checkout, a minimal source-baseline descriptor for later isolated contribution. It excludes `.git`, `.selc`, reports, and other business data. The output path must be outside the suite, and symlinks in portable content are rejected. If creation or packaging reports `PATH_CONFLICT`, select an empty output path. If validation reports `INVALID_MANIFEST`, repair the declared relative paths and skill names before packaging.
 
+Portable skill files use the supported core form: a bounded `---` frontmatter block with the declared string `name`, a non-empty string `description`, and a non-empty body. This is a runtime safety check, not a replacement for the full creator validator. SELC v0.1 uses a canonical typed-tree digest for portable content. Development artifacts made with an earlier digest format must be recreated, sealed, evaluated, and reconfirmed; SELC does not accept a weak-digest fallback or silently reseal them.
+
 For Codex-authoring changes, use `.claude/skills/selc/SKILL.md` and the system `skill-creator` validator. Its PyYAML requirement is not a portable suite dependency.
 
 ## US-002 — Install and run the text-report example
@@ -65,13 +67,15 @@ Use `--source <repo> --subdir <relative-suite-dir> --ref <tag-or-commit>` for a 
 
 ## US-003 — Record and aggregate a task
 
-Actor: a harness adapter or user with task evidence. A task ID is the business-operation identity; each invocation gets a separate call ID. `initiator` and `executor` are separate fields. `--test` puts controlled fixtures outside default reports. A call supplies the skill entry's `--expected-version` and may supply `--expected-hash`; either mismatch rejects a stale entry before it can mix with the new runtime.
+Actor: a harness adapter or user with task evidence. A task ID is the business-operation identity; each invocation gets a separate call ID. `initiator` and `executor` are separate fields. `--test` puts controlled fixtures outside default reports. An installed call must supply the skill entry's `--expected-version` and `--expected-hash`; SELC never fills a missing digest from the current installation, so a stale or incomplete entry cannot mix with a new runtime.
 
 ```bash
 selc task start --project-root /tmp/selc-project --id task-1 \
   --suite-id simple-reports --initiator author --evidence local-test --test --harness codex
+EXPECTED_HASH=$(selc_python -c 'import json; print(json.load(open("/tmp/selc-project/.selc/installations.json"))["installations"]["simple-reports"]["digest"])')
 selc call start --project-root /tmp/selc-project --id call-1 --task-id task-1 \
-  --skill text-report --executor fixture-runner --evidence local-test --expected-version 1.0.0
+  --skill text-report --executor fixture-runner --evidence local-test --expected-version 1.0.0 \
+  --expected-hash "$EXPECTED_HASH"
 selc event --project-root /tmp/selc-project --task-id task-1 \
   --kind input_ready --evidence 'input selected for this task'
 selc delivery --project-root /tmp/selc-project --id delivery-1 --task-id task-1 --call-id call-1 \
@@ -132,6 +136,8 @@ selc release prepare --suite /tmp/suite-repository/suite --candidate /tmp/candid
 ```
 
 `evolve prepare` only creates a creator brief; it does not claim an LLM changed the candidate. Follow that brief to make an explicit candidate-only edit such as the command above; an unchanged candidate is rejected with `NO_CONTRIBUTION_CHANGES`. An invalid candidate resource produces a failed report. `--model-calls` must remain zero in v0.1. Holdout details are not copied to the creator brief. `contribute prepare` restores the saved source commit in an isolated workspace, creates a `codex/` non-default branch, maps only candidate skills/resources, and writes a real diff and package. `contribute execute` rechecks the workspace manifest, runtime, wrapper, and business hashes before committing and pushing that branch. With `--provider github|gitlab --repository <owner/repository> --client <controlled-client>`, the source provenance must record a public `github.com` or `gitlab.com` origin for that same repository; SELC verifies the namespace, provider, and host before it commits or pushes, then queries and creates a PR/MR with a host-qualified `--repo`. It rejects an unclassified self-hosted origin in v0.1. `contribute verify --plan <contribution-plan> --provider <github|gitlab> --client <controlled-client>` reloads that same bound identity and branch rather than resolving a client default such as `GH_HOST`.
+
+If a local push or provider request is interrupted, rerun the same contribution plan. SELC accepts only its one verified contribution commit, rechecks the fixed remote branch before a request is reused, and verifies the provider response against the bound repository, head branch, base branch, and commit. An unknown provider response stops the recovery rather than creating another request. Local releases stage the package and full target metadata inside the bound center before an atomic tag publish; a partial or corrupt existing tag is reported for repair and is never overwritten.
 
 A provenance-carrying package installed in a consumer project can prepare the same contribution without a development checkout:
 
