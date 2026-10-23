@@ -182,8 +182,8 @@ class SelcSmokeTests(unittest.TestCase):
                 skill_body = archive.read("skills/text-report/SKILL.md").decode("utf-8")
             self.assertNotIn(".selc/business-output.txt", names)
             self.assertNotIn(".git/config", names)
-            self.assertIn("task start", skill_body)
-            self.assertIn("Scanning, discovery", skill_body)
+            self.assertIn("managed runtime verifies", skill_body)
+            self.assertIn("Discovery or scanning creates no lifecycle record", skill_body)
             unsafe_package = run_cli(
                 "package",
                 "--suite",

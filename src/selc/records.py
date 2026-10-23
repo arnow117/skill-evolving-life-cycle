@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -13,8 +14,7 @@ from . import SCHEMA_VERSION
 from .errors import SelcError
 from .util import json_hash, read_json, write_json
 
-
-WRITER_PROTOCOL_VERSION = 2
+WRITER_PROTOCOL_VERSION = 3
 
 
 def utc_now() -> str:
@@ -197,7 +197,7 @@ def open_database(project_root: Path) -> sqlite3.Connection:
           created_at TEXT NOT NULL,
           PRIMARY KEY(origin_id, subject_kind, subject_id)
         );
-            """
+            """,
         )
         _ensure_column(database, "calls", "actual_harness", "TEXT NOT NULL DEFAULT 'unknown'")
         _ensure_column(database, "calls", "declared_result", "TEXT")
@@ -209,7 +209,9 @@ def open_database(project_root: Path) -> sqlite3.Connection:
         _ensure_column(database, "deliveries", "checker_artifact_hash", "TEXT")
         _ensure_column(database, "deliveries", "checker_resource_hash", "TEXT")
         _ensure_column(database, "deliveries", "checker_composite_hash", "TEXT")
-        _ensure_column(database, "deliveries", "checker_identity_version", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(
+            database, "deliveries", "checker_identity_version", "INTEGER NOT NULL DEFAULT 0"
+        )
         _ensure_column(database, "deliveries", "sequence", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(database, "feedback", "delivery_id", "TEXT")
         _ensure_column(database, "imported_samples", "started_at", "TEXT NOT NULL DEFAULT ''")
@@ -219,6 +221,13 @@ def open_database(project_root: Path) -> sqlite3.Connection:
         _ensure_column(database, "imported_samples", "evidence", "TEXT")
         _ensure_column(database, "imported_samples", "trigger_kind", "TEXT")
         _ensure_column(database, "imported_samples", "expected_hash", "TEXT")
+        _ensure_column(database, "tasks", "assessment_owner", "TEXT NOT NULL DEFAULT 'legacy'")
+        _ensure_column(database, "calls", "assessment_owner", "TEXT NOT NULL DEFAULT 'legacy'")
+        # A protocol-2 database already has guards which deliberately reject a
+        # protocol-3 connection.  Remove only the guards while this exclusive,
+        # atomic migration is in progress; a later failure rolls this change
+        # back with every other schema/data change.
+        _drop_writer_protocol_triggers(database)
         _backfill_delivery_sequences(database)
         _migrate_feedback_revisions(database)
         if database.execute("SELECT 1 FROM meta WHERE key = 'origin_id'").fetchone() is None:
@@ -227,6 +236,8 @@ def open_database(project_root: Path) -> sqlite3.Connection:
             )
             database.execute("INSERT INTO meta(key, value) VALUES('snapshot_revision', '0')")
         _create_observation_tables(database)
+        _create_managed_runtime_tables(database)
+        _recompute_owned_assessments(database)
         database.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES('writer_protocol', ?)",
             (str(WRITER_PROTOCOL_VERSION),),
@@ -371,6 +382,286 @@ def _create_observation_tables(database: sqlite3.Connection) -> None:
         database.execute(statement)
 
 
+def _create_managed_runtime_tables(database: sqlite3.Connection) -> None:
+    """Create the protocol-3 managed-runtime ledger.
+
+    Managed records retain only native identifiers, allowlisted metadata, and
+    hashes.  The public snapshot/export protocol intentionally remains v1.
+    """
+
+    statements = (
+        """CREATE TABLE IF NOT EXISTS managed_native_events (
+            event_id TEXT PRIMARY KEY,
+            stable_identity TEXT NOT NULL UNIQUE,
+            payload_digest TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            host TEXT NOT NULL,
+            suite_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            tool_use_id TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            task_id TEXT,
+            call_id TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_native_conflicts (
+            conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stable_identity TEXT NOT NULL,
+            original_event_id TEXT NOT NULL,
+            incoming_digest TEXT NOT NULL,
+            received_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_contexts (
+            context_key TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            host TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            root_request_id TEXT NOT NULL DEFAULT '',
+            request_digest TEXT NOT NULL,
+            input_skill TEXT NOT NULL DEFAULT '',
+            root_event_id TEXT NOT NULL,
+            root_valid INTEGER NOT NULL,
+            task_id TEXT,
+            intervention INTEGER NOT NULL DEFAULT 0,
+            unknown_change INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(suite_id, host, session_id, generation_id, request_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_receipts (
+            receipt_digest TEXT PRIMARY KEY,
+            native_event_id TEXT NOT NULL UNIQUE,
+            installation_digest TEXT NOT NULL,
+            host TEXT NOT NULL,
+            suite_id TEXT NOT NULL,
+            skill TEXT NOT NULL,
+            action TEXT NOT NULL,
+            command_digest TEXT NOT NULL,
+            operation_digest TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            tool_use_id TEXT NOT NULL,
+            host_version TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            task_id TEXT,
+            call_id TEXT,
+            consumed_at TEXT,
+            invalidated_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_actions (
+            action_run_id TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            call_id TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            receipt_digest TEXT NOT NULL UNIQUE,
+            request_digest TEXT NOT NULL,
+            artifact_path TEXT,
+            artifact_digest TEXT,
+            status TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            finished_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_executions (
+            action_run_id TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            pid INTEGER NOT NULL,
+            process_group INTEGER NOT NULL,
+            started_identity TEXT NOT NULL,
+            heartbeat_path TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_publication_counters (
+            task_id TEXT PRIMARY KEY,
+            next_ordinal INTEGER NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_publications (
+            delivery_id TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            call_id TEXT NOT NULL,
+            receipt_digest TEXT NOT NULL UNIQUE,
+            action_run_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            predecessor_ordinal INTEGER,
+            artifact_digest TEXT NOT NULL,
+            staging_path TEXT NOT NULL,
+            target_path TEXT NOT NULL,
+            checker_json TEXT,
+            status TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            reserved_at TEXT NOT NULL,
+            prepared_at TEXT,
+            supplied_at TEXT,
+            recorded_at TEXT,
+            UNIQUE(task_id, ordinal)
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_publication_intents (
+            delivery_id TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            target_path TEXT NOT NULL,
+            staged_path TEXT NOT NULL,
+            previous_digest TEXT,
+            previous_device INTEGER,
+            previous_inode INTEGER,
+            staged_digest TEXT NOT NULL,
+            staged_device INTEGER NOT NULL,
+            staged_inode INTEGER NOT NULL,
+            target_parent_device INTEGER,
+            target_parent_inode INTEGER,
+            staging_parent_device INTEGER NOT NULL DEFAULT 0,
+            staging_parent_inode INTEGER NOT NULL DEFAULT 0,
+            displaced_path TEXT,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_windows (
+            window_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            call_id TEXT NOT NULL,
+            delivery_id TEXT,
+            host TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            tool_use_id TEXT NOT NULL,
+            pre_event_id TEXT NOT NULL,
+            post_event_id TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            closed_at TEXT,
+            UNIQUE(host, session_id, generation_id, tool_use_id, pre_event_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_assessments (
+            task_id TEXT PRIMARY KEY,
+            first_result TEXT NOT NULL,
+            final_result TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_suppressions (
+            stable_identity TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_context_suppressions (
+            suite_id TEXT NOT NULL,
+            host TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(suite_id, host, session_id, generation_id, request_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS managed_native_events_task_idx ON managed_native_events(task_id)",
+        "CREATE INDEX IF NOT EXISTS managed_publications_task_idx ON managed_publications(task_id, ordinal)",
+    )
+    for statement in statements:
+        database.execute(statement)
+    _migrate_managed_context_identity(database)
+    _ensure_column(database, "managed_native_events", "request_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_receipts", "request_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_receipts", "host_version", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_receipts", "operation_digest", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_contexts", "root_request_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_contexts", "input_skill", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_windows", "request_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_windows", "pre_prefix_hash", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_windows", "pre_prefix_length", "INTEGER NOT NULL DEFAULT -1")
+    _ensure_column(database, "managed_executions", "heartbeat_path", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_publication_intents", "target_parent_device", "INTEGER")
+    _ensure_column(database, "managed_publication_intents", "target_parent_inode", "INTEGER")
+    _ensure_column(
+        database,
+        "managed_publication_intents",
+        "staging_parent_device",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _ensure_column(
+        database,
+        "managed_publication_intents",
+        "staging_parent_inode",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+
+
+def _migrate_managed_context_identity(database: sqlite3.Connection) -> None:
+    """Separate native request IDs from a host generation atomically.
+
+    The first protocol-3 draft keyed contexts by generation alone.  A host can
+    issue more than one managed request in a generation, so preserving that
+    layout would merge unrelated requests.  This replacement runs inside
+    :func:`open_database`'s ``BEGIN IMMEDIATE`` transaction before writer
+    triggers are installed.
+    """
+
+    columns = {
+        str(row["name"])
+        for row in database.execute("PRAGMA table_info(managed_contexts)").fetchall()
+    }
+    if "request_id" in columns:
+        return
+    database.execute(
+        """CREATE TABLE managed_contexts_v3 (
+        context_key TEXT PRIMARY KEY,
+        suite_id TEXT NOT NULL,
+        host TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        generation_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        root_request_id TEXT NOT NULL DEFAULT '',
+        request_digest TEXT NOT NULL,
+        input_skill TEXT NOT NULL DEFAULT '',
+        root_event_id TEXT NOT NULL,
+        root_valid INTEGER NOT NULL,
+        task_id TEXT,
+        intervention INTEGER NOT NULL DEFAULT 0,
+        unknown_change INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(suite_id, host, session_id, generation_id, request_id)
+        )"""
+    )
+    database.execute(
+        """INSERT INTO managed_contexts_v3(
+        context_key, suite_id, host, session_id, generation_id, request_id, root_request_id,
+        request_digest, input_skill, root_event_id, root_valid, task_id, intervention,
+        unknown_change, status, created_at)
+        SELECT context_key, suite_id, host, session_id, generation_id, generation_id, '',
+               request_digest, '', root_event_id, root_valid, task_id, intervention,
+               unknown_change, status, created_at
+        FROM managed_contexts"""
+    )
+    database.execute("DROP TABLE managed_contexts")
+    database.execute("ALTER TABLE managed_contexts_v3 RENAME TO managed_contexts")
+
+
+def _recompute_owned_assessments(database: sqlite3.Connection) -> None:
+    """Restore each managed subject through its durable assessment owner."""
+
+    rows = database.execute(
+        "SELECT task_id FROM tasks WHERE assessment_owner = 'managed-v2'"
+    ).fetchall()
+    if not rows:
+        return
+    from .managed_runtime import reduce_managed_assessment
+
+    for row in rows:
+        reduce_managed_assessment(database, str(row["task_id"]))
+
+
 def _install_writer_protocol_triggers(database: sqlite3.Connection) -> None:
     protected_tables = (
         "tasks",
@@ -386,17 +677,45 @@ def _install_writer_protocol_triggers(database: sqlite3.Connection) -> None:
         "observation_tombstones",
         "observation_deletion_ranges",
         "observation_source_epochs",
+        "managed_native_events",
+        "managed_native_conflicts",
+        "managed_contexts",
+        "managed_receipts",
+        "managed_actions",
+        "managed_executions",
+        "managed_publication_counters",
+        "managed_publications",
+        "managed_publication_intents",
+        "managed_windows",
+        "managed_assessments",
+        "managed_suppressions",
+        "managed_context_suppressions",
     )
     for table in protected_tables:
         for operation in ("INSERT", "UPDATE", "DELETE"):
+            trigger_name = f"writer_protocol_{table}_{operation.lower()}"
+            database.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
             database.execute(
-                f"""CREATE TRIGGER IF NOT EXISTS writer_protocol_{table}_{operation.lower()}
+                f"""CREATE TRIGGER {trigger_name}
                 BEFORE {operation} ON {table}
                 WHEN selc_writer_protocol() != {WRITER_PROTOCOL_VERSION}
                 BEGIN
                     SELECT RAISE(ABORT, 'SELC_WRITER_PROTOCOL_REQUIRED');
                 END"""
             )
+
+
+def _drop_writer_protocol_triggers(database: sqlite3.Connection) -> None:
+    """Remove only SELC's version guards before an atomic protocol upgrade."""
+
+    rows = database.execute(
+        """SELECT name FROM sqlite_master
+        WHERE type = 'trigger' AND name GLOB 'writer_protocol_*'"""
+    ).fetchall()
+    for row in rows:
+        name = str(row["name"])
+        quoted_name = name.replace('"', '""')
+        database.execute(f'DROP TRIGGER IF EXISTS "{quoted_name}"')
 
 
 def _ensure_column(database: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -542,6 +861,12 @@ def set_task_event(
         )
     with database:
         task = _task(database, task_id)
+        if task["assessment_owner"] != "legacy":
+            raise SelcError(
+                "MANAGED_RECORDS_OWNED",
+                "managed-v2 tasks accept events only through the managed runtime",
+                "use the installed managed runtime",
+            )
         if kind == "session_start" and task["status"] != "active":
             raise SelcError(
                 "TASK_CLOSED",
@@ -640,6 +965,12 @@ def complete_call(database: sqlite3.Connection, call_id: str, result: str) -> di
             raise SelcError(
                 "MISSING_CALL", f"call does not exist: {call_id}", "start the call first"
             )
+        if row["assessment_owner"] != "legacy":
+            raise SelcError(
+                "MANAGED_RECORDS_OWNED",
+                "managed-v2 calls are completed by managed publication recovery",
+                "use the installed managed runtime",
+            )
         if row["declared_result"] is not None and row["declared_result"] != result:
             raise SelcError(
                 "ID_CONFLICT",
@@ -676,6 +1007,8 @@ def record_delivery(
     checker_verified: bool = False,
     checker_result: str | None = None,
     checker_identity: dict[str, str] | None = None,
+    sequence: int | None = None,
+    _managed: bool = False,
 ) -> dict[str, Any]:
     _validate_result(declared_result)
     if checker_result is not None:
@@ -697,6 +1030,18 @@ def record_delivery(
                 "UNTRUSTED_OBSERVATION",
                 "complete observation fixtures are limited to test tasks",
                 "record normal host evidence as unknown or create an isolated test task",
+            )
+        if task["assessment_owner"] != "legacy" and not _managed:
+            raise SelcError(
+                "MANAGED_RECORDS_OWNED",
+                "managed-v2 tasks accept delivery evidence only through the managed runtime",
+                "use the installed managed publish command",
+            )
+        if sequence is not None and (type(sequence) is not int or sequence < 1):
+            raise SelcError(
+                "INVALID_DELIVERY_SEQUENCE",
+                "managed publication sequence must be a positive integer",
+                "reserve the publication before recording it",
             )
         normalized_identity = checker_identity or {}
         identity_keys = {
@@ -747,10 +1092,22 @@ def record_delivery(
             effective = checker_result
         else:
             effective = "unknown"
-        sequence = database.execute(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM deliveries WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()[0]
+        assigned_sequence = sequence
+        if assigned_sequence is None:
+            assigned_sequence = database.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM deliveries WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+        occupied = database.execute(
+            "SELECT delivery_id FROM deliveries WHERE task_id = ? AND sequence = ?",
+            (task_id, assigned_sequence),
+        ).fetchone()
+        if occupied is not None:
+            raise SelcError(
+                "DELIVERY_SEQUENCE_CONFLICT",
+                "publication sequence is already assigned to another delivery",
+                "preserve the existing publication order",
+            )
         database.execute(
             """INSERT INTO deliveries(
             delivery_id, task_id, call_id, artifact_hash, rule_version, checker_id,
@@ -775,7 +1132,7 @@ def record_delivery(
                 effective,
                 1,
                 int(complete_fixture),
-                sequence,
+                assigned_sequence,
                 utc_now(),
             ),
         )
@@ -785,12 +1142,17 @@ def record_delivery(
     return {
         "delivery_id": delivery_id,
         "effective_result": effective,
-        "sequence": sequence,
+        "sequence": assigned_sequence,
         "replayed": False,
     }
 
 
-def record_checked_delivery(database: sqlite3.Connection, execution: Any) -> dict[str, Any]:
+def record_checked_delivery(
+    database: sqlite3.Connection,
+    execution: Any,
+    *,
+    _managed_sequence: int | None = None,
+) -> dict[str, Any]:
     """Atomically link a completed checker execution to its exact delivery.
 
     ``execution`` is the internal ``CheckerExecution`` DTO from
@@ -877,6 +1239,8 @@ def record_checked_delivery(database: sqlite3.Connection, execution: Any) -> dic
             checker_verified=True,
             checker_result=str(getattr(result, "status", "")),
             checker_identity=checker_identity,
+            sequence=_managed_sequence,
+            _managed=_managed_sequence is not None,
         )
         _store_checker_execution(
             database,
@@ -943,10 +1307,9 @@ def _store_checker_execution(
                 (delivery_id,),
             ).fetchall()
         ]
-        if (
-            all(existing[key] == value for key, value in expected.items())
-            and sorted(existing_rules) == sorted(expected_rules)
-        ):
+        if all(existing[key] == value for key, value in expected.items()) and sorted(
+            existing_rules
+        ) == sorted(expected_rules):
             return
         raise SelcError(
             "ID_CONFLICT",
@@ -1182,7 +1545,9 @@ def _project_task_event(
         database.execute("UPDATE tasks SET business_intervention = 1 WHERE task_id = ?", (task_id,))
     elif kind == "session_start":
         if task["status"] != "active":
-            raise SelcError("TASK_CLOSED", "cannot start a session for a closed task", "start a task")
+            raise SelcError(
+                "TASK_CLOSED", "cannot start a session for a closed task", "start a task"
+            )
         database.execute(
             """INSERT OR REPLACE INTO sessions(session_id, suite_id, status, evidence, created_at)
             VALUES (?, ?, 'active', ?, ?)""",
@@ -1286,7 +1651,9 @@ def _project_delivery(
     _validate_result(checker_result)
     _task(database, task_id)
     if call_id is not None:
-        call = database.execute("SELECT task_id FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+        call = database.execute(
+            "SELECT task_id FROM calls WHERE call_id = ?", (call_id,)
+        ).fetchone()
         if call is None or call["task_id"] != task_id:
             raise SelcError(
                 "INVALID_DELIVERY_LINK",
@@ -1484,6 +1851,14 @@ def _observed_first_result(base_result: str, complete_observation: bool, input_r
 
 
 def _recompute_task_results(database: sqlite3.Connection, task_id: str) -> None:
+    task = _task(database, task_id)
+    if task["assessment_owner"] == "managed-v2":
+        from .managed_runtime import reduce_managed_assessment
+
+        reduce_managed_assessment(database, task_id)
+        return
+    if task["assessment_owner"] != "legacy":
+        return
     formal = _formal_assessment(database, task_id)
     if formal is not None:
         database.execute(
@@ -1491,7 +1866,6 @@ def _recompute_task_results(database: sqlite3.Connection, task_id: str) -> None:
             (formal["first_result"], formal["final_result"], task_id),
         )
         return
-    task = _task(database, task_id)
     deliveries = database.execute(
         """SELECT delivery_id, effective_result, complete_fixture FROM deliveries
         WHERE task_id = ? ORDER BY sequence""",
@@ -1537,6 +1911,13 @@ def _formal_assessment(database: sqlite3.Connection, task_id: str) -> sqlite3.Ro
 def _recompute_call_results(database: sqlite3.Connection, call_id: str) -> None:
     call = database.execute("SELECT * FROM calls WHERE call_id = ?", (call_id,)).fetchone()
     if call is None:
+        return
+    if call["assessment_owner"] == "managed-v2":
+        from .managed_runtime import reduce_managed_assessment
+
+        reduce_managed_assessment(database, str(call["task_id"]))
+        return
+    if call["assessment_owner"] != "legacy":
         return
     if call["status"] != "closed":
         first = "unknown"
@@ -2093,8 +2474,62 @@ def delete_records(
     suite_id: str | None,
     before: str | None,
     apply: bool,
+    _locks_held: bool = False,
 ) -> dict[str, Any]:
     _register_writer_protocol(database)
+    database_file = next(
+        (str(row["file"]) for row in database.execute("PRAGMA database_list") if row["file"]),
+        "",
+    )
+    managed_root = Path(database_file).parent if database_file else None
+    if apply and not _locks_held and managed_root is not None:
+        # Public direct callers must participate in the same registry→suite
+        # exclusion used by managed actions.  A full or time-bounded deletion
+        # discovers every selected suite while it owns the registry lock, then
+        # acquires those suite locks in stable order.  The recursive internal
+        # call keeps the SQL and filesystem deletion closure in one
+        # implementation.
+        from .install import install_root, registry_lock_path
+        from .util import exclusive_lock
+
+        project_root = managed_root.parent
+        try:
+            with ExitStack() as locks:
+                locks.enter_context(exclusive_lock(registry_lock_path(project_root)))
+                filters = []
+                arguments: list[object] = []
+                if suite_id is not None:
+                    filters.append("suite_id = ?")
+                    arguments.append(suite_id)
+                if before is not None:
+                    filters.append("created_at < ?")
+                    arguments.append(before)
+                where = f"WHERE {' AND '.join(filters)}" if filters else ""
+                suite_rows = database.execute(
+                    f"SELECT DISTINCT suite_id FROM tasks {where}", arguments
+                ).fetchall()
+                selected_suites = {str(row["suite_id"]) for row in suite_rows}
+                if suite_id is not None:
+                    selected_suites.add(suite_id)
+                for selected_suite in sorted(selected_suites):
+                    locks.enter_context(
+                        exclusive_lock(install_root(project_root) / selected_suite / ".lock")
+                    )
+                return delete_records(
+                    database,
+                    suite_id=suite_id,
+                    before=before,
+                    apply=apply,
+                    _locks_held=True,
+                )
+        except SelcError as error:
+            if error.code != "LOCKED":
+                raise
+            raise SelcError(
+                "DATABASE_BUSY",
+                "managed execution or deletion already owns this suite",
+                "retry after the active managed operation completes",
+            ) from error
     filters = []
     imported_filters = []
     arguments: list[object] = []
@@ -2110,10 +2545,11 @@ def delete_records(
     imported_where = f"WHERE {' AND '.join(imported_filters)}" if imported_filters else ""
 
     def selection() -> tuple[
-        list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row], dict[str, Any]
+        list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row], dict[str, Any]
     ]:
         local_rows = database.execute(
-            f"SELECT task_id, owner_origin, status, suite_id, created_at FROM tasks {where}", arguments
+            f"SELECT task_id, owner_origin, status, suite_id, created_at FROM tasks {where}",
+            arguments,
         ).fetchall()
         imported_rows = database.execute(
             f"SELECT origin_id, subject_kind, subject_id FROM imported_samples {imported_where}",
@@ -2142,7 +2578,57 @@ def delete_records(
             observation_arguments,
         ).fetchall()
         preview["observations"] = len(observation_rows)
+        managed_filters = []
+        managed_arguments: list[object] = []
+        if suite_id:
+            managed_filters.append("suite_id = ?")
+            managed_arguments.append(suite_id)
+        if before:
+            managed_filters.append("received_at < ?")
+            managed_arguments.append(before)
+        managed_where = f"WHERE {' AND '.join(managed_filters)}" if managed_filters else ""
+        managed_rows = database.execute(
+            """SELECT event_id, stable_identity, suite_id, task_id, host, session_id,
+            generation_id, request_id
+            FROM managed_native_events """
+            + managed_where,
+            managed_arguments,
+        ).fetchall()
         local_task_ids = [str(row["task_id"]) for row in local_rows]
+        if local_task_ids:
+            placeholders = ", ".join("?" for _ in local_task_ids)
+            context_rows = database.execute(
+                f"""SELECT suite_id, host, session_id, generation_id, request_id
+                FROM managed_contexts WHERE task_id IN ({placeholders})""",
+                local_task_ids,
+            ).fetchall()
+            context_clauses = [
+                "task_id IN (" + placeholders + ")",
+            ]
+            context_arguments: list[object] = [*local_task_ids]
+            for context in context_rows:
+                context_clauses.append(
+                    "(suite_id = ? AND host = ? AND session_id = ? AND generation_id = ? AND request_id = ?)"
+                )
+                context_arguments.extend(
+                    [
+                        context["suite_id"],
+                        context["host"],
+                        context["session_id"],
+                        context["generation_id"],
+                        context["request_id"],
+                    ]
+                )
+            closure_rows = database.execute(
+                "SELECT event_id, stable_identity, suite_id, task_id, host, session_id, "
+                "generation_id, request_id FROM managed_native_events WHERE "
+                + " OR ".join(context_clauses),
+                context_arguments,
+            ).fetchall()
+            by_event_id = {str(row["event_id"]): row for row in managed_rows}
+            by_event_id.update({str(row["event_id"]): row for row in closure_rows})
+            managed_rows = list(by_event_id.values())
+        preview["managed_native_events"] = len(managed_rows)
         if local_task_ids:
             placeholders = ", ".join("?" for _ in local_task_ids)
             active_calls = int(
@@ -2167,19 +2653,31 @@ def delete_records(
             "calls": active_calls,
             "sessions": active_sessions,
         }
-        return local_rows, imported_rows, observation_rows, preview
+        return local_rows, imported_rows, observation_rows, managed_rows, preview
 
     if not apply:
-        _, _, _, preview = selection()
+        _, _, _, _, preview = selection()
         return {"preview": preview}
 
     # A reserved SQLite write transaction closes the direct-API race as well as
     # the CLI path: a concurrent start either finishes before this recheck (and
     # causes ACTIVE_LEASE) or receives a busy error before it can create a session.
+    owned_private_paths: list[str] = []
     with database:
         database.execute("BEGIN IMMEDIATE")
         deletion_boundary = before or utc_now()
-        local_rows, imported_rows, observation_rows, preview = selection()
+        local_rows, imported_rows, observation_rows, managed_rows, preview = selection()
+        from .execution_lease import assert_no_live_execution
+
+        task_ids_by_suite: dict[str, list[str]] = {}
+        for row in local_rows:
+            task_ids_by_suite.setdefault(str(row["suite_id"]), []).append(str(row["task_id"]))
+        for selected_suite in sorted(task_ids_by_suite):
+            assert_no_live_execution(
+                database,
+                selected_suite,
+                task_ids=task_ids_by_suite[selected_suite],
+            )
         active_leases = preview["active_leases"]
         if any(int(count) for count in active_leases.values()):
             raise SelcError(
@@ -2232,7 +2730,84 @@ def delete_records(
             database.execute(
                 "DELETE FROM observation_events WHERE event_id = ?", (observation["event_id"],)
             )
+        for managed_event in managed_rows:
+            database.execute(
+                """INSERT OR IGNORE INTO managed_suppressions(
+                stable_identity, suite_id, created_at) VALUES (?, ?, ?)""",
+                (managed_event["stable_identity"], managed_event["suite_id"], utc_now()),
+            )
+            database.execute(
+                """INSERT OR IGNORE INTO managed_context_suppressions(
+                suite_id, host, session_id, generation_id, request_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    managed_event["suite_id"],
+                    managed_event["host"],
+                    managed_event["session_id"],
+                    managed_event["generation_id"],
+                    managed_event["request_id"],
+                    utc_now(),
+                ),
+            )
+            database.execute(
+                "DELETE FROM managed_native_conflicts WHERE original_event_id = ?",
+                (managed_event["event_id"],),
+            )
+            database.execute(
+                "DELETE FROM managed_receipts WHERE native_event_id = ?",
+                (managed_event["event_id"],),
+            )
+            database.execute(
+                "DELETE FROM managed_native_events WHERE event_id = ?",
+                (managed_event["event_id"],),
+            )
         for row in local_rows:
+            # An interrupted exchange can leave a user object in private
+            # staging.  Preserve or prove that object before deletion removes
+            # the directory; a failed preservation intentionally aborts this
+            # deletion and retains both the intent and original bytes.
+            from .managed_runtime import _recover_interrupted_publication_staging
+
+            interrupted = database.execute(
+                """SELECT delivery_id FROM managed_publication_intents
+                WHERE task_id = ? AND state != 'recorded'""",
+                (row["task_id"],),
+            ).fetchall()
+            for intent in interrupted:
+                _recover_interrupted_publication_staging(database, str(intent["delivery_id"]))
+            private_rows = database.execute(
+                """SELECT artifact_path AS path FROM managed_actions WHERE task_id = ?
+                UNION ALL
+                SELECT staging_path AS path FROM managed_publications WHERE task_id = ?
+                UNION ALL
+                SELECT staged_path AS path FROM managed_publication_intents WHERE task_id = ?""",
+                (row["task_id"], row["task_id"], row["task_id"]),
+            ).fetchall()
+            for private_row in private_rows:
+                raw_path = private_row["path"]
+                if not raw_path:
+                    continue
+                candidate = Path(str(raw_path))
+                if "managed-staging" in candidate.parts:
+                    owned_private_paths.append(str(candidate.parent))
+                else:
+                    owned_private_paths.append(str(candidate))
+            if managed_root is not None:
+                action_rows = database.execute(
+                    "SELECT action_run_id FROM managed_actions WHERE task_id = ?",
+                    (row["task_id"],),
+                ).fetchall()
+                for action in action_rows:
+                    action_run_id = str(action["action_run_id"])
+                    if action_run_id.startswith("managed-action-"):
+                        owned_private_paths.append(
+                            str(
+                                managed_root
+                                / "managed-staging"
+                                / str(row["suite_id"])
+                                / action_run_id
+                            )
+                        )
             database.execute(
                 "INSERT OR IGNORE INTO suppressions(origin_id, subject_kind, subject_id, created_at) VALUES (?, 'task', ?, ?)",
                 (row["owner_origin"], row["task_id"], utc_now()),
@@ -2257,6 +2832,26 @@ def delete_records(
             database.execute(
                 "DELETE FROM observation_call_assessments WHERE task_id = ?", (row["task_id"],)
             )
+            database.execute("DELETE FROM managed_assessments WHERE task_id = ?", (row["task_id"],))
+            database.execute("DELETE FROM managed_windows WHERE task_id = ?", (row["task_id"],))
+            database.execute(
+                """DELETE FROM managed_executions
+                WHERE action_run_id IN (
+                    SELECT action_run_id FROM managed_actions WHERE task_id = ?
+                )""",
+                (row["task_id"],),
+            )
+            database.execute(
+                "DELETE FROM managed_publications WHERE task_id = ?", (row["task_id"],)
+            )
+            database.execute(
+                "DELETE FROM managed_publication_intents WHERE task_id = ?", (row["task_id"],)
+            )
+            database.execute(
+                "DELETE FROM managed_publication_counters WHERE task_id = ?", (row["task_id"],)
+            )
+            database.execute("DELETE FROM managed_actions WHERE task_id = ?", (row["task_id"],))
+            database.execute("DELETE FROM managed_contexts WHERE task_id = ?", (row["task_id"],))
             database.execute("DELETE FROM tasks WHERE task_id = ?", (row["task_id"],))
         for row in imported_rows:
             database.execute(
@@ -2265,7 +2860,43 @@ def delete_records(
             )
         database.execute(f"DELETE FROM imported_samples {imported_where}", arguments)
         _bump_snapshot_revision(database)
+    _remove_owned_managed_private_paths(database, owned_private_paths)
     return {"deleted": preview}
+
+
+def _remove_owned_managed_private_paths(
+    database: sqlite3.Connection, candidates: list[str]
+) -> None:
+    """Remove only runtime-private copies after the durable deletion commits."""
+
+    database_file = next(
+        (str(row["file"]) for row in database.execute("PRAGMA database_list") if row["file"]),
+        "",
+    )
+    if not database_file:
+        return
+    selc_root = Path(database_file).parent
+    allowed_roots = (selc_root / "managed-staging", selc_root / "managed-publications")
+    for raw_path in candidates:
+        candidate = Path(raw_path)
+        try:
+            resolved = candidate.resolve(strict=False)
+            allowed_root = next(
+                root for root in allowed_roots if resolved.is_relative_to(root.resolve())
+            )
+        except (OSError, StopIteration):
+            continue
+        if resolved.is_dir():
+            shutil.rmtree(resolved, ignore_errors=True)
+        else:
+            resolved.unlink(missing_ok=True)
+        parent = resolved.parent
+        while parent != allowed_root.parent and parent != allowed_root:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
 
 
 def _bump_snapshot_revision(database: sqlite3.Connection) -> int:

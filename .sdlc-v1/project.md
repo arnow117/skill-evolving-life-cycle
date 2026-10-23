@@ -8,7 +8,7 @@ SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成�
 
 用户已确认本地提交及继续验证/评审，历史验证与评审记录保留。业务版本 `aa079e2` 已通过正式验证（76 项测试、README 的 66 条实际操作及 API014 对照）、独立评审和主 Agent 本地交付验收。Feature 为 reviewed；当前远端选择公开 GitHub；F-001 的旧本地范围 release 仍 pending，不能替代 REQ-002 的完整闭环。技术栈为 Python >=3.11 标准库 CLI + SQLite + Git/uv；实际功能范围和证据以工程上下文为准。
 
-`REQ-002` 的产品规格为 `context/REQ-002.product.md`，已进入F-002交付。用户已确认复用SQLite、统一受管入口、不确定分类unknown、采集不可用时暂停。有限真实探针已验证Codex CLI 0.147与WorkBuddy桌面5.7.6的业务入口自动采集和停用时暂停；Codex桌面、原生skill发现、完整统计和验证器框架待补齐。本轮已授权完整五项交付，采用结构化事件与保守规则，真实验收最多24次串行请求（每次3分钟），正式发布前最后确认。结果及原件引用见产品上下文；不改变F-001的旧验证范围。
+`REQ-002` 的产品规格为 `context/REQ-002.product.md`，已进入F-002交付。用户已确认复用SQLite、统一受管入口、不确定分类unknown、采集不可用时暂停。有限真实探针已验证Codex CLI 0.147与WorkBuddy桌面5.7.6的业务入口自动采集和停用时暂停；Codex桌面、原生skill发现、完整统计和验证器框架待补齐。本轮已授权完整五项交付，采用结构化事件与保守规则，真实验收原计划24次串行请求（每次3分钟）；2026-10-21用户整体授权所需预算，不再申请追加，仍按需有界执行，正式发布前最后确认。结果及原件引用见产品上下文；不改变F-001的旧验证范围。
 
 ## 约定与环境
 
@@ -29,7 +29,7 @@ SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成�
 | 更新/评估/贡献/发布 | `install.py` / `evolve.py`，portable suite runtime | 框架来源复用、目录恢复、缺省保留与选择并发复核已有返修证据；既有回归仅 public GitHub/GitLab 和 local fixture；本轮已授权真实 GitHub贡献验证，结果待执行 |
 | 验证 | `tests/` 和 README 的 US-001 至 US-005 | aa079e2 正式 Validate PASS，76项测试及 SC001–007 本地范围证据，见工程 Validation |
 
-F-002源码增量已推送`0293358`；[Draft PR #1](https://github.com/arnow117/skill-evolving-life-cycle/pull/1)仍为开发中。native context实验工具准备通过11项本地检查，真实WorkBuddy请求2只暴露session环境，回执运输仍待验证；不能把原有限探针或这次实验视作正式双端接入完成。具体预算、原件和后续运输选择以F-002工程上下文为准。
+F-002源码增量已推送`d17d7bd`；[Draft PR #1](https://github.com/arnow117/skill-evolving-life-cycle/pull/1)仍为开发中。native context工具准备通过11项、updatedInput工具准备通过25项本地检查；真实WorkBuddy请求3已证明无allow的回执传入并精确消费，请求4未被旧project deny阻止，不能认定权限保留通过。T010条件式生产集成正在实现；正常发现、完整one-shot窗口及Codex桌面实际业务仍未验收。具体预算、原件和权限差异以F-002工程上下文为准。
 
 ## 检查入口
 
@@ -41,4 +41,6 @@ F-002发布目标为公开GitHub源码、SELC框架及简单合成套件的版�
 UV_CACHE_DIR=/private/tmp/selc-uv-cache uv run --no-project --python 3.12 python -m unittest discover -s tests -v
 ```
 
-README 是面向使用者的唯一全局使用指南，CLI help 为参数权威。F-002已实际执行compileall/py_compile和`git diff --check`；当前Ruff不可用，不把未执行的formatter检查写成通过。官方 skill 格式校验使用当前creator工具环境，不能把其PyYAML当作portable运行依赖。
+README 是面向使用者的唯一全局使用指南，CLI help 为参数权威。F-002已实际执行compileall/py_compile和`git diff --check`；Ruff 0.15.6现可通过专用uv缓存离线运行，候选4实现者报告受影响文件format/check通过，具体适用快照及验证范围见F-002工程记录。该作者工具不是portable运行依赖。官方 skill 格式校验使用当前creator工具环境，不能把其PyYAML当作portable运行依赖。
+
+2026-10-21增量：T014完整前缀工具33项本地检查通过；实际请求5在WorkBuddy5.8.3、自定义GLM-5.3:glm-5.3中精确匹配原生PreToolUse与执行进程身份。生产方案采用无命令改写的直接绑定，T010仍在实现，完整业务及one-shot验收尚未通过；以F-002实施层决定13和私有证据摘要为准。

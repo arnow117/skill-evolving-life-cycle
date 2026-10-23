@@ -267,9 +267,6 @@ class InstallationContractsTests(unittest.TestCase):
                     recover_installation(project, f"path-{kind}"),
                     {"recovered": False, "state": "no_journal"},
                 )
-                expected_relative = (
-                    "skills/custom" if kind == "explicit-custom" else "skills/text-report"
-                )
                 link = project / ".agents" / "skills" / "text-report"
                 self.assertTrue(link.is_symlink())
                 self.assertEqual(
@@ -279,8 +276,9 @@ class InstallationContractsTests(unittest.TestCase):
                         / ".selc"
                         / "installs"
                         / f"path-{kind}"
-                        / "current"
-                        / expected_relative
+                        / "entries"
+                        / "codex"
+                        / "text-report"
                     ).resolve(),
                 )
 
@@ -331,19 +329,15 @@ class InstallationContractsTests(unittest.TestCase):
             active["registrations"],
             {"codex": ["text-report"], "workbuddy": ["text-report"]},
         )
-        expected_skill = (
-            project
-            / ".selc"
-            / "installs"
-            / "path-omitted-recovery"
-            / "current"
-            / "skills"
-            / "text-report"
-        ).resolve()
-        for harness_path in (
-            project / ".agents" / "skills" / "text-report",
-            project / ".codebuddy" / "skills" / "text-report",
-        ):
+        expected_skills = {
+            project / ".agents" / "skills" / "text-report": (
+                project / ".selc" / "installs" / "path-omitted-recovery" / "entries" / "codex" / "text-report"
+            ).resolve(),
+            project / ".codebuddy" / "skills" / "text-report": (
+                project / ".selc" / "installs" / "path-omitted-recovery" / "entries" / "workbuddy" / "text-report"
+            ).resolve(),
+        }
+        for harness_path, expected_skill in expected_skills.items():
             self.assertTrue(harness_path.is_symlink())
             self.assertEqual(harness_path.resolve(), expected_skill)
 

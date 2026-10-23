@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
+import shlex
 import shutil
+import sys
 import time
 import zipfile
 from contextlib import ExitStack, contextmanager
@@ -22,6 +26,7 @@ from .manifest import (
     portable_tree_hash,
 )
 from .records import active_leases, open_database
+from .execution_lease import assert_no_live_execution
 from .util import (
     copy_tree,
     exclusive_lock,
@@ -373,6 +378,16 @@ def _harness_base(project_root: Path, harness: str) -> Path:
     )
 
 
+def _hook_configuration_path(project_root: Path, harness: str) -> Path:
+    if harness == "codex":
+        return project_root / ".codex" / "hooks.json"
+    if harness == "workbuddy":
+        return project_root / ".codebuddy" / "settings.json"
+    raise SelcError(
+        "UNSUPPORTED_HARNESS", f"unsupported harness: {harness}", "choose codex or workbuddy"
+    )
+
+
 def _manifest_skill_names(manifest: dict[str, Any]) -> list[str]:
     return sorted(str(skill["name"]) for skill in manifest["skills"])
 
@@ -387,15 +402,129 @@ def _registered_names(installation: dict[str, Any] | None, harness: str) -> list
 
 
 def _is_owned_link(link: Path, root: Path) -> bool:
-    """Only replace a symlink whose resolved target stays in this suite's contents."""
+    """Only replace a symlink whose target is an owned suite entry or content."""
 
     if not link.is_symlink():
         return False
     try:
-        link.resolve().relative_to((root / "contents").resolve())
+        target = link.resolve()
+        target.relative_to(root.resolve())
     except ValueError:
         return False
-    return True
+    return target.is_relative_to((root / "contents").resolve()) or target.is_relative_to(
+        (root / "entries").resolve()
+    )
+
+
+def _entry_root(root: Path, harness: str, skill_name: str) -> Path:
+    return root / "entries" / harness / skill_name
+
+
+def _skill_description(skill_file: Path, skill_name: str) -> str:
+    """Keep discovery metadata without copying the original business body."""
+
+    lines = skill_file.read_text(encoding="utf-8").splitlines()
+    if len(lines) < 3 or lines[0] != "---":
+        raise SelcError("INVALID_MANIFEST", "declared skill has no portable frontmatter")
+    for line in lines[1:]:
+        if line == "---":
+            break
+        if line.startswith("description:"):
+            value = line.partition(":")[2].strip()
+            try:
+                parsed = json.loads(value)
+            except json.JSONDecodeError:
+                parsed = value.strip("'\"")
+            if isinstance(parsed, str) and parsed:
+                return parsed
+    raise SelcError(
+        "INVALID_MANIFEST",
+        f"declared skill {skill_name} has no usable description frontmatter",
+        "repair the original skill metadata before installing",
+    )
+
+
+def _managed_entry_body(
+    skill_name: str,
+    description: str,
+    suite_id: str,
+    version: str,
+    digest: str,
+    activation_command: str,
+) -> str:
+    """Render a routing-only discovery entry owned by the installer."""
+
+    return (
+        "---\n"
+        f"name: {json.dumps(skill_name)}\n"
+        f"description: {json.dumps(description)}\n"
+        "---\n\n"
+        f"# {skill_name}\n\n"
+        "This installer-owned discovery entry only routes managed activation. "
+        "It contains no business instructions and creates no lifecycle sample while scanned. "
+        f"The installed SELC runtime verifies suite {suite_id}, version {version}, and composite "
+        f"digest {digest} before it supplies the immutable original skill body.\n\n"
+        "Run this installer-owned activation route exactly once in the current native child. "
+        "It does not accept or print a receipt; the installed runtime resolves the one durable "
+        "receipt bound to the current child identity before it supplies the original body.\n\n"
+        "```sh\n"
+        f"{activation_command}\n"
+        "```\n"
+    )
+
+
+def _materialize_managed_entries(
+    root: Path, manifest: dict[str, Any], harnesses: list[str]
+) -> dict[str, dict[str, str]]:
+    """Create one separately-owned immutable discovery entry per suite and harness."""
+
+    entries: dict[str, dict[str, str]] = {}
+    digest = portable_tree_hash(root / "current")
+    for harness in harnesses:
+        harness_entries: dict[str, str] = {}
+        for skill in normalize_declared_skills(manifest["skills"]):
+            skill_name = skill["name"]
+            original = root / "current" / skill["path"] / "SKILL.md"
+            if not original.is_file():
+                original = (
+                    root / "contents" / str(manifest["content_hash"]) / skill["path"] / "SKILL.md"
+                )
+            description = _skill_description(original, skill_name)
+            entry = _entry_root(root, harness, skill_name) / "SKILL.md"
+            entry.parent.mkdir(parents=True, exist_ok=True)
+            project_root = root.parents[2]
+            activation_command = shlex.join(
+                (
+                    sys.executable,
+                    str(root / "current" / "bin" / "selc-suite.py"),
+                    "managed",
+                    "invoke",
+                    "--project-root",
+                    str(project_root),
+                    "--suite",
+                    str(manifest["suite_id"]),
+                    "--skill",
+                    str(skill_name),
+                    "--host",
+                    harness,
+                    "--expected-version",
+                    str(manifest["version"]),
+                    "--expected-composite",
+                    digest,
+                )
+            )
+            contents = _managed_entry_body(
+                skill_name,
+                description,
+                str(manifest["suite_id"]),
+                str(manifest["version"]),
+                digest,
+                activation_command,
+            )
+            entry.write_text(contents, encoding="utf-8")
+            harness_entries[skill_name] = hashlib.sha256(contents.encode("utf-8")).hexdigest()
+        entries[harness] = harness_entries
+    return entries
 
 
 def _assert_registration_available(
@@ -449,7 +578,8 @@ def _sync_harness_skills(
             link.unlink()
     for skill_name, relative_path in paths.items():
         link = base / skill_name
-        target = root / "current" / relative_path
+        del relative_path
+        target = _entry_root(root, harness, skill_name)
         expected = os.path.relpath(target, start=base)
         if link.exists() or link.is_symlink():
             if not _is_owned_link(link, root):
@@ -482,6 +612,180 @@ def _sync_all_harnesses(
         )
         for harness in harnesses
     }
+
+
+def _managed_hook_command(project_root: Path, root: Path, suite_id: str, harness: str) -> str:
+    """Return the fixed command owned by one installed suite and harness."""
+
+    wrapper = root / "current" / "bin" / "selc-suite.py"
+    arguments = (
+        sys.executable,
+        str(wrapper),
+        "managed",
+        "hook",
+        "--project-root",
+        str(project_root),
+        "--suite",
+        suite_id,
+        "--host",
+        harness,
+    )
+    return shlex.join(arguments)
+
+
+def _managed_hook_entry(command: str, event: str) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "hooks": [{"type": "command", "command": command, "timeout": 5}],
+    }
+    if event in {"PreToolUse", "PostToolUse"}:
+        entry["matcher"] = "^(Bash|exec_command|shell)$"
+    return entry
+
+
+def _read_hook_configuration(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"hooks": {}}
+    try:
+        value = read_json(path)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise SelcError(
+            "HOOK_CONFIG_CONFLICT",
+            "project hook configuration is not a readable JSON object",
+            "repair the project hook configuration before installing",
+        ) from error
+    if not isinstance(value, dict) or not isinstance(value.get("hooks", {}), dict):
+        raise SelcError(
+            "HOOK_CONFIG_CONFLICT",
+            "project hook configuration has no hooks object",
+            "repair the project hook configuration before installing",
+        )
+    return value
+
+
+def _entry_commands(entry: object) -> set[str]:
+    if not isinstance(entry, dict):
+        return set()
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list):
+        return set()
+    return {
+        item["command"]
+        for item in hooks
+        if isinstance(item, dict) and isinstance(item.get("command"), str)
+    }
+
+
+def _without_owned_commands(entry: object, owned_commands: set[str]) -> dict[str, Any] | None:
+    """Remove only this suite's command items from a shared hook entry."""
+
+    if not isinstance(entry, dict):
+        return entry  # type: ignore[return-value]
+    hooks = entry.get("hooks")
+    if not isinstance(hooks, list):
+        return dict(entry)
+    retained_hooks = [
+        item
+        for item in hooks
+        if not (isinstance(item, dict) and item.get("command") in owned_commands)
+    ]
+    if len(retained_hooks) == len(hooks):
+        return dict(entry)
+    if not retained_hooks:
+        return None
+    preserved = dict(entry)
+    preserved["hooks"] = retained_hooks
+    return preserved
+
+
+def _sync_managed_hooks(
+    project_root: Path,
+    root: Path,
+    suite_id: str,
+    harnesses: list[str],
+    previous: dict[str, Any] | None,
+) -> dict[str, dict[str, str]]:
+    """Merge the suite's silent collector hooks without touching other hooks."""
+
+    previous_hooks = (previous or {}).get("owned_hooks", {})
+    if not isinstance(previous_hooks, dict):
+        previous_hooks = {}
+    events = ("UserPromptSubmit", "PreToolUse", "PostToolUse", "PermissionRequest", "Stop")
+    owned: dict[str, dict[str, str]] = {}
+    for harness in harnesses:
+        harness_events = events
+        if harness == "workbuddy":
+            harness_events = (*events, "PermissionDenied")
+        path = _hook_configuration_path(project_root, harness)
+        configuration = _read_hook_configuration(path)
+        hooks = configuration.setdefault("hooks", {})
+        if not isinstance(hooks, dict):
+            raise SelcError(
+                "HOOK_CONFIG_CONFLICT",
+                "project hook configuration has invalid hooks entries",
+                "repair the project hook configuration before installing",
+            )
+        old_commands = set()
+        prior = previous_hooks.get(harness)
+        if isinstance(prior, dict):
+            old_commands = {value for value in prior.values() if isinstance(value, str)}
+        command = _managed_hook_command(project_root, root, suite_id, harness)
+        expected: dict[str, str] = {}
+        for event in harness_events:
+            current = hooks.get(event, [])
+            if not isinstance(current, list):
+                raise SelcError(
+                    "HOOK_CONFIG_CONFLICT",
+                    f"project hook event {event} must be a list",
+                    "repair the project hook configuration before installing",
+                )
+            retained = []
+            for entry in current:
+                preserved = _without_owned_commands(entry, old_commands)
+                if preserved is not None:
+                    retained.append(preserved)
+            expected[event] = command
+            if not any(command in _entry_commands(entry) for entry in retained):
+                retained.append(_managed_hook_entry(command, event))
+            hooks[event] = retained
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(path, configuration)
+        owned[harness] = expected
+    return owned
+
+
+def _assert_managed_hooks(project_root: Path, installation: dict[str, Any]) -> None:
+    owned = installation.get("owned_hooks", {})
+    if not isinstance(owned, dict):
+        raise SelcError(
+            "RECOVERY_INCOMPLETE",
+            "installation has invalid managed hook ownership metadata",
+            "run updates recover before activation",
+        )
+    for harness, events in owned.items():
+        if not isinstance(events, dict):
+            raise SelcError(
+                "RECOVERY_INCOMPLETE",
+                "installation has invalid managed hook ownership metadata",
+                "run updates recover before activation",
+            )
+        hooks = _read_hook_configuration(_hook_configuration_path(project_root, str(harness))).get(
+            "hooks", {}
+        )
+        assert isinstance(hooks, dict)
+        for event, command in events.items():
+            entries = hooks.get(event)
+            if not isinstance(command, str) or not isinstance(entries, list):
+                raise SelcError(
+                    "INSTALLATION_HOOK_DRIFT",
+                    "managed native hook is missing from the project configuration",
+                    "run updates recover before activation",
+                )
+            if not any(command in _entry_commands(entry) for entry in entries):
+                raise SelcError(
+                    "INSTALLATION_HOOK_DRIFT",
+                    "managed native hook was modified or removed",
+                    "run updates recover before activation",
+                )
 
 
 def _saved_external_framework_selection(project_root: Path, suite_id: str) -> dict[str, Any] | None:
@@ -784,8 +1088,11 @@ def _install_materialized_suite(
         registry = _registry(project_root)
         existing = registry["installations"].get(suite_id)
         database = open_database(project_root)
-        leases = active_leases(database, suite_id)
-        database.close()
+        try:
+            assert_no_live_execution(database, suite_id)
+            leases = active_leases(database, suite_id)
+        finally:
+            database.close()
         if prepared_business_snapshot is not None and not _installed_business_matches_snapshot(
             existing, prepared_business_snapshot
         ):
@@ -846,10 +1153,15 @@ def _install_materialized_suite(
                         "new_installation": new_installation,
                     },
                 )
+                entries = _materialize_managed_entries(root, manifest, harnesses)
+                new_installation["managed_entries"] = entries
                 registrations = _sync_all_harnesses(
                     project_root, root, manifest, harnesses, existing
                 )
                 new_installation["registrations"] = registrations
+                new_installation["owned_hooks"] = _sync_managed_hooks(
+                    project_root, root, suite_id, harnesses, existing
+                )
                 journal_record = read_json(journal)
                 journal_record["new_installation"] = new_installation
                 write_json(journal, journal_record)
@@ -888,6 +1200,8 @@ def _install_materialized_suite(
             "registrations": {
                 harness_name: _manifest_skill_names(manifest) for harness_name in harnesses
             },
+            "managed_entries": {},
+            "owned_hooks": {},
             "state": "active",
         }
         write_json(
@@ -921,8 +1235,14 @@ def _install_materialized_suite(
             },
         )
         os.replace(temporary_current, current)
+        new_installation["managed_entries"] = _materialize_managed_entries(
+            root, manifest, harnesses
+        )
         registrations = _sync_all_harnesses(project_root, root, manifest, harnesses, existing)
         new_installation["registrations"] = registrations
+        new_installation["owned_hooks"] = _sync_managed_hooks(
+            project_root, root, suite_id, harnesses, existing
+        )
         journal_record = read_json(journal)
         journal_record["new_installation"] = new_installation
         write_json(journal, journal_record)
@@ -997,24 +1317,42 @@ def _assert_installation_state(
             "run updates recover before using the suite",
         )
     registrations = installation.get("registrations", {})
+    entry_hashes = installation.get("managed_entries", {})
     for harness, skills in registrations.items():
         base = _harness_base(project_root, harness)
         for skill_name in skills:
             link = base / str(skill_name)
-            relative_path = skill_paths.get(str(skill_name))
-            if relative_path is None:
+            if str(skill_name) not in skill_paths:
                 raise SelcError(
                     "RECOVERY_INCOMPLETE",
                     f"registry lists an undeclared skill registration: {skill_name}",
                     "run updates recover and inspect the registration metadata",
                 )
-            expected_target = os.path.relpath(root / "current" / relative_path, start=base)
+            expected_target = os.path.relpath(
+                _entry_root(root, harness, str(skill_name)), start=base
+            )
             if not link.is_symlink() or os.readlink(link) != expected_target:
                 raise SelcError(
                     "RECOVERY_INCOMPLETE",
                     f"harness registration does not match the active suite: {link}",
                     "run updates recover before using the suite",
                 )
+            expected_hash = entry_hashes.get(harness, {}).get(str(skill_name))
+            entry = _entry_root(root, harness, str(skill_name)) / "SKILL.md"
+            if not isinstance(expected_hash, str) or not entry.is_file():
+                raise SelcError(
+                    "RECOVERY_INCOMPLETE",
+                    f"managed entry is missing for {harness}:{skill_name}",
+                    "run updates recover before using the suite",
+                )
+            actual_hash = hashlib.sha256(entry.read_bytes()).hexdigest()
+            if actual_hash != expected_hash:
+                raise SelcError(
+                    "LOCAL_EDIT_CONFLICT",
+                    f"managed entry has local edits: {entry}",
+                    "restore the installer-owned entry before continuing",
+                )
+    _assert_managed_hooks(project_root, installation)
 
 
 def record_daily_update_check(project_root: Path, suite_id: str) -> dict[str, Any]:
@@ -1188,10 +1526,16 @@ def recover_installation(project_root: Path, suite_id: str) -> dict[str, Any]:
                     Path("contents") / new_digest, target_is_directory=True
                 )
                 os.replace(temporary_current, current)
+                new_installation["managed_entries"] = _materialize_managed_entries(
+                    root, manifest, harnesses
+                )
                 registrations = _sync_all_harnesses(
                     project_root, root, manifest, harnesses, old_installation
                 )
                 new_installation["registrations"] = registrations
+                new_installation["owned_hooks"] = _sync_managed_hooks(
+                    project_root, root, suite_id, harnesses, old_installation
+                )
                 registry = _registry(project_root)
                 registry["installations"][suite_id] = new_installation
                 _write_registry(project_root, registry)

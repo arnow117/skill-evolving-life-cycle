@@ -18,10 +18,9 @@ import shlex
 import shutil
 import subprocess
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-
 
 PROTOCOL = "native-context-probe-v1"
 SUPPORTED_HOSTS = {"codex", "workbuddy"}
@@ -33,7 +32,12 @@ OBSERVATIONS_LOCK_FILE = "observations.lock"
 RECEIPTS_FILE = "receipts.json"
 RUNS_DIRECTORY = "runs"
 DEFAULT_TRANSPORT = "context"
-UPDATED_INPUT_TRANSPORT = "workbuddy-updated-input"
+WORKBUDDY_UPDATED_INPUT_TRANSPORT = "workbuddy-updated-input"
+CODEX_UPDATED_INPUT_TRANSPORT = "codex-updated-input"
+UPDATED_INPUT_TRANSPORTS = {
+    WORKBUDDY_UPDATED_INPUT_TRANSPORT,
+    CODEX_UPDATED_INPUT_TRANSPORT,
+}
 RECEIPT_MAX_AGE_SECONDS = 60
 HOOK_EVENTS = (
     "SessionStart",
@@ -49,6 +53,12 @@ ALLOWED_ENVIRONMENT_NAMES = (
     "CODEX_TOOL_CALL_ID",
     "CODEX_VERSION",
     "CODEBUDDY_SESSION_ID",
+    "CODEBUDDY_TOOL_CALL_ID",
+    "CODEBUDDY_CONVERSATION_REQUEST_ID",
+    "CODEBUDDY_CONVERSATION_MESSAGE_ID",
+    "CODEBUDDY_ROOT_REQUEST_ID",
+    "CODEBUDDY_SANDBOX_BROKER_SESSION_ID",
+    "CODEBUDDY_SANDBOX_BROKER_TOOL_CALL_ID",
     "TOOL_CALL_ID",
     "CONVERSATION_REQUEST_ID",
     "CONVERSATION_MESSAGE_ID",
@@ -92,6 +102,18 @@ def receipts_path(workspace: Path) -> Path:
     return private_directory(workspace) / RECEIPTS_FILE
 
 
+def is_updated_input_transport(transport: object) -> bool:
+    return transport in UPDATED_INPUT_TRANSPORTS
+
+
+def transport_is_valid_for_host(host: object, transport: object) -> bool:
+    return (
+        (transport == DEFAULT_TRANSPORT)
+        or (host == "workbuddy" and transport == WORKBUDDY_UPDATED_INPUT_TRANSPORT)
+        or (host == "codex" and transport == CODEX_UPDATED_INPUT_TRANSPORT)
+    )
+
+
 def runs_directory(workspace: Path) -> Path:
     return private_directory(workspace) / RUNS_DIRECTORY
 
@@ -112,6 +134,10 @@ def digest(value: object) -> str:
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def exact_command_digest(command: str) -> str:
+    return hashlib.sha256(command.encode("utf-8")).hexdigest()
+
+
 def command_text(argv: tuple[str, ...] | list[str]) -> str:
     return shlex.join(argv)
 
@@ -127,10 +153,8 @@ def write_private_bytes(path: Path, content: bytes, *, replace: bool = False) ->
             os.replace(temporary_path, path)
             os.chmod(path, 0o600)
         except BaseException:
-            try:
+            with suppress(FileNotFoundError):
                 temporary_path.unlink()
-            except FileNotFoundError:
-                pass
             raise
         return
 
@@ -159,8 +183,7 @@ def read_fixture(workspace_value: str | Path) -> dict[str, str]:
         raise ProbeError("INVALID_FIXTURE", "fixture must be a JSON object")
 
     fixture = {
-        name: raw_fixture.get(name)
-        for name in ("protocol", "workspace", "host", "fixture_id")
+        name: raw_fixture.get(name) for name in ("protocol", "workspace", "host", "fixture_id")
     }
     transport = raw_fixture.get("transport", DEFAULT_TRANSPORT)
     if (
@@ -168,11 +191,9 @@ def read_fixture(workspace_value: str | Path) -> dict[str, str]:
         or fixture["workspace"] != str(workspace)
         or fixture["host"] not in SUPPORTED_HOSTS
         or not isinstance(fixture["fixture_id"], str)
-        or transport not in {DEFAULT_TRANSPORT, UPDATED_INPUT_TRANSPORT}
+        or not transport_is_valid_for_host(fixture["host"], transport)
     ):
         raise ProbeError("INVALID_FIXTURE", "fixture identity does not match this workspace")
-    if transport == UPDATED_INPUT_TRANSPORT and fixture["host"] != "workbuddy":
-        raise ProbeError("INVALID_FIXTURE", "updated-input transport requires a WorkBuddy fixture")
     return {**fixture, "transport": transport}  # type: ignore[return-value]
 
 
@@ -253,13 +274,13 @@ def prepare(
 
     if host not in SUPPORTED_HOSTS:
         raise ProbeError("UNSUPPORTED_HOST", "host must be codex or workbuddy")
-    if transport not in {DEFAULT_TRANSPORT, UPDATED_INPUT_TRANSPORT}:
+    if transport not in {DEFAULT_TRANSPORT, *UPDATED_INPUT_TRANSPORTS}:
         raise ProbeError(
             "UNSUPPORTED_TRANSPORT",
-            "transport must be context or workbuddy-updated-input",
+            "transport must be context, workbuddy-updated-input, or codex-updated-input",
         )
-    if transport == UPDATED_INPUT_TRANSPORT and host != "workbuddy":
-        raise ProbeError("UNSUPPORTED_TRANSPORT", "workbuddy-updated-input requires host workbuddy")
+    if not transport_is_valid_for_host(host, transport):
+        raise ProbeError("UNSUPPORTED_TRANSPORT", "transport does not match the selected host")
 
     workspace = resolve_path(workspace_value)
     if workspace.exists() and any(workspace.iterdir()):
@@ -279,7 +300,7 @@ def prepare(
     write_private_json(fixture_path(workspace), fixture)
     write_private_json(observations_path(workspace), [])
     write_private_bytes(observations_lock_path(workspace), b"")
-    if transport == UPDATED_INPUT_TRANSPORT:
+    if is_updated_input_transport(transport):
         write_private_json(receipts_path(workspace), [])
     runs_directory(workspace).mkdir(mode=0o700)
 
@@ -352,9 +373,7 @@ def normalize_payload(
     event_source = "hook_candidate" if source == "hook" else "fixture_candidate"
     identity_status = "stable" if session_id and tool_call_id else "unknown_id_arrival"
     stop_flags = {
-        name: payload[name]
-        for name in ("stop", "is_stop")
-        if isinstance(payload.get(name), bool)
+        name: payload[name] for name in ("stop", "is_stop") if isinstance(payload.get(name), bool)
     }
     return {
         "arrival_id": secrets.token_hex(12),
@@ -452,9 +471,7 @@ def parse_fixed_probe_command(
     if len(arguments) == 8 and arguments[0] == "cd" and arguments[2] == "&&":
         cd_target = Path(arguments[1]).expanduser()
         cd_workspace = (
-            (cwd / cd_target).resolve()
-            if not cd_target.is_absolute()
-            else cd_target.resolve()
+            (cwd / cd_target).resolve() if not cd_target.is_absolute() else cd_target.resolve()
         )
         if cd_workspace != workspace:
             return None
@@ -471,7 +488,7 @@ def parse_fixed_probe_command(
     ):
         return None
     return {
-        "original_command_digest": digest(command),
+        "original_command_digest": exact_command_digest(command),
         "operation_digest": fixed_operation_digest(workspace),
         "runtime_arguments_digest": digest(fixed_runtime_arguments(workspace)),
     }
@@ -482,6 +499,15 @@ def bounded_nonempty_text(payload: dict[str, object], name: str) -> str | None:
     if isinstance(value, str) and 0 < len(value) <= 256:
         return value
     return None
+
+
+def bounded_unique_text(payload: dict[str, object], *names: str) -> str | None:
+    values = {
+        value for name in names if (value := bounded_nonempty_text(payload, name)) is not None
+    }
+    if len(values) != 1:
+        return None
+    return next(iter(values))
 
 
 def workbuddy_session_tool_identity(payload: dict[str, object]) -> dict[str, str] | None:
@@ -503,14 +529,49 @@ def native_workbuddy_identity(payload: dict[str, object]) -> dict[str, str] | No
     return {**identity, "generation_id": generation_id, "call_id": call_id}
 
 
+def native_codex_identity(payload: dict[str, object]) -> dict[str, str] | None:
+    session_id = bounded_nonempty_text(payload, "session_id")
+    turn_id = bounded_nonempty_text(payload, "turn_id")
+    tool_use_id = bounded_unique_text(payload, "tool_use_id", "tool_call_id")
+    if session_id is None or turn_id is None or tool_use_id is None:
+        return None
+    return {
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "tool_use_id": tool_use_id,
+    }
+
+
+def native_updated_input_identity(
+    fixture: dict[str, str],
+    payload: dict[str, object],
+) -> dict[str, str] | None:
+    if fixture["host"] == "workbuddy":
+        return native_workbuddy_identity(payload)
+    return native_codex_identity(payload)
+
+
+def receipt_conflict_identity(
+    fixture: dict[str, str],
+    payload: dict[str, object],
+) -> dict[str, str] | None:
+    if fixture["host"] == "workbuddy":
+        return workbuddy_session_tool_identity(payload)
+
+    session_id = bounded_nonempty_text(payload, "session_id")
+    tool_use_id = bounded_unique_text(payload, "tool_use_id", "tool_call_id")
+    if session_id is None or tool_use_id is None:
+        return None
+    return {"session_id": session_id, "tool_use_id": tool_use_id}
+
+
 def receipt_payload_conflicts(
     receipts: list[dict[str, object]],
     identity: dict[str, str],
     payload_digest: object,
 ) -> bool:
     return any(
-        receipt.get("session_id") == identity["session_id"]
-        and receipt.get("tool_use_id") == identity["tool_use_id"]
+        all(receipt.get(name) == value for name, value in identity.items())
         and receipt.get("payload_digest") != payload_digest
         for receipt in receipts
     )
@@ -597,13 +658,16 @@ def issue_updated_input_receipt(
     *,
     source: str,
 ) -> tuple[str, dict[str, object] | None]:
-    """Persist one WorkBuddy receipt before returning a permission-neutral rewrite."""
+    """Persist one native Pre receipt before returning a rewrite without explicit allow.
+
+    Permission equivalence remains unverified until a real host case observes it.
+    """
 
     if source != "hook":
         return "fixture_source", None
     if observation["event_type"] != "PreToolUse":
         return "not_pre_tool_use", None
-    identity = native_workbuddy_identity(payload)
+    identity = native_updated_input_identity(fixture, payload)
     if identity is None:
         return "missing_native_identity", None
     if observation["identity_status"] == "conflict":
@@ -629,6 +693,8 @@ def issue_updated_input_receipt(
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return "unsupported_fixed_command", None
+    if fixture["host"] == "codex" and observation["tool_name"] != "Bash":
+        return "unsupported_fixed_command", None
     command = tool_input.get("command")
     cwd = Path(str(observation["cwd"]))
     operation = (
@@ -650,14 +716,17 @@ def issue_updated_input_receipt(
 
     issued_at = utc_now()
     expires_at = parse_timestamp(issued_at) + timedelta(seconds=RECEIPT_MAX_AGE_SECONDS)
+    receipt_token = secrets.token_hex(32)
+    updated_probe_command = updated_command(command, receipt_token)
     receipt = {
-        "receipt": secrets.token_hex(32),
+        "receipt": receipt_token,
         "fixture_id": fixture["fixture_id"],
         "source": "hook_candidate",
         "issued_at": issued_at,
         "expires_at": expires_at.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
         "payload_digest": observation["payload_digest"],
         "original_command_digest": operation["original_command_digest"],
+        "updated_command_digest": exact_command_digest(updated_probe_command),
         "operation_digest": operation["operation_digest"],
         "runtime_arguments_digest": operation["runtime_arguments_digest"],
         "consumed_at": None,
@@ -734,9 +803,9 @@ def receive_payload(
             "evidence_label": "candidate",
             "identity_status": observation["identity_status"],
         }
-        if fixture["transport"] == UPDATED_INPUT_TRANSPORT:
+        if is_updated_input_transport(fixture["transport"]):
             receipts = load_receipts(workspace)
-            stable_native_identity = workbuddy_session_tool_identity(payload)
+            stable_native_identity = receipt_conflict_identity(fixture, payload)
             transport_status, hook_output = issue_updated_input_receipt(
                 fixture,
                 payload,
@@ -812,6 +881,46 @@ def receipt_matches_runtime(
     )
 
 
+def receipt_has_required_native_identity(
+    fixture: dict[str, str],
+    receipt: dict[str, object],
+) -> bool:
+    names = (
+        ("turn_id", "tool_use_id")
+        if fixture["host"] == "codex"
+        else ("generation_id", "tool_use_id", "call_id")
+    )
+    return all(isinstance(receipt.get(name), str) for name in names)
+
+
+def receipt_matches_child_environment(
+    fixture: dict[str, str],
+    receipt: dict[str, object],
+    environment: dict[str, str],
+) -> dict[str, object] | None:
+    child = child_environment(fixture["host"], environment)
+    identity_error = child.get("_identity_error")
+    if isinstance(identity_error, str):
+        return receipt_comparison("unknown", "probe_receipt_environment_conflict")
+
+    if fixture["host"] == "codex":
+        thread_id = child["thread_id"]
+        if not isinstance(thread_id, str) or receipt.get("session_id") != thread_id:
+            return receipt_comparison("unknown", "probe_receipt_session_mismatch")
+        return None
+
+    session_id = child["session_id"]
+    if not isinstance(session_id, str) or receipt.get("session_id") != session_id:
+        return receipt_comparison("unknown", "probe_receipt_session_mismatch")
+    generation_id = child["generation_id"]
+    if generation_id is not None and receipt.get("generation_id") != generation_id:
+        return receipt_comparison("unknown", "probe_receipt_generation_mismatch")
+    tool_call_id = child["tool_call_id"]
+    if tool_call_id is not None and receipt.get("tool_use_id") != tool_call_id:
+        return receipt_comparison("unknown", "probe_receipt_tool_mismatch")
+    return None
+
+
 def consume_updated_input_receipt(
     fixture: dict[str, str],
     workspace: Path,
@@ -819,7 +928,7 @@ def consume_updated_input_receipt(
     receipt_token: str | None,
     runtime_arguments: tuple[str, ...],
 ) -> dict[str, object]:
-    """Consume one local WorkBuddy receipt after checking its bound operation."""
+    """Consume one local updated-input receipt after checking its bound operation."""
 
     if receipt_token is None:
         return receipt_comparison("unknown", "missing_probe_receipt")
@@ -862,17 +971,11 @@ def consume_updated_input_receipt(
         if receipt.get("consumed_at") is not None:
             return receipt_comparison("unknown", "probe_receipt_spent")
 
-        session_id = environment.get("CODEBUDDY_SESSION_ID")
-        if not isinstance(session_id, str) or receipt.get("session_id") != session_id:
-            return receipt_comparison("unknown", "probe_receipt_session_mismatch")
-        request_id = environment.get("CONVERSATION_REQUEST_ID")
-        if request_id is not None and receipt.get("generation_id") != request_id:
-            return receipt_comparison("unknown", "probe_receipt_generation_mismatch")
-        if any(
-            not isinstance(receipt.get(name), str)
-            for name in ("generation_id", "tool_use_id", "call_id")
-        ):
+        if not receipt_has_required_native_identity(fixture, receipt):
             return receipt_comparison("unknown", "probe_receipt_invalid")
+        environment_result = receipt_matches_child_environment(fixture, receipt, environment)
+        if environment_result is not None:
+            return environment_result
 
         receipt["consumed_at"] = utc_now()
         write_private_json(receipts_path(workspace), receipts, replace=True)
@@ -908,6 +1011,16 @@ def allowed_environment() -> dict[str, str]:
     }
 
 
+def consistent_environment_alias(
+    environment: dict[str, str],
+    *names: str,
+) -> tuple[str | None, bool]:
+    values = {value for name in names if (value := environment.get(name)) is not None}
+    if len(values) > 1:
+        return None, True
+    return next(iter(values), None), False
+
+
 def child_environment(host: str, environment: dict[str, str]) -> dict[str, str | None]:
     if host == "codex":
         return {
@@ -921,17 +1034,61 @@ def child_environment(host: str, environment: dict[str, str]) -> dict[str, str |
             "version": environment.get("CODEX_VERSION"),
             "tool_identity_strategy": "CODEX_TOOL_CALL_ID",
         }
+
+    session_id, session_conflict = consistent_environment_alias(
+        environment,
+        "CODEBUDDY_SESSION_ID",
+        "CODEBUDDY_SANDBOX_BROKER_SESSION_ID",
+    )
+    native_tool_call_id, native_tool_conflict = consistent_environment_alias(
+        environment,
+        "CODEBUDDY_TOOL_CALL_ID",
+        "TOOL_CALL_ID",
+    )
+    broker_tool_call_id, broker_tool_conflict = consistent_environment_alias(
+        environment,
+        "CODEBUDDY_SANDBOX_BROKER_TOOL_CALL_ID",
+        "SANDBOX_BROKER_TOOL_CALL_ID",
+    )
+    tool_call_values = {
+        value for value in (native_tool_call_id, broker_tool_call_id) if value is not None
+    }
+    tool_call_id = next(iter(tool_call_values)) if len(tool_call_values) == 1 else None
+    tool_call_conflict = native_tool_conflict or broker_tool_conflict or len(tool_call_values) > 1
+    generation_id, generation_conflict = consistent_environment_alias(
+        environment,
+        "CODEBUDDY_CONVERSATION_REQUEST_ID",
+        "CONVERSATION_REQUEST_ID",
+    )
+    message_id, message_conflict = consistent_environment_alias(
+        environment,
+        "CODEBUDDY_CONVERSATION_MESSAGE_ID",
+        "CONVERSATION_MESSAGE_ID",
+    )
+    identity_error = (
+        "conflicting_child_environment_alias"
+        if any(
+            (
+                session_conflict,
+                tool_call_conflict,
+                generation_conflict,
+                message_conflict,
+            )
+        )
+        else None
+    )
     return {
-        "session_id": environment.get("CODEBUDDY_SESSION_ID"),
+        "session_id": session_id,
         "thread_id": None,
-        "tool_call_id": environment.get("SANDBOX_BROKER_TOOL_CALL_ID")
-        or environment.get("TOOL_CALL_ID"),
+        "tool_call_id": tool_call_id,
         "request_id": None,
-        "generation_id": environment.get("CONVERSATION_REQUEST_ID"),
+        "generation_id": generation_id,
         "turn_id": None,
-        "message_id": environment.get("CONVERSATION_MESSAGE_ID"),
+        "message_id": message_id,
+        "root_request_id": environment.get("CODEBUDDY_ROOT_REQUEST_ID"),
         "version": None,
-        "tool_identity_strategy": "SANDBOX_BROKER_TOOL_CALL_ID_or_TOOL_CALL_ID_candidate",
+        "tool_identity_strategy": "CODEBUDDY_TOOL_CALL_ID_or_broker_candidate",
+        "_identity_error": identity_error,
     }
 
 
@@ -943,7 +1100,17 @@ def compare_child_context(
     child = child_environment(fixture["host"], environment)
     session_id = child["session_id"]
     tool_call_id = child["tool_call_id"]
-    available_fields = sorted(name for name, value in child.items() if value is not None)
+    available_fields = sorted(
+        name for name, value in child.items() if value is not None and not name.startswith("_")
+    )
+    identity_error = child.get("_identity_error")
+    if isinstance(identity_error, str):
+        return {
+            "status": "unknown",
+            "reason": identity_error,
+            "available_fields": available_fields,
+            "evidence_label": "candidate",
+        }
     if not isinstance(session_id, str) or not isinstance(tool_call_id, str):
         return {
             "status": "unknown",
@@ -968,9 +1135,11 @@ def compare_child_context(
             "evidence_label": "candidate",
         }
     if len(matches) != 1:
-        reason = "conflicting_pretooluse_payloads" if any(
-            item["identity_status"] == "conflict" for item in matches
-        ) else "ambiguous_pretooluse_matches"
+        reason = (
+            "conflicting_pretooluse_payloads"
+            if any(item["identity_status"] == "conflict" for item in matches)
+            else "ambiguous_pretooluse_matches"
+        )
         return {
             "status": "conflict",
             "reason": reason,
@@ -1049,7 +1218,7 @@ def run(
     environment = allowed_environment()
     child_values = observe_child_environment(workspace, environment)
     observations = load_observations(workspace)
-    if fixture["transport"] == UPDATED_INPUT_TRANSPORT:
+    if is_updated_input_transport(fixture["transport"]):
         expected_runtime_arguments = runtime_arguments or receipt_runtime_arguments(
             workspace,
             probe_receipt or "",
@@ -1106,7 +1275,7 @@ def inspect(workspace_value: str | Path) -> dict[str, object]:
         "config": configuration,
         "observations": load_observations(workspace),
         "receipts": load_receipts(workspace)
-        if fixture["transport"] == UPDATED_INPUT_TRANSPORT
+        if is_updated_input_transport(fixture["transport"])
         else [],
         "runs": runs,
     }
@@ -1121,9 +1290,9 @@ def parser() -> argparse.ArgumentParser:
     preparing.add_argument("--host", choices=sorted(SUPPORTED_HOSTS), required=True)
     preparing.add_argument(
         "--transport",
-        choices=(DEFAULT_TRANSPORT, UPDATED_INPUT_TRANSPORT),
+        choices=(DEFAULT_TRANSPORT, *sorted(UPDATED_INPUT_TRANSPORTS)),
         default=DEFAULT_TRANSPORT,
-        help="use the opt-in WorkBuddy updatedInput receipt transport",
+        help="use an opt-in host-specific updatedInput receipt transport",
     )
 
     receiving = commands.add_parser("receive", help="record bounded hook JSON from stdin")
@@ -1134,7 +1303,9 @@ def parser() -> argparse.ArgumentParser:
         help="label this local injection as a fixture candidate, never native proof",
     )
 
-    running = commands.add_parser("run", help="compare one fixed child environment to a hook candidate")
+    running = commands.add_parser(
+        "run", help="compare one fixed child environment to a hook candidate"
+    )
     running.add_argument("--workspace", required=True)
     running.add_argument("--probe-receipt")
 
@@ -1177,7 +1348,12 @@ def main(arguments: list[str] | None = None) -> int:
         else:
             response = inspect(parsed.workspace)
     except (OSError, subprocess.SubprocessError) as error:
-        response = {"protocol": PROTOCOL, "ok": False, "code": "LOCAL_IO_FAILED", "message": str(error)}
+        response = {
+            "protocol": PROTOCOL,
+            "ok": False,
+            "code": "LOCAL_IO_FAILED",
+            "message": str(error),
+        }
         print(json.dumps(response, sort_keys=True), file=sys.stderr)
         return 1
     except ProbeError as error:

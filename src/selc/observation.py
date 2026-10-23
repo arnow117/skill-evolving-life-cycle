@@ -639,6 +639,16 @@ def _refresh_assessment(database: sqlite3.Connection, task_id: str) -> None:
     task = database.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
     if task is None:
         return
+    if task["assessment_owner"] == "managed-v2":
+        # Protocol-3 managed records have one reducer.  Observation replay,
+        # legacy ingress, and feedback must all reach that reducer instead of
+        # writing a competing v1 assessment over its task or calls.
+        from .managed_runtime import reduce_managed_assessment
+
+        reduce_managed_assessment(database, task_id)
+        return
+    if task["assessment_owner"] != "legacy":
+        return
     events = database.execute(
         """SELECT * FROM observation_events
         WHERE task_id = ? AND status = 'applied' ORDER BY received_at, event_id""",

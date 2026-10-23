@@ -1094,14 +1094,16 @@ class ObservationContractTests(unittest.TestCase):
         database = self.database()
         path = self.root / "project" / ".selc" / "records.sqlite3"
         task_count = database.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-        database.execute("UPDATE meta SET value = '3' WHERE key = 'writer_protocol'")
+        future_protocol = str(records.WRITER_PROTOCOL_VERSION + 1)
+        database.execute("UPDATE meta SET value = ? WHERE key = 'writer_protocol'", (future_protocol,))
         database.commit()
         database.close()
         with self.assertRaisesRegex(SelcError, "newer SELC runtime"):
             records.open_database(self.root / "project")
         raw = sqlite3.connect(path)
         self.assertEqual(
-            raw.execute("SELECT value FROM meta WHERE key = 'writer_protocol'").fetchone()[0], "3"
+            raw.execute("SELECT value FROM meta WHERE key = 'writer_protocol'").fetchone()[0],
+            future_protocol,
         )
         self.assertEqual(raw.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], task_count)
         raw.close()
@@ -1109,7 +1111,10 @@ class ObservationContractTests(unittest.TestCase):
     def test_future_protocol_rejection_closes_the_opened_connection(self) -> None:
         database = self.database()
         path = self.root / "project" / ".selc" / "records.sqlite3"
-        database.execute("UPDATE meta SET value = '3' WHERE key = 'writer_protocol'")
+        database.execute(
+            "UPDATE meta SET value = ? WHERE key = 'writer_protocol'",
+            (str(records.WRITER_PROTOCOL_VERSION + 1),),
+        )
         database.commit()
         database.close()
 
@@ -1335,7 +1340,7 @@ class ObservationContractTests(unittest.TestCase):
         migrated = records.open_database(self.root / "project")
         self.assertEqual(
             migrated.execute("SELECT value FROM meta WHERE key = 'writer_protocol'").fetchone()[0],
-            "2",
+            str(records.WRITER_PROTOCOL_VERSION),
         )
         legacy_task = migrated.execute(
             "SELECT task_id, first_result, current_result FROM tasks WHERE task_id = 'legacy-task'"
@@ -1383,7 +1388,7 @@ class ObservationContractTests(unittest.TestCase):
         reopened = records.open_database(self.root / "project")
         self.assertEqual(
             reopened.execute("SELECT value FROM meta WHERE key = 'writer_protocol'").fetchone()[0],
-            "2",
+            str(records.WRITER_PROTOCOL_VERSION),
         )
         reopened.close()
 

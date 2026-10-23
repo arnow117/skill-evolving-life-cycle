@@ -21,16 +21,15 @@ import hashlib
 import importlib.util
 import json
 import sys
-from contextlib import ExitStack
-from dataclasses import dataclass, replace
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .errors import SelcError
 from .install import current_installation, install_root, registry_lock_path
 from .manifest import load_manifest, normalize_artifact_checks, portable_tree_hash
 from .util import exclusive_lock, write_json
-
 
 CHECKER_REGISTRY_SCHEMA_VERSION = 1
 CHECKER_REGISTRY_NAME = "checker-registry.json"
@@ -115,6 +114,7 @@ def run_installed_check(
     artifact_path: Path,
     subject: Any,
     run_id: str,
+    locks_held: bool = False,
 ) -> CheckerExecution:
     """Run one declared checker against frozen input and artifact source bytes.
 
@@ -125,13 +125,9 @@ def run_installed_check(
     to ``unknown`` without deleting or rewriting either source file.
     """
 
-    with ExitStack() as locks:
-        locks.enter_context(exclusive_lock(registry_lock_path(project_root)))
-        installation = current_installation(project_root, suite_id)
+    with _checker_runtime_lock(project_root, suite_id, locks_held) as installation:
         installation_digest = _required_installation_string(installation, "digest")
         installation_version = _required_installation_string(installation, "version")
-        suite_lock = install_root(project_root) / suite_id / ".lock"
-        locks.enter_context(exclusive_lock(suite_lock))
 
         suite_root = install_root(project_root) / suite_id / "current"
         actual_tree_digest = portable_tree_hash(suite_root)
@@ -193,6 +189,22 @@ def run_installed_check(
     )
 
 
+@contextmanager
+def _checker_runtime_lock(
+    project_root: Path, suite_id: str, locks_held: bool
+) -> Iterator[dict[str, object]]:
+    """Use the caller's registry→suite lease without reacquiring flock locks."""
+
+    if locks_held:
+        yield current_installation(project_root, suite_id)
+        return
+    with ExitStack() as locks:
+        locks.enter_context(exclusive_lock(registry_lock_path(project_root)))
+        suite_lock = install_root(project_root) / suite_id / ".lock"
+        locks.enter_context(exclusive_lock(suite_lock))
+        yield current_installation(project_root, suite_id)
+
+
 def check_result_payload(execution: CheckerExecution) -> dict[str, object]:
     """Convert an engine result to the stable JSON object printed by ``check``."""
 
@@ -240,7 +252,8 @@ def _load_installed_checker_module(suite_root: Path, installation_digest: str) -
             "selected suite has no safe checker runtime module",
             "reinstall a framework that includes checkers.py",
         )
-    module_name = f"_selc_installed_checkers_{installation_digest[:16]}"
+    path_identity = hashlib.sha256(str(module_path.resolve()).encode("utf-8")).hexdigest()[:12]
+    module_name = f"_selc_installed_checkers_{installation_digest[:16]}_{path_identity}"
     existing = sys.modules.get(module_name)
     if existing is not None:
         return existing
@@ -431,7 +444,10 @@ def _registered_script_entry(
             "checker rules must be unique bounded identifiers",
             "register one or more explicit supported rules",
         )
-    if not isinstance(timeout_seconds, float) or not 0 < timeout_seconds <= MAX_SCRIPT_TIMEOUT_SECONDS:
+    if (
+        not isinstance(timeout_seconds, float)
+        or not 0 < timeout_seconds <= MAX_SCRIPT_TIMEOUT_SECONDS
+    ):
         raise SelcError(
             "INVALID_CHECKER_REGISTRATION",
             "checker timeout must be greater than zero and at most ten seconds",
@@ -481,7 +497,10 @@ def _read_project_registry(project_root: Path) -> dict[str, list[dict[str, objec
             "project checker registry is not valid JSON",
             "repair or remove .selc/checker-registry.json",
         ) from error
-    if not isinstance(value, dict) or value.get("schema_version") != CHECKER_REGISTRY_SCHEMA_VERSION:
+    if (
+        not isinstance(value, dict)
+        or value.get("schema_version") != CHECKER_REGISTRY_SCHEMA_VERSION
+    ):
         raise SelcError(
             "INVALID_CHECKER_REGISTRY",
             "project checker registry schema is unsupported",

@@ -128,9 +128,9 @@
             "T009"
           ],
           "id": "T010",
-          "status": "todo",
+          "status": "in_progress",
           "title": "Codex与WorkBuddy自动受管调用及时间线",
-          "updated_at": "2026-10-20T08:35:23Z"
+          "updated_at": "2026-10-20T11:12:31Z"
         },
         "T011": {
           "depends_on": [
@@ -156,9 +156,19 @@
           "status": "done",
           "title": "WorkBuddy本地command-hook回执传递实验准备",
           "updated_at": "2026-10-20T10:53:58Z"
+        },
+        "T014": {
+          "depends_on": [
+            "T012",
+            "T013"
+          ],
+          "id": "T014",
+          "status": "done",
+          "title": "核正WorkBuddy完整原生环境命名的探针遗漏",
+          "updated_at": "2026-10-21T06:41:47Z"
         }
       },
-      "updated_at": "2026-10-20T10:53:58Z",
+      "updated_at": "2026-10-21T06:41:47Z",
       "validation": {
         "at": null,
         "command": null,
@@ -192,7 +202,7 @@
       "product_context_ref": ".sdlc-v1/context/REQ-002.product.md",
       "status": "in_delivery",
       "title": "补齐 Codex 与 WorkBuddy 自动统计及业务验证扩展",
-      "updated_at": "2026-10-20T10:53:58Z"
+      "updated_at": "2026-10-21T06:41:47Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

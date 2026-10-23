@@ -45,6 +45,28 @@ from .install import (
     update_check,
     verify_expected_version,
 )
+from .managed_runtime import (
+    activate as managed_activate,
+)
+from .managed_runtime import (
+    activate_from_environment as managed_activate_from_environment,
+)
+from .managed_runtime import (
+    health as managed_health,
+)
+from .managed_runtime import (
+    observe_request_boundary,
+    stage_instruction_artifact,
+)
+from .managed_runtime import (
+    publish as managed_publish,
+)
+from .managed_runtime import (
+    recover as recover_managed_runtime,
+)
+from .managed_runtime import (
+    run_action as run_managed_action,
+)
 from .manifest import (
     create_suite,
     load_manifest,
@@ -54,6 +76,7 @@ from .manifest import (
     render_text_report_bytes,
     seal_suite,
 )
+from .native_adapter import current_environment, read_hook_payload, receive_native_hook
 from .records import (
     close_task,
     complete_call,
@@ -355,6 +378,75 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--output", type=_path, required=True)
     run.add_argument("--suite", type=_path)
 
+    managed = subcommands.add_parser("managed", help="run the installed managed lifecycle boundary")
+    managed_commands = managed.add_subparsers(dest="managed_command", required=True)
+    managed_observe = managed_commands.add_parser("observe")
+    _project(managed_observe)
+    managed_observe.add_argument("--suite", required=True)
+    managed_observe.add_argument("--payload", type=_path, required=True)
+    managed_observe.add_argument("--fixture", action="store_true")
+    managed_invoke = managed_commands.add_parser(
+        "invoke", help="activate through the installed discovery entry and current native child"
+    )
+    _project(managed_invoke)
+    managed_invoke.add_argument("--suite", required=True)
+    managed_invoke.add_argument("--skill", required=True)
+    managed_invoke.add_argument("--host", choices=["codex", "workbuddy"], required=True)
+    managed_invoke.add_argument("--expected-version", required=True)
+    managed_invoke.add_argument("--expected-composite", required=True)
+    managed_activate_parser = managed_commands.add_parser("activate")
+    _project(managed_activate_parser)
+    managed_activate_parser.add_argument("--suite", required=True)
+    managed_activate_parser.add_argument("--skill", required=True)
+    managed_activate_parser.add_argument("--receipt", required=True)
+    managed_action = managed_commands.add_parser("action")
+    _project(managed_action)
+    managed_action.add_argument("--suite", required=True)
+    managed_action.add_argument("--skill", required=True)
+    managed_action.add_argument("--task-id", required=True)
+    managed_action.add_argument("--call-id", required=True)
+    managed_action.add_argument("--action", required=True)
+    managed_action.add_argument("--request", type=_path, required=True)
+    managed_action.add_argument("--host", choices=["codex", "workbuddy"], required=True)
+    managed_action.add_argument("--expected-version", required=True)
+    managed_action.add_argument("--expected-composite", required=True)
+    managed_stage = managed_commands.add_parser("stage")
+    _project(managed_stage)
+    managed_stage.add_argument("--suite", required=True)
+    managed_stage.add_argument("--skill", required=True)
+    managed_stage.add_argument("--task-id", required=True)
+    managed_stage.add_argument("--call-id", required=True)
+    managed_stage.add_argument("--action", required=True)
+    managed_stage.add_argument("--artifact-bytes", type=_path, required=True)
+    managed_stage.add_argument("--checker-input", type=_path, required=True)
+    managed_stage.add_argument("--host", choices=["codex", "workbuddy"], required=True)
+    managed_stage.add_argument("--expected-version", required=True)
+    managed_stage.add_argument("--expected-composite", required=True)
+    managed_publish_parser = managed_commands.add_parser("publish")
+    _project(managed_publish_parser)
+    managed_publish_parser.add_argument("--suite", required=True)
+    managed_publish_parser.add_argument("--skill", required=True)
+    managed_publish_parser.add_argument("--task-id", required=True)
+    managed_publish_parser.add_argument("--call-id", required=True)
+    managed_publish_parser.add_argument("--artifact", type=_path, required=True)
+    managed_publish_parser.add_argument("--target", required=True)
+    managed_publish_parser.add_argument("--host", choices=["codex", "workbuddy"], required=True)
+    managed_publish_parser.add_argument("--expected-version", required=True)
+    managed_publish_parser.add_argument("--expected-composite", required=True)
+    managed_health_parser = managed_commands.add_parser("health")
+    _project(managed_health_parser)
+    managed_health_parser.add_argument("--suite", required=True)
+    managed_health_parser.add_argument("--task-id", required=True)
+    managed_recover = managed_commands.add_parser("recover")
+    _project(managed_recover)
+    managed_recover.add_argument("--suite", required=True)
+    managed_hook = managed_commands.add_parser(
+        "hook", help="receive one installer-owned native callback on standard input"
+    )
+    _project(managed_hook)
+    managed_hook.add_argument("--suite", required=True)
+    managed_hook.add_argument("--host", choices=["codex", "workbuddy"], required=True)
+
     doctor = subcommands.add_parser("doctor", help="report the portable runtime contract")
     doctor.add_argument("--suite", type=_path)
     return parser
@@ -441,6 +533,179 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
                 arguments.suite_id, arguments.version, arguments.output, arguments.skill
             )
         }
+    if command == "managed":
+        if arguments.managed_command == "hook":
+            payload = read_hook_payload(sys.stdin)
+            return {
+                "managed": receive_native_hook(
+                    project_root=arguments.project_root,
+                    suite_id=arguments.suite,
+                    host=arguments.host,
+                    payload=payload,
+                    environment=current_environment(),
+                )
+            }
+        if arguments.managed_command == "observe":
+            try:
+                payload = json.loads(arguments.payload.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise SelcError(
+                    "NATIVE_COLLECTOR_INVALID",
+                    "managed observer payload is not a readable JSON object",
+                    "supply the native collector payload file",
+                ) from error
+            if not isinstance(payload, dict):
+                raise SelcError(
+                    "NATIVE_COLLECTOR_INVALID",
+                    "managed observer payload must be an object",
+                    "supply the native collector payload file",
+                )
+            return {
+                "managed": observe_request_boundary(
+                    project_root=arguments.project_root,
+                    suite_id=arguments.suite,
+                    payload=payload,
+                    fixture=arguments.fixture,
+                )
+            }
+        if arguments.managed_command == "invoke":
+            return {
+                "managed": managed_activate_from_environment(
+                    project_root=arguments.project_root,
+                    suite_id=arguments.suite,
+                    skill=arguments.skill,
+                    host=arguments.host,
+                    expected_version=arguments.expected_version,
+                    expected_composite=arguments.expected_composite,
+                    environment=current_environment(),
+                )
+            }
+        if arguments.managed_command == "activate":
+            return {
+                "managed": managed_activate(
+                    project_root=arguments.project_root,
+                    suite_id=arguments.suite,
+                    skill=arguments.skill,
+                    receipt=arguments.receipt,
+                )
+            }
+        if arguments.managed_command == "action":
+            try:
+                request = json.loads(arguments.request.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as error:
+                raise SelcError(
+                    "MANAGED_INPUT_INVALID",
+                    "managed action request is not a readable JSON object",
+                    "supply the declared managed input object",
+                ) from error
+            if not isinstance(request, dict):
+                raise SelcError(
+                    "MANAGED_INPUT_INVALID",
+                    "managed action request must be an object",
+                    "supply the declared managed input object",
+                )
+            return {
+                "managed": run_managed_action(
+                    project_root=arguments.project_root,
+                    suite_id=arguments.suite,
+                    skill=arguments.skill,
+                    task_id=arguments.task_id,
+                    call_id=arguments.call_id,
+                    action_id=arguments.action,
+                    receipt=None,
+                    request=request,
+                    host=arguments.host,
+                    expected_version=arguments.expected_version,
+                    expected_composite=arguments.expected_composite,
+                    environment=current_environment(),
+                    operation_arguments={
+                        "--project-root": str(arguments.project_root),
+                        "--suite": arguments.suite,
+                        "--skill": arguments.skill,
+                        "--task-id": arguments.task_id,
+                        "--call-id": arguments.call_id,
+                        "--action": arguments.action,
+                        "--request": str(arguments.request),
+                        "--host": arguments.host,
+                        "--expected-version": arguments.expected_version,
+                        "--expected-composite": arguments.expected_composite,
+                    },
+                )
+            }
+        if arguments.managed_command == "stage":
+            try:
+                artifact_bytes = arguments.artifact_bytes.read_bytes()
+                checker_input_bytes = arguments.checker_input.read_bytes()
+            except OSError as error:
+                raise SelcError(
+                    "MANAGED_INPUT_INVALID",
+                    "managed instruction staging inputs are unavailable",
+                    "supply readable artifact and checker-input files",
+                ) from error
+            return {
+                "managed": stage_instruction_artifact(
+                    project_root=arguments.project_root,
+                    suite_id=arguments.suite,
+                    task_id=arguments.task_id,
+                    call_id=arguments.call_id,
+                    action_id=arguments.action,
+                    artifact_bytes=artifact_bytes,
+                    checker_input_bytes=checker_input_bytes,
+                    host=arguments.host,
+                    expected_version=arguments.expected_version,
+                    expected_composite=arguments.expected_composite,
+                    environment=current_environment(),
+                    operation_arguments={
+                        "--project-root": str(arguments.project_root),
+                        "--suite": arguments.suite,
+                        "--skill": arguments.skill,
+                        "--task-id": arguments.task_id,
+                        "--call-id": arguments.call_id,
+                        "--action": arguments.action,
+                        "--artifact-bytes": str(arguments.artifact_bytes),
+                        "--checker-input": str(arguments.checker_input),
+                        "--host": arguments.host,
+                        "--expected-version": arguments.expected_version,
+                        "--expected-composite": arguments.expected_composite,
+                    },
+                )
+            }
+        if arguments.managed_command == "publish":
+            return {
+                "managed": managed_publish(
+                    project_root=arguments.project_root,
+                    suite_id=arguments.suite,
+                    task_id=arguments.task_id,
+                    call_id=arguments.call_id,
+                    receipt=None,
+                    artifact_path=arguments.artifact,
+                    target=arguments.target,
+                    skill=arguments.skill,
+                    host=arguments.host,
+                    expected_version=arguments.expected_version,
+                    expected_composite=arguments.expected_composite,
+                    environment=current_environment(),
+                    operation_arguments={
+                        "--project-root": str(arguments.project_root),
+                        "--suite": arguments.suite,
+                        "--skill": arguments.skill,
+                        "--task-id": arguments.task_id,
+                        "--call-id": arguments.call_id,
+                        "--artifact": str(arguments.artifact),
+                        "--target": arguments.target,
+                        "--host": arguments.host,
+                        "--expected-version": arguments.expected_version,
+                        "--expected-composite": arguments.expected_composite,
+                    },
+                )
+            }
+        if arguments.managed_command == "health":
+            return {
+                "managed": managed_health(
+                    arguments.project_root, arguments.suite, arguments.task_id
+                )
+            }
+        return {"managed": recover_managed_runtime(arguments.project_root, arguments.suite)}
     if command == "validate":
         return {"suite": load_manifest(arguments.suite), "valid": True}
     if command == "seal":
@@ -680,37 +945,19 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
         finally:
             database.close()
     if command == "delete":
-        with ExitStack() as locks:
-            locks.enter_context(exclusive_lock(registry_lock_path(arguments.project_root)))
-            lookup = open_database(arguments.project_root)
-            try:
-                filters = []
-                values: list[str] = []
-                if arguments.suite_id:
-                    filters.append("suite_id = ?")
-                    values.append(arguments.suite_id)
-                if arguments.before:
-                    filters.append("created_at < ?")
-                    values.append(arguments.before)
-                where = f"WHERE {' AND '.join(filters)}" if filters else ""
-                suite_rows = lookup.execute(
-                    f"SELECT DISTINCT suite_id FROM tasks {where}", values
-                ).fetchall()
-            finally:
-                lookup.close()
-            for row in sorted(suite_rows, key=lambda item: str(item["suite_id"])):
-                suite_lock = install_root(arguments.project_root) / row["suite_id"] / ".lock"
-                locks.enter_context(exclusive_lock(suite_lock))
-            database = open_database(arguments.project_root)
-            try:
-                return delete_records(
-                    database,
-                    suite_id=arguments.suite_id,
-                    before=arguments.before,
-                    apply=arguments.apply,
-                )
-            finally:
-                database.close()
+        database = open_database(arguments.project_root)
+        try:
+            # ``delete_records`` owns registry→selected-suite locking for both
+            # public API and CLI callers.  Keeping this path thin prevents a
+            # CLI-only lock flag from bypassing its durable execution check.
+            return delete_records(
+                database,
+                suite_id=arguments.suite_id,
+                before=arguments.before,
+                apply=arguments.apply,
+            )
+        finally:
+            database.close()
     if command == "updates":
         if arguments.updates_command == "check":
             business_source = arguments.business_source or arguments.source
@@ -877,11 +1124,29 @@ def main(
     try:
         arguments = parser.parse_args(effective_arguments)
         output = _dispatch(arguments, default_suite_root)
+        if arguments.command == "managed" and arguments.managed_command == "hook":
+            if arguments.host == "codex":
+                # Codex Stop hooks require JSON stdout.  An empty object keeps
+                # the callback observational: it grants no permission and
+                # carries no command rewrite or host control field.
+                print("{}")
+            return 0
     except SelcError as error:
+        error_code = error.code
+        error_message = error.message
+        recovery = error.recovery
+        if error.code == "LOCKED" and getattr(arguments, "command", None) == "event":
+            error_code = "DATABASE_BUSY"
+            error_message = "the managed suite is executing or being deleted"
+            recovery = "retry after the managed operation completes"
         output = {
             "schema_version": SCHEMA_VERSION,
             "ok": False,
-            "error": {"code": error.code, "message": error.message, "recovery": error.recovery},
+            "error": {
+                "code": error_code,
+                "message": error_message,
+                "recovery": recovery,
+            },
         }
         print(json.dumps(output, ensure_ascii=False, sort_keys=True))
         return 2
