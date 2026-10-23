@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import time
 import uuid
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Iterable
 
 from . import SCHEMA_VERSION
 from .errors import SelcError
 from .util import json_hash, read_json, write_json
+
+WRITER_PROTOCOL_VERSION = 3
 
 
 def utc_now() -> str:
@@ -27,10 +31,15 @@ def open_database(project_root: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     database = sqlite3.connect(path)
     database.row_factory = sqlite3.Row
+    _register_writer_protocol(database)
     database.execute("PRAGMA foreign_keys = ON")
     database.execute("PRAGMA busy_timeout = 250")
-    database.executescript(
-        """
+    try:
+        _reject_future_writer_protocol(database)
+        database.execute("BEGIN IMMEDIATE")
+        _execute_schema_script(
+            database,
+            """
         CREATE TABLE IF NOT EXISTS meta (
           key TEXT PRIMARY KEY,
           value TEXT NOT NULL
@@ -87,6 +96,36 @@ def open_database(project_root: Path) -> sqlite3.Connection:
           complete_fixture INTEGER NOT NULL,
           sequence INTEGER NOT NULL,
           created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS checker_runs (
+          delivery_id TEXT PRIMARY KEY REFERENCES deliveries(delivery_id) ON DELETE CASCADE,
+          task_id TEXT NOT NULL REFERENCES tasks(task_id),
+          call_id TEXT NOT NULL REFERENCES calls(call_id),
+          subject_delivery_id TEXT NOT NULL,
+          check_id TEXT NOT NULL,
+          run_id TEXT NOT NULL,
+          checker_name TEXT NOT NULL,
+          checker_version TEXT NOT NULL,
+          checker_digest TEXT NOT NULL,
+          rule_version TEXT NOT NULL,
+          result TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          input_digest TEXT NOT NULL,
+          artifact_digest TEXT NOT NULL,
+          resource_identity TEXT NOT NULL,
+          resource_digest TEXT NOT NULL,
+          composite_identity TEXT NOT NULL,
+          composite_digest TEXT NOT NULL,
+          installation_digest TEXT NOT NULL,
+          installation_version TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS checker_rule_results (
+          delivery_id TEXT NOT NULL REFERENCES checker_runs(delivery_id) ON DELETE CASCADE,
+          rule_id TEXT NOT NULL,
+          result TEXT NOT NULL,
+          reason TEXT NOT NULL,
+          PRIMARY KEY(delivery_id, rule_id)
         );
         CREATE TABLE IF NOT EXISTS feedback (
           feedback_id TEXT PRIMARY KEY,
@@ -158,37 +197,525 @@ def open_database(project_root: Path) -> sqlite3.Connection:
           created_at TEXT NOT NULL,
           PRIMARY KEY(origin_id, subject_kind, subject_id)
         );
-        """
-    )
-    _ensure_column(database, "calls", "actual_harness", "TEXT NOT NULL DEFAULT 'unknown'")
-    _ensure_column(database, "calls", "declared_result", "TEXT")
-    _ensure_column(database, "deliveries", "call_id", "TEXT")
-    _ensure_column(database, "deliveries", "checker_id", "TEXT")
-    _ensure_column(database, "deliveries", "checker_verified", "INTEGER NOT NULL DEFAULT 0")
-    _ensure_column(database, "deliveries", "checker_result", "TEXT")
-    _ensure_column(database, "deliveries", "checker_input_hash", "TEXT")
-    _ensure_column(database, "deliveries", "checker_artifact_hash", "TEXT")
-    _ensure_column(database, "deliveries", "checker_resource_hash", "TEXT")
-    _ensure_column(database, "deliveries", "checker_composite_hash", "TEXT")
-    _ensure_column(database, "deliveries", "checker_identity_version", "INTEGER NOT NULL DEFAULT 0")
-    _ensure_column(database, "deliveries", "sequence", "INTEGER NOT NULL DEFAULT 0")
-    _ensure_column(database, "feedback", "delivery_id", "TEXT")
-    _ensure_column(database, "imported_samples", "started_at", "TEXT NOT NULL DEFAULT ''")
-    _ensure_column(database, "imported_samples", "initiator", "TEXT")
-    _ensure_column(database, "imported_samples", "skill", "TEXT")
-    _ensure_column(database, "imported_samples", "executor", "TEXT")
-    _ensure_column(database, "imported_samples", "evidence", "TEXT")
-    _ensure_column(database, "imported_samples", "trigger_kind", "TEXT")
-    _ensure_column(database, "imported_samples", "expected_hash", "TEXT")
-    _backfill_delivery_sequences(database)
-    _migrate_feedback_revisions(database)
-    if database.execute("SELECT 1 FROM meta WHERE key = 'origin_id'").fetchone() is None:
-        database.execute(
-            "INSERT INTO meta(key, value) VALUES('origin_id', ?)", (str(uuid.uuid4()),)
+            """,
         )
-        database.execute("INSERT INTO meta(key, value) VALUES('snapshot_revision', '0')")
-    database.commit()
+        _ensure_column(database, "calls", "actual_harness", "TEXT NOT NULL DEFAULT 'unknown'")
+        _ensure_column(database, "calls", "declared_result", "TEXT")
+        _ensure_column(database, "deliveries", "call_id", "TEXT")
+        _ensure_column(database, "deliveries", "checker_id", "TEXT")
+        _ensure_column(database, "deliveries", "checker_verified", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(database, "deliveries", "checker_result", "TEXT")
+        _ensure_column(database, "deliveries", "checker_input_hash", "TEXT")
+        _ensure_column(database, "deliveries", "checker_artifact_hash", "TEXT")
+        _ensure_column(database, "deliveries", "checker_resource_hash", "TEXT")
+        _ensure_column(database, "deliveries", "checker_composite_hash", "TEXT")
+        _ensure_column(
+            database, "deliveries", "checker_identity_version", "INTEGER NOT NULL DEFAULT 0"
+        )
+        _ensure_column(database, "deliveries", "sequence", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(database, "feedback", "delivery_id", "TEXT")
+        _ensure_column(database, "imported_samples", "started_at", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(database, "imported_samples", "initiator", "TEXT")
+        _ensure_column(database, "imported_samples", "skill", "TEXT")
+        _ensure_column(database, "imported_samples", "executor", "TEXT")
+        _ensure_column(database, "imported_samples", "evidence", "TEXT")
+        _ensure_column(database, "imported_samples", "trigger_kind", "TEXT")
+        _ensure_column(database, "imported_samples", "expected_hash", "TEXT")
+        _ensure_column(database, "tasks", "assessment_owner", "TEXT NOT NULL DEFAULT 'legacy'")
+        _ensure_column(database, "calls", "assessment_owner", "TEXT NOT NULL DEFAULT 'legacy'")
+        # A protocol-2 database already has guards which deliberately reject a
+        # protocol-3 connection.  Remove only the guards while this exclusive,
+        # atomic migration is in progress; a later failure rolls this change
+        # back with every other schema/data change.
+        _drop_writer_protocol_triggers(database)
+        _backfill_delivery_sequences(database)
+        _migrate_feedback_revisions(database)
+        if database.execute("SELECT 1 FROM meta WHERE key = 'origin_id'").fetchone() is None:
+            database.execute(
+                "INSERT INTO meta(key, value) VALUES('origin_id', ?)", (str(uuid.uuid4()),)
+            )
+            database.execute("INSERT INTO meta(key, value) VALUES('snapshot_revision', '0')")
+        _create_observation_tables(database)
+        _create_managed_runtime_tables(database)
+        _recompute_owned_assessments(database)
+        database.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('writer_protocol', ?)",
+            (str(WRITER_PROTOCOL_VERSION),),
+        )
+        _install_writer_protocol_triggers(database)
+        database.commit()
+    except Exception:
+        database.rollback()
+        database.close()
+        raise
     return database
+
+
+def _register_writer_protocol(database: sqlite3.Connection) -> None:
+    """Mark a connection as a current records writer for guarded triggers."""
+
+    database.create_function("selc_writer_protocol", 0, lambda: WRITER_PROTOCOL_VERSION)
+
+
+def _reject_future_writer_protocol(database: sqlite3.Connection) -> None:
+    meta_exists = database.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'meta'"
+    ).fetchone()
+    if meta_exists is None:
+        return
+    row = database.execute("SELECT value FROM meta WHERE key = 'writer_protocol'").fetchone()
+    if row is None:
+        return
+    try:
+        protocol = int(row["value"])
+    except (TypeError, ValueError) as error:
+        raise SelcError(
+            "UNSUPPORTED_DATABASE_PROTOCOL",
+            "database writer protocol is invalid",
+            "restore a supported records database or update SELC",
+        ) from error
+    if protocol > WRITER_PROTOCOL_VERSION:
+        raise SelcError(
+            "UNSUPPORTED_DATABASE_PROTOCOL",
+            "database was written by a newer SELC runtime",
+            "update SELC before opening this records database",
+        )
+
+
+def _execute_schema_script(database: sqlite3.Connection, script: str) -> None:
+    """Execute schema DDL inside the caller's transaction.
+
+    ``sqlite3.Connection.executescript`` commits a pending transaction first.  A
+    migration needs the opposite property, so this deliberately executes each
+    complete statement through ``execute``.
+    """
+
+    for statement in script.split(";\n"):
+        if statement.strip():
+            database.execute(statement)
+
+
+def _create_observation_tables(database: sqlite3.Connection) -> None:
+    statements = (
+        """CREATE TABLE IF NOT EXISTS observation_events (
+            event_id TEXT PRIMARY KEY,
+            stable_identity TEXT,
+            event_digest TEXT NOT NULL,
+            protocol INTEGER NOT NULL,
+            adapter_name TEXT NOT NULL,
+            adapter_version TEXT NOT NULL,
+            installation_id TEXT NOT NULL,
+            host TEXT NOT NULL,
+            surface TEXT NOT NULL,
+            session_id TEXT,
+            turn_id TEXT,
+            native_event_id TEXT,
+            phase TEXT NOT NULL,
+            source_context TEXT NOT NULL,
+            source_epoch INTEGER NOT NULL,
+            suite_id TEXT,
+            task_id TEXT,
+            kind TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            classification_version TEXT NOT NULL,
+            facts_json TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason TEXT,
+            applied_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_conflicts (
+            conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stable_identity TEXT NOT NULL,
+            original_event_id TEXT NOT NULL,
+            incoming_digest TEXT NOT NULL,
+            classification_version TEXT NOT NULL,
+            facts_json TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            reason TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_assessments (
+            task_id TEXT PRIMARY KEY,
+            first_result TEXT NOT NULL,
+            final_result TEXT NOT NULL,
+            assessment_version TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_call_assessments (
+            call_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            first_result TEXT NOT NULL,
+            final_result TEXT NOT NULL,
+            assessment_version TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_tombstones (
+            stable_identity TEXT PRIMARY KEY,
+            source_context TEXT NOT NULL,
+            source_epoch INTEGER NOT NULL,
+            suite_id TEXT,
+            task_id TEXT,
+            deleted_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_deletion_ranges (
+            deletion_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            suite_id TEXT NOT NULL,
+            before_time TEXT,
+            delete_epoch INTEGER NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS observation_source_epochs (
+            source_context TEXT PRIMARY KEY,
+            invalid_before_epoch INTEGER NOT NULL,
+            deleted_at TEXT NOT NULL
+        )""",
+        "CREATE INDEX IF NOT EXISTS observation_events_status_idx ON observation_events(status, event_id)",
+        "CREATE INDEX IF NOT EXISTS observation_events_task_idx ON observation_events(task_id, status)",
+        "CREATE INDEX IF NOT EXISTS observation_events_identity_idx ON observation_events(stable_identity)",
+        """CREATE UNIQUE INDEX IF NOT EXISTS observation_events_stable_identity_unique
+        ON observation_events(stable_identity) WHERE stable_identity IS NOT NULL""",
+    )
+    for statement in statements:
+        database.execute(statement)
+
+
+def _create_managed_runtime_tables(database: sqlite3.Connection) -> None:
+    """Create the protocol-3 managed-runtime ledger.
+
+    Managed records retain only native identifiers, allowlisted metadata, and
+    hashes.  The public snapshot/export protocol intentionally remains v1.
+    """
+
+    statements = (
+        """CREATE TABLE IF NOT EXISTS managed_native_events (
+            event_id TEXT PRIMARY KEY,
+            stable_identity TEXT NOT NULL UNIQUE,
+            payload_digest TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            host TEXT NOT NULL,
+            suite_id TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            tool_use_id TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            received_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            task_id TEXT,
+            call_id TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_native_conflicts (
+            conflict_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            stable_identity TEXT NOT NULL,
+            original_event_id TEXT NOT NULL,
+            incoming_digest TEXT NOT NULL,
+            received_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_contexts (
+            context_key TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            host TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            root_request_id TEXT NOT NULL DEFAULT '',
+            request_digest TEXT NOT NULL,
+            input_skill TEXT NOT NULL DEFAULT '',
+            root_event_id TEXT NOT NULL,
+            root_valid INTEGER NOT NULL,
+            task_id TEXT,
+            intervention INTEGER NOT NULL DEFAULT 0,
+            unknown_change INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(suite_id, host, session_id, generation_id, request_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_receipts (
+            receipt_digest TEXT PRIMARY KEY,
+            native_event_id TEXT NOT NULL UNIQUE,
+            installation_digest TEXT NOT NULL,
+            host TEXT NOT NULL,
+            suite_id TEXT NOT NULL,
+            skill TEXT NOT NULL,
+            action TEXT NOT NULL,
+            command_digest TEXT NOT NULL,
+            operation_digest TEXT NOT NULL DEFAULT '',
+            session_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            tool_use_id TEXT NOT NULL,
+            host_version TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            task_id TEXT,
+            call_id TEXT,
+            consumed_at TEXT,
+            invalidated_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_actions (
+            action_run_id TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            call_id TEXT NOT NULL,
+            action_id TEXT NOT NULL,
+            receipt_digest TEXT NOT NULL UNIQUE,
+            request_digest TEXT NOT NULL,
+            artifact_path TEXT,
+            artifact_digest TEXT,
+            status TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            finished_at TEXT
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_executions (
+            action_run_id TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            pid INTEGER NOT NULL,
+            process_group INTEGER NOT NULL,
+            started_identity TEXT NOT NULL,
+            heartbeat_path TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_publication_counters (
+            task_id TEXT PRIMARY KEY,
+            next_ordinal INTEGER NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_publications (
+            delivery_id TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            call_id TEXT NOT NULL,
+            receipt_digest TEXT NOT NULL UNIQUE,
+            action_run_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL,
+            predecessor_ordinal INTEGER,
+            artifact_digest TEXT NOT NULL,
+            staging_path TEXT NOT NULL,
+            target_path TEXT NOT NULL,
+            checker_json TEXT,
+            status TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            reserved_at TEXT NOT NULL,
+            prepared_at TEXT,
+            supplied_at TEXT,
+            recorded_at TEXT,
+            UNIQUE(task_id, ordinal)
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_publication_intents (
+            delivery_id TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            target_path TEXT NOT NULL,
+            staged_path TEXT NOT NULL,
+            previous_digest TEXT,
+            previous_device INTEGER,
+            previous_inode INTEGER,
+            staged_digest TEXT NOT NULL,
+            staged_device INTEGER NOT NULL,
+            staged_inode INTEGER NOT NULL,
+            target_parent_device INTEGER,
+            target_parent_inode INTEGER,
+            staging_parent_device INTEGER NOT NULL DEFAULT 0,
+            staging_parent_inode INTEGER NOT NULL DEFAULT 0,
+            displaced_path TEXT,
+            state TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_windows (
+            window_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            call_id TEXT NOT NULL,
+            delivery_id TEXT,
+            host TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            tool_use_id TEXT NOT NULL,
+            pre_event_id TEXT NOT NULL,
+            post_event_id TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            closed_at TEXT,
+            UNIQUE(host, session_id, generation_id, tool_use_id, pre_event_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_assessments (
+            task_id TEXT PRIMARY KEY,
+            first_result TEXT NOT NULL,
+            final_result TEXT NOT NULL,
+            evidence_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_suppressions (
+            stable_identity TEXT PRIMARY KEY,
+            suite_id TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_context_suppressions (
+            suite_id TEXT NOT NULL,
+            host TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            generation_id TEXT NOT NULL,
+            request_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(suite_id, host, session_id, generation_id, request_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS managed_native_events_task_idx ON managed_native_events(task_id)",
+        "CREATE INDEX IF NOT EXISTS managed_publications_task_idx ON managed_publications(task_id, ordinal)",
+    )
+    for statement in statements:
+        database.execute(statement)
+    _migrate_managed_context_identity(database)
+    _ensure_column(database, "managed_native_events", "request_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_receipts", "request_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_receipts", "host_version", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_receipts", "operation_digest", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_contexts", "root_request_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_contexts", "input_skill", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_windows", "request_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_windows", "pre_prefix_hash", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_windows", "pre_prefix_length", "INTEGER NOT NULL DEFAULT -1")
+    _ensure_column(database, "managed_executions", "heartbeat_path", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_publication_intents", "target_parent_device", "INTEGER")
+    _ensure_column(database, "managed_publication_intents", "target_parent_inode", "INTEGER")
+    _ensure_column(
+        database,
+        "managed_publication_intents",
+        "staging_parent_device",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _ensure_column(
+        database,
+        "managed_publication_intents",
+        "staging_parent_inode",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+
+
+def _migrate_managed_context_identity(database: sqlite3.Connection) -> None:
+    """Separate native request IDs from a host generation atomically.
+
+    The first protocol-3 draft keyed contexts by generation alone.  A host can
+    issue more than one managed request in a generation, so preserving that
+    layout would merge unrelated requests.  This replacement runs inside
+    :func:`open_database`'s ``BEGIN IMMEDIATE`` transaction before writer
+    triggers are installed.
+    """
+
+    columns = {
+        str(row["name"])
+        for row in database.execute("PRAGMA table_info(managed_contexts)").fetchall()
+    }
+    if "request_id" in columns:
+        return
+    database.execute(
+        """CREATE TABLE managed_contexts_v3 (
+        context_key TEXT PRIMARY KEY,
+        suite_id TEXT NOT NULL,
+        host TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        generation_id TEXT NOT NULL,
+        request_id TEXT NOT NULL,
+        root_request_id TEXT NOT NULL DEFAULT '',
+        request_digest TEXT NOT NULL,
+        input_skill TEXT NOT NULL DEFAULT '',
+        root_event_id TEXT NOT NULL,
+        root_valid INTEGER NOT NULL,
+        task_id TEXT,
+        intervention INTEGER NOT NULL DEFAULT 0,
+        unknown_change INTEGER NOT NULL DEFAULT 0,
+        status TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        UNIQUE(suite_id, host, session_id, generation_id, request_id)
+        )"""
+    )
+    database.execute(
+        """INSERT INTO managed_contexts_v3(
+        context_key, suite_id, host, session_id, generation_id, request_id, root_request_id,
+        request_digest, input_skill, root_event_id, root_valid, task_id, intervention,
+        unknown_change, status, created_at)
+        SELECT context_key, suite_id, host, session_id, generation_id, generation_id, '',
+               request_digest, '', root_event_id, root_valid, task_id, intervention,
+               unknown_change, status, created_at
+        FROM managed_contexts"""
+    )
+    database.execute("DROP TABLE managed_contexts")
+    database.execute("ALTER TABLE managed_contexts_v3 RENAME TO managed_contexts")
+
+
+def _recompute_owned_assessments(database: sqlite3.Connection) -> None:
+    """Restore each managed subject through its durable assessment owner."""
+
+    rows = database.execute(
+        "SELECT task_id FROM tasks WHERE assessment_owner = 'managed-v2'"
+    ).fetchall()
+    if not rows:
+        return
+    from .managed_runtime import reduce_managed_assessment
+
+    for row in rows:
+        reduce_managed_assessment(database, str(row["task_id"]))
+
+
+def _install_writer_protocol_triggers(database: sqlite3.Connection) -> None:
+    protected_tables = (
+        "tasks",
+        "calls",
+        "deliveries",
+        "feedback",
+        "feedback_revisions",
+        "events",
+        "observation_events",
+        "observation_conflicts",
+        "observation_assessments",
+        "observation_call_assessments",
+        "observation_tombstones",
+        "observation_deletion_ranges",
+        "observation_source_epochs",
+        "managed_native_events",
+        "managed_native_conflicts",
+        "managed_contexts",
+        "managed_receipts",
+        "managed_actions",
+        "managed_executions",
+        "managed_publication_counters",
+        "managed_publications",
+        "managed_publication_intents",
+        "managed_windows",
+        "managed_assessments",
+        "managed_suppressions",
+        "managed_context_suppressions",
+    )
+    for table in protected_tables:
+        for operation in ("INSERT", "UPDATE", "DELETE"):
+            trigger_name = f"writer_protocol_{table}_{operation.lower()}"
+            database.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+            database.execute(
+                f"""CREATE TRIGGER {trigger_name}
+                BEFORE {operation} ON {table}
+                WHEN selc_writer_protocol() != {WRITER_PROTOCOL_VERSION}
+                BEGIN
+                    SELECT RAISE(ABORT, 'SELC_WRITER_PROTOCOL_REQUIRED');
+                END"""
+            )
+
+
+def _drop_writer_protocol_triggers(database: sqlite3.Connection) -> None:
+    """Remove only SELC's version guards before an atomic protocol upgrade."""
+
+    rows = database.execute(
+        """SELECT name FROM sqlite_master
+        WHERE type = 'trigger' AND name GLOB 'writer_protocol_*'"""
+    ).fetchall()
+    for row in rows:
+        name = str(row["name"])
+        quoted_name = name.replace('"', '""')
+        database.execute(f'DROP TRIGGER IF EXISTS "{quoted_name}"')
 
 
 def _ensure_column(database: sqlite3.Connection, table: str, column: str, definition: str) -> None:
@@ -254,10 +781,21 @@ def _task(database: sqlite3.Connection, task_id: str) -> sqlite3.Row:
 
 
 def _validate_result(result: str) -> None:
-    if result not in {"pass", "fail", "unknown"}:
+    if not isinstance(result, str) or result not in {"pass", "fail", "unknown"}:
         raise SelcError(
             "INVALID_INPUT", "result must be pass, fail, or unknown", "provide a supported result"
         )
+
+
+@contextmanager
+def _transaction_if_needed(database: sqlite3.Connection) -> Iterable[None]:
+    """Use the caller's projection transaction without committing it early."""
+
+    if database.in_transaction:
+        yield
+        return
+    with database:
+        yield
 
 
 def start_task(
@@ -323,6 +861,12 @@ def set_task_event(
         )
     with database:
         task = _task(database, task_id)
+        if task["assessment_owner"] != "legacy":
+            raise SelcError(
+                "MANAGED_RECORDS_OWNED",
+                "managed-v2 tasks accept events only through the managed runtime",
+                "use the installed managed runtime",
+            )
         if kind == "session_start" and task["status"] != "active":
             raise SelcError(
                 "TASK_CLOSED",
@@ -421,6 +965,12 @@ def complete_call(database: sqlite3.Connection, call_id: str, result: str) -> di
             raise SelcError(
                 "MISSING_CALL", f"call does not exist: {call_id}", "start the call first"
             )
+        if row["assessment_owner"] != "legacy":
+            raise SelcError(
+                "MANAGED_RECORDS_OWNED",
+                "managed-v2 calls are completed by managed publication recovery",
+                "use the installed managed runtime",
+            )
         if row["declared_result"] is not None and row["declared_result"] != result:
             raise SelcError(
                 "ID_CONFLICT",
@@ -457,11 +1007,13 @@ def record_delivery(
     checker_verified: bool = False,
     checker_result: str | None = None,
     checker_identity: dict[str, str] | None = None,
+    sequence: int | None = None,
+    _managed: bool = False,
 ) -> dict[str, Any]:
     _validate_result(declared_result)
     if checker_result is not None:
         _validate_result(checker_result)
-    with database:
+    with _transaction_if_needed(database):
         task = _task(database, task_id)
         if call_id is not None:
             call = database.execute(
@@ -478,6 +1030,18 @@ def record_delivery(
                 "UNTRUSTED_OBSERVATION",
                 "complete observation fixtures are limited to test tasks",
                 "record normal host evidence as unknown or create an isolated test task",
+            )
+        if task["assessment_owner"] != "legacy" and not _managed:
+            raise SelcError(
+                "MANAGED_RECORDS_OWNED",
+                "managed-v2 tasks accept delivery evidence only through the managed runtime",
+                "use the installed managed publish command",
+            )
+        if sequence is not None and (type(sequence) is not int or sequence < 1):
+            raise SelcError(
+                "INVALID_DELIVERY_SEQUENCE",
+                "managed publication sequence must be a positive integer",
+                "reserve the publication before recording it",
             )
         normalized_identity = checker_identity or {}
         identity_keys = {
@@ -528,10 +1092,22 @@ def record_delivery(
             effective = checker_result
         else:
             effective = "unknown"
-        sequence = database.execute(
-            "SELECT COALESCE(MAX(sequence), 0) + 1 FROM deliveries WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()[0]
+        assigned_sequence = sequence
+        if assigned_sequence is None:
+            assigned_sequence = database.execute(
+                "SELECT COALESCE(MAX(sequence), 0) + 1 FROM deliveries WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()[0]
+        occupied = database.execute(
+            "SELECT delivery_id FROM deliveries WHERE task_id = ? AND sequence = ?",
+            (task_id, assigned_sequence),
+        ).fetchone()
+        if occupied is not None:
+            raise SelcError(
+                "DELIVERY_SEQUENCE_CONFLICT",
+                "publication sequence is already assigned to another delivery",
+                "preserve the existing publication order",
+            )
         database.execute(
             """INSERT INTO deliveries(
             delivery_id, task_id, call_id, artifact_hash, rule_version, checker_id,
@@ -556,7 +1132,7 @@ def record_delivery(
                 effective,
                 1,
                 int(complete_fixture),
-                sequence,
+                assigned_sequence,
                 utc_now(),
             ),
         )
@@ -566,9 +1142,191 @@ def record_delivery(
     return {
         "delivery_id": delivery_id,
         "effective_result": effective,
-        "sequence": sequence,
+        "sequence": assigned_sequence,
         "replayed": False,
     }
+
+
+def record_checked_delivery(
+    database: sqlite3.Connection,
+    execution: Any,
+    *,
+    _managed_sequence: int | None = None,
+) -> dict[str, Any]:
+    """Atomically link a completed checker execution to its exact delivery.
+
+    ``execution`` is the internal ``CheckerExecution`` DTO from
+    ``checker_integration``.  Checkers run before this function is called, so
+    a long-running trusted script never holds the SQLite transaction.  Callers
+    that already own ``projection_transaction`` can safely use this helper: it
+    detects the active transaction and leaves commit ownership with the caller.
+    """
+
+    result = getattr(execution, "result", None)
+    check_id = getattr(execution, "check_id", None)
+    installation_digest = getattr(execution, "installation_digest", None)
+    installation_version = getattr(execution, "installation_version", None)
+    subject = getattr(result, "subject", None)
+    checker = getattr(result, "checker", None)
+    if (
+        not isinstance(check_id, str)
+        or not isinstance(installation_digest, str)
+        or not isinstance(installation_version, str)
+        or subject is None
+        or checker is None
+    ):
+        raise SelcError(
+            "INVALID_DELIVERY_CHECK",
+            "checked delivery needs a complete trusted checker execution",
+            "run the installed checker before recording the delivery",
+        )
+    task_id = getattr(subject, "task_id", None)
+    call_id = getattr(subject, "call_id", None)
+    delivery_id = getattr(subject, "delivery_id", None)
+    if not all(isinstance(value, str) and value for value in (task_id, call_id, delivery_id)):
+        raise SelcError(
+            "INVALID_DELIVERY_CHECK",
+            "checker subject must identify task, call, and delivery",
+            "bind the checker to the actual delivery identity",
+        )
+    _validate_result(getattr(result, "status", ""))
+    rule_results = tuple(getattr(result, "rule_results", ()))
+    if not rule_results:
+        raise SelcError(
+            "INVALID_DELIVERY_CHECK",
+            "checker result must include required rule outcomes",
+            "run a declared checker with one or more required rules",
+        )
+
+    checker_identity = {
+        "checker_input_hash": str(getattr(result, "input_digest", "")),
+        "checker_artifact_hash": str(getattr(result, "artifact_digest", "")),
+        "checker_resource_hash": str(getattr(result, "resource_digest", "")),
+        "checker_composite_hash": str(getattr(result, "composite_digest", "")),
+    }
+    with _transaction_if_needed(database):
+        task = _task(database, task_id)
+        call = database.execute(
+            "SELECT task_id, expected_version, expected_hash FROM calls WHERE call_id = ?",
+            (call_id,),
+        ).fetchone()
+        if call is None or call["task_id"] != task_id:
+            raise SelcError(
+                "INVALID_DELIVERY_LINK",
+                "checked delivery call must exist under the same task",
+                "record the managed call before its checked delivery",
+            )
+        if (
+            task["suite_version"] != installation_version
+            or call["expected_version"] != installation_version
+            or call["expected_hash"] != installation_digest
+        ):
+            raise SelcError(
+                "INSTALLATION_IDENTITY_DRIFT",
+                "checker execution does not match the task and call installation identity",
+                "start a new managed call for the selected installation",
+            )
+        delivery = record_delivery(
+            database,
+            delivery_id=delivery_id,
+            task_id=task_id,
+            call_id=call_id,
+            artifact_hash=checker_identity["checker_artifact_hash"],
+            rule_version=str(getattr(result, "rule_version", "")),
+            declared_result=str(getattr(result, "status", "")),
+            complete_fixture=False,
+            checker_id=f"{checker.name}@{checker.version}",
+            checker_verified=True,
+            checker_result=str(getattr(result, "status", "")),
+            checker_identity=checker_identity,
+            sequence=_managed_sequence,
+            _managed=_managed_sequence is not None,
+        )
+        _store_checker_execution(
+            database,
+            execution=execution,
+            task_id=task_id,
+            call_id=call_id,
+            delivery_id=delivery_id,
+            rule_results=rule_results,
+        )
+    return delivery
+
+
+def _store_checker_execution(
+    database: sqlite3.Connection,
+    *,
+    execution: Any,
+    task_id: str,
+    call_id: str,
+    delivery_id: str,
+    rule_results: tuple[Any, ...],
+) -> None:
+    result = execution.result
+    checker = result.checker
+    expected = {
+        "delivery_id": delivery_id,
+        "task_id": task_id,
+        "call_id": call_id,
+        "subject_delivery_id": result.subject.delivery_id,
+        "check_id": execution.check_id,
+        "run_id": result.run_id,
+        "checker_name": checker.name,
+        "checker_version": checker.version,
+        "checker_digest": checker.digest,
+        "rule_version": result.rule_version,
+        "result": result.status,
+        "reason": result.reason,
+        "input_digest": result.input_digest,
+        "artifact_digest": result.artifact_digest,
+        "resource_identity": result.resource_identity,
+        "resource_digest": result.resource_digest,
+        "composite_identity": result.composite_identity,
+        "composite_digest": result.composite_digest,
+        "installation_digest": execution.installation_digest,
+        "installation_version": execution.installation_version,
+    }
+    existing = database.execute(
+        "SELECT * FROM checker_runs WHERE delivery_id = ?", (delivery_id,)
+    ).fetchone()
+    expected_rules = [
+        (str(item.rule_id), str(item.status), str(item.reason)) for item in rule_results
+    ]
+    if len({item[0] for item in expected_rules}) != len(expected_rules):
+        raise SelcError(
+            "INVALID_DELIVERY_CHECK",
+            "checker result repeats a rule id",
+            "keep one result for each required rule",
+        )
+    if existing is not None:
+        existing_rules = [
+            (str(row["rule_id"]), str(row["result"]), str(row["reason"]))
+            for row in database.execute(
+                "SELECT rule_id, result, reason FROM checker_rule_results "
+                "WHERE delivery_id = ? ORDER BY rule_id",
+                (delivery_id,),
+            ).fetchall()
+        ]
+        if all(existing[key] == value for key, value in expected.items()) and sorted(
+            existing_rules
+        ) == sorted(expected_rules):
+            return
+        raise SelcError(
+            "ID_CONFLICT",
+            "delivery already has different checker evidence",
+            "preserve the original checker result and use a new delivery id",
+        )
+    columns = ", ".join(expected)
+    placeholders = ", ".join("?" for _ in expected)
+    database.execute(
+        f"INSERT INTO checker_runs({columns}, created_at) VALUES ({placeholders}, ?)",
+        [*expected.values(), utc_now()],
+    )
+    database.executemany(
+        """INSERT INTO checker_rule_results(delivery_id, rule_id, result, reason)
+        VALUES (?, ?, ?, ?)""",
+        [(delivery_id, rule_id, status, reason) for rule_id, status, reason in expected_rules],
+    )
 
 
 def record_feedback(
@@ -697,6 +1455,347 @@ def close_task(database: sqlite3.Connection, task_id: str) -> dict[str, Any]:
     return {"task_id": task_id, "replayed": False, "result": current, "first_result": first}
 
 
+@contextmanager
+def projection_transaction(database: sqlite3.Connection) -> Iterable[None]:
+    """Run reducer projections without public-method auto-commits.
+
+    Public record functions intentionally retain their single-operation commit
+    behavior.  The observation reducer uses this internal transaction boundary
+    so business projection and an event's consumed state commit together.
+    """
+
+    database.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except Exception:
+        database.rollback()
+        raise
+    else:
+        database.commit()
+
+
+def _project_start_task(
+    database: sqlite3.Connection,
+    *,
+    task_id: str,
+    suite_id: str,
+    suite_version: str,
+    harness: str,
+    initiator: str,
+    evidence: str,
+) -> bool:
+    current = database.execute("SELECT * FROM tasks WHERE task_id = ?", (task_id,)).fetchone()
+    if current is not None:
+        expected = {
+            "suite_id": suite_id,
+            "suite_version": suite_version,
+            "harness": harness,
+            "initiator": initiator,
+            "evidence": evidence,
+            "is_test": 0,
+        }
+        if all(current[key] == value for key, value in expected.items()):
+            return True
+        raise SelcError(
+            "ID_CONFLICT",
+            f"task id already belongs to another task: {task_id}",
+            "preserve the original task and use a new business identity",
+        )
+    database.execute(
+        """INSERT INTO tasks(
+        task_id, suite_id, suite_version, harness, initiator, evidence, is_test,
+        status, created_at, owner_origin)
+        VALUES (?, ?, ?, ?, ?, ?, 0, 'active', ?, ?)""",
+        (
+            task_id,
+            suite_id,
+            suite_version,
+            harness,
+            initiator,
+            evidence,
+            utc_now(),
+            _origin_id(database),
+        ),
+    )
+    return False
+
+
+def _project_task_event(
+    database: sqlite3.Connection, *, task_id: str, kind: str, evidence: str
+) -> None:
+    allowed = {
+        "input_ready",
+        "permission_click",
+        "business_intervention",
+        "session_start",
+        "session_close",
+        "automatic_retry",
+        "interrupted",
+    }
+    if kind not in allowed:
+        raise SelcError("INVALID_EVENT", f"unsupported event: {kind}", "use a supported event")
+    task = _task(database, task_id)
+    database.execute(
+        "INSERT INTO events(task_id, kind, evidence, created_at) VALUES (?, ?, ?, ?)",
+        (task_id, kind, evidence, utc_now()),
+    )
+    if kind == "input_ready":
+        database.execute("UPDATE tasks SET input_ready = 1 WHERE task_id = ?", (task_id,))
+    elif kind == "business_intervention":
+        database.execute("UPDATE tasks SET business_intervention = 1 WHERE task_id = ?", (task_id,))
+    elif kind == "session_start":
+        if task["status"] != "active":
+            raise SelcError(
+                "TASK_CLOSED", "cannot start a session for a closed task", "start a task"
+            )
+        database.execute(
+            """INSERT OR REPLACE INTO sessions(session_id, suite_id, status, evidence, created_at)
+            VALUES (?, ?, 'active', ?, ?)""",
+            (f"session:{task_id}", task["suite_id"], evidence, utc_now()),
+        )
+    elif kind == "session_close":
+        database.execute(
+            "UPDATE sessions SET status = 'closed', closed_at = ? WHERE session_id = ?",
+            (utc_now(), f"session:{task_id}"),
+        )
+    _recompute_task_results(database, task_id)
+
+
+def _project_start_call(
+    database: sqlite3.Connection,
+    *,
+    call_id: str,
+    task_id: str,
+    skill: str,
+    executor: str,
+    evidence: str,
+    expected_version: str,
+    expected_hash: str | None,
+    trigger_kind: str,
+) -> bool:
+    actual_harness = executor if executor in {"codex", "workbuddy"} else "unknown"
+    task = _task(database, task_id)
+    current = database.execute("SELECT * FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+    if current is not None:
+        expected = {
+            "task_id": task_id,
+            "skill": skill,
+            "executor": executor,
+            "actual_harness": actual_harness,
+            "evidence": evidence,
+            "expected_version": expected_version,
+            "expected_hash": expected_hash,
+            "trigger_kind": trigger_kind,
+        }
+        if all(current[key] == value for key, value in expected.items()):
+            return True
+        raise SelcError(
+            "ID_CONFLICT",
+            f"call id already belongs to another call: {call_id}",
+            "preserve the original invocation and use a new native identity",
+        )
+    if task["status"] != "active":
+        raise SelcError("TASK_CLOSED", "cannot start a call for a closed task", "start a new task")
+    database.execute(
+        """INSERT INTO calls(
+        call_id, task_id, skill, executor, actual_harness, evidence, expected_version,
+        expected_hash, trigger_kind, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+        (
+            call_id,
+            task_id,
+            skill,
+            executor,
+            actual_harness,
+            evidence,
+            expected_version,
+            expected_hash,
+            trigger_kind,
+            utc_now(),
+        ),
+    )
+    return False
+
+
+def _project_complete_call(database: sqlite3.Connection, *, call_id: str, result: str) -> None:
+    _validate_result(result)
+    row = database.execute("SELECT * FROM calls WHERE call_id = ?", (call_id,)).fetchone()
+    if row is None:
+        raise SelcError("MISSING_CALL", f"call does not exist: {call_id}", "start the call first")
+    if row["declared_result"] is not None and row["declared_result"] != result:
+        raise SelcError(
+            "ID_CONFLICT",
+            f"call already has result {row['declared_result']}",
+            "create a new retry call",
+        )
+    database.execute(
+        "UPDATE calls SET declared_result = ?, status = 'closed' WHERE call_id = ?",
+        (result, call_id),
+    )
+    _recompute_call_results(database, call_id)
+
+
+def _project_delivery(
+    database: sqlite3.Connection,
+    *,
+    delivery_id: str,
+    task_id: str,
+    call_id: str | None,
+    artifact_hash: str,
+    rule_version: str,
+    checker_id: str,
+    checker_result: str,
+    checker_identity: dict[str, str],
+    sequence: int,
+) -> bool:
+    _validate_result(checker_result)
+    _task(database, task_id)
+    if call_id is not None:
+        call = database.execute(
+            "SELECT task_id FROM calls WHERE call_id = ?", (call_id,)
+        ).fetchone()
+        if call is None or call["task_id"] != task_id:
+            raise SelcError(
+                "INVALID_DELIVERY_LINK",
+                "delivery call must exist under the same task",
+                "start the invocation before recording delivery evidence",
+            )
+    expected = {
+        "task_id": task_id,
+        "call_id": call_id,
+        "artifact_hash": artifact_hash,
+        "rule_version": rule_version,
+        "checker_id": checker_id,
+        "checker_result": checker_result,
+        "checker_input_hash": checker_identity["checker_input_hash"],
+        "checker_artifact_hash": checker_identity["checker_artifact_hash"],
+        "checker_resource_hash": checker_identity["checker_resource_hash"],
+        "checker_composite_hash": checker_identity["checker_composite_hash"],
+        "sequence": sequence,
+    }
+    current = database.execute(
+        "SELECT * FROM deliveries WHERE delivery_id = ?", (delivery_id,)
+    ).fetchone()
+    if current is not None:
+        if all(current[key] == value for key, value in expected.items()):
+            return True
+        raise SelcError(
+            "ID_CONFLICT",
+            f"delivery id already exists: {delivery_id}",
+            "preserve the original publication and use a new identity",
+        )
+    ordinal_conflict = database.execute(
+        "SELECT delivery_id FROM deliveries WHERE task_id = ? AND sequence = ?",
+        (task_id, sequence),
+    ).fetchone()
+    if ordinal_conflict is not None:
+        raise SelcError(
+            "PUBLICATION_CONFLICT",
+            f"publication ordinal {sequence} already belongs to {ordinal_conflict['delivery_id']}",
+            "retain the recorded publication order",
+        )
+    database.execute(
+        """INSERT INTO deliveries(
+        delivery_id, task_id, call_id, artifact_hash, rule_version, checker_id,
+        checker_verified, checker_result, checker_input_hash, checker_artifact_hash,
+        checker_resource_hash, checker_composite_hash, declared_result, effective_result,
+        checker_identity_version, complete_fixture, sequence, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, 1, 0, ?, ?)""",
+        (
+            delivery_id,
+            task_id,
+            call_id,
+            artifact_hash,
+            rule_version,
+            checker_id,
+            checker_result,
+            checker_identity["checker_input_hash"],
+            checker_identity["checker_artifact_hash"],
+            checker_identity["checker_resource_hash"],
+            checker_identity["checker_composite_hash"],
+            checker_result,
+            checker_result,
+            sequence,
+            utc_now(),
+        ),
+    )
+    _recompute_task_results(database, task_id)
+    if call_id is not None:
+        _recompute_call_results(database, call_id)
+    return False
+
+
+def _project_feedback(
+    database: sqlite3.Connection,
+    *,
+    feedback_id: str,
+    task_id: str,
+    delivery_id: str,
+    revision: int,
+    scope: str,
+    result: str,
+    body_hash: str | None,
+) -> bool:
+    _validate_result(result)
+    if scope not in {"first", "final", "requirement_change"}:
+        raise SelcError("INVALID_INPUT", "feedback scope is invalid", "use a supported scope")
+    if revision < 1:
+        raise SelcError("INVALID_INPUT", "feedback revision must be positive", "start at 1")
+    _task(database, task_id)
+    delivery = database.execute(
+        "SELECT call_id FROM deliveries WHERE delivery_id = ? AND task_id = ?",
+        (delivery_id, task_id),
+    ).fetchone()
+    if delivery is None:
+        raise SelcError(
+            "INVALID_FEEDBACK_LINK",
+            "feedback must bind an existing delivery in the same task",
+            "record its publication before feedback",
+        )
+    existing = database.execute(
+        "SELECT * FROM feedback_revisions WHERE feedback_id = ? AND revision = ?",
+        (feedback_id, revision),
+    ).fetchone()
+    if existing is not None:
+        expected = (task_id, delivery_id, scope, result, body_hash)
+        actual = (
+            existing["task_id"],
+            existing["delivery_id"],
+            existing["scope"],
+            existing["result"],
+            existing["body_hash"],
+        )
+        if actual == expected:
+            return True
+        raise SelcError("ID_CONFLICT", "feedback revision has different evidence", "use a new id")
+    latest = database.execute(
+        "SELECT MAX(revision) FROM feedback_revisions WHERE feedback_id = ?", (feedback_id,)
+    ).fetchone()[0]
+    expected_revision = int(latest) + 1 if latest is not None else 1
+    if revision != expected_revision:
+        if revision > expected_revision:
+            raise SelcError(
+                "MISSING_FEEDBACK_REVISION",
+                f"feedback revision {expected_revision} is still pending",
+                "replay after the missing earlier revision arrives",
+            )
+        raise SelcError(
+            "REVISION_CONFLICT",
+            f"expected feedback revision {expected_revision}",
+            "retry with the next revision",
+        )
+    database.execute(
+        """INSERT INTO feedback_revisions(
+        feedback_id, task_id, delivery_id, revision, scope, result, body_hash, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (feedback_id, task_id, delivery_id, revision, scope, result, body_hash, utc_now()),
+    )
+    _recompute_task_results(database, task_id)
+    if delivery["call_id"] is not None:
+        _recompute_call_results(database, delivery["call_id"])
+    return False
+
+
 def _combine_with_feedback(base_result: str, feedback_results: list[str]) -> str:
     """Apply active feedback threads without allowing praise to erase a failure."""
 
@@ -753,6 +1852,20 @@ def _observed_first_result(base_result: str, complete_observation: bool, input_r
 
 def _recompute_task_results(database: sqlite3.Connection, task_id: str) -> None:
     task = _task(database, task_id)
+    if task["assessment_owner"] == "managed-v2":
+        from .managed_runtime import reduce_managed_assessment
+
+        reduce_managed_assessment(database, task_id)
+        return
+    if task["assessment_owner"] != "legacy":
+        return
+    formal = _formal_assessment(database, task_id)
+    if formal is not None:
+        database.execute(
+            "UPDATE tasks SET first_result = ?, current_result = ? WHERE task_id = ?",
+            (formal["first_result"], formal["final_result"], task_id),
+        )
+        return
     deliveries = database.execute(
         """SELECT delivery_id, effective_result, complete_fixture FROM deliveries
         WHERE task_id = ? ORDER BY sequence""",
@@ -782,9 +1895,29 @@ def _recompute_task_results(database: sqlite3.Connection, task_id: str) -> None:
     )
 
 
+def _formal_assessment(database: sqlite3.Connection, task_id: str) -> sqlite3.Row | None:
+    """Return an observation-derived assessment when the v2 table exists."""
+
+    try:
+        return database.execute(
+            """SELECT first_result, final_result FROM observation_assessments
+            WHERE task_id = ?""",
+            (task_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
 def _recompute_call_results(database: sqlite3.Connection, call_id: str) -> None:
     call = database.execute("SELECT * FROM calls WHERE call_id = ?", (call_id,)).fetchone()
     if call is None:
+        return
+    if call["assessment_owner"] == "managed-v2":
+        from .managed_runtime import reduce_managed_assessment
+
+        reduce_managed_assessment(database, str(call["task_id"]))
+        return
+    if call["assessment_owner"] != "legacy":
         return
     if call["status"] != "closed":
         first = "unknown"
@@ -1276,7 +2409,12 @@ def import_snapshot(database: sqlite3.Connection, input_path: Path) -> dict[str,
                     "SELECT 1 FROM suppressions WHERE origin_id = ? AND subject_kind = ? AND subject_id = ?",
                     (origin_id, subject_kind, subject_id),
                 ).fetchone()
-                if suppressed is None:
+                deleted_by_range = _snapshot_in_deleted_range(
+                    database,
+                    str(sample.get("suite_id", "unknown")),
+                    str(sample.get("started_at", "")),
+                )
+                if suppressed is None and not deleted_by_range:
                     database.execute(
                         """INSERT INTO imported_samples(
                         origin_id, subject_kind, subject_id, suite_id, suite_version, harness,
@@ -1314,13 +2452,84 @@ def import_snapshot(database: sqlite3.Connection, input_path: Path) -> dict[str,
     }
 
 
+def _snapshot_in_deleted_range(
+    database: sqlite3.Connection, suite_id: str, started_at: str
+) -> bool:
+    """Keep an old minimal snapshot from restoring a locally deleted sample."""
+
+    try:
+        rows = database.execute(
+            """SELECT suite_id, before_time FROM observation_deletion_ranges
+            WHERE suite_id = ? OR suite_id = '*'""",
+            (suite_id,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+    return any(row["before_time"] is None or started_at < row["before_time"] for row in rows)
+
+
 def delete_records(
     database: sqlite3.Connection,
     *,
     suite_id: str | None,
     before: str | None,
     apply: bool,
+    _locks_held: bool = False,
 ) -> dict[str, Any]:
+    _register_writer_protocol(database)
+    database_file = next(
+        (str(row["file"]) for row in database.execute("PRAGMA database_list") if row["file"]),
+        "",
+    )
+    managed_root = Path(database_file).parent if database_file else None
+    if apply and not _locks_held and managed_root is not None:
+        # Public direct callers must participate in the same registry→suite
+        # exclusion used by managed actions.  A full or time-bounded deletion
+        # discovers every selected suite while it owns the registry lock, then
+        # acquires those suite locks in stable order.  The recursive internal
+        # call keeps the SQL and filesystem deletion closure in one
+        # implementation.
+        from .install import install_root, registry_lock_path
+        from .util import exclusive_lock
+
+        project_root = managed_root.parent
+        try:
+            with ExitStack() as locks:
+                locks.enter_context(exclusive_lock(registry_lock_path(project_root)))
+                filters = []
+                arguments: list[object] = []
+                if suite_id is not None:
+                    filters.append("suite_id = ?")
+                    arguments.append(suite_id)
+                if before is not None:
+                    filters.append("created_at < ?")
+                    arguments.append(before)
+                where = f"WHERE {' AND '.join(filters)}" if filters else ""
+                suite_rows = database.execute(
+                    f"SELECT DISTINCT suite_id FROM tasks {where}", arguments
+                ).fetchall()
+                selected_suites = {str(row["suite_id"]) for row in suite_rows}
+                if suite_id is not None:
+                    selected_suites.add(suite_id)
+                for selected_suite in sorted(selected_suites):
+                    locks.enter_context(
+                        exclusive_lock(install_root(project_root) / selected_suite / ".lock")
+                    )
+                return delete_records(
+                    database,
+                    suite_id=suite_id,
+                    before=before,
+                    apply=apply,
+                    _locks_held=True,
+                )
+        except SelcError as error:
+            if error.code != "LOCKED":
+                raise
+            raise SelcError(
+                "DATABASE_BUSY",
+                "managed execution or deletion already owns this suite",
+                "retry after the active managed operation completes",
+            ) from error
     filters = []
     imported_filters = []
     arguments: list[object] = []
@@ -1335,9 +2544,12 @@ def delete_records(
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
     imported_where = f"WHERE {' AND '.join(imported_filters)}" if imported_filters else ""
 
-    def selection() -> tuple[list[sqlite3.Row], list[sqlite3.Row], dict[str, Any]]:
+    def selection() -> tuple[
+        list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row], dict[str, Any]
+    ]:
         local_rows = database.execute(
-            f"SELECT task_id, owner_origin, status FROM tasks {where}", arguments
+            f"SELECT task_id, owner_origin, status, suite_id, created_at FROM tasks {where}",
+            arguments,
         ).fetchall()
         imported_rows = database.execute(
             f"SELECT origin_id, subject_kind, subject_id FROM imported_samples {imported_where}",
@@ -1348,7 +2560,75 @@ def delete_records(
             "imported_samples": len(imported_rows),
             "apply": apply,
         }
+        observation_filters = []
+        observation_arguments: list[object] = []
+        if suite_id:
+            observation_filters.append("suite_id = ?")
+            observation_arguments.append(suite_id)
+        if before:
+            observation_filters.append("occurred_at < ?")
+            observation_arguments.append(before)
+        observation_where = (
+            f"WHERE {' AND '.join(observation_filters)}" if observation_filters else ""
+        )
+        observation_rows = database.execute(
+            """SELECT event_id, stable_identity, source_context, source_epoch, suite_id, task_id
+            FROM observation_events """
+            + observation_where,
+            observation_arguments,
+        ).fetchall()
+        preview["observations"] = len(observation_rows)
+        managed_filters = []
+        managed_arguments: list[object] = []
+        if suite_id:
+            managed_filters.append("suite_id = ?")
+            managed_arguments.append(suite_id)
+        if before:
+            managed_filters.append("received_at < ?")
+            managed_arguments.append(before)
+        managed_where = f"WHERE {' AND '.join(managed_filters)}" if managed_filters else ""
+        managed_rows = database.execute(
+            """SELECT event_id, stable_identity, suite_id, task_id, host, session_id,
+            generation_id, request_id
+            FROM managed_native_events """
+            + managed_where,
+            managed_arguments,
+        ).fetchall()
         local_task_ids = [str(row["task_id"]) for row in local_rows]
+        if local_task_ids:
+            placeholders = ", ".join("?" for _ in local_task_ids)
+            context_rows = database.execute(
+                f"""SELECT suite_id, host, session_id, generation_id, request_id
+                FROM managed_contexts WHERE task_id IN ({placeholders})""",
+                local_task_ids,
+            ).fetchall()
+            context_clauses = [
+                "task_id IN (" + placeholders + ")",
+            ]
+            context_arguments: list[object] = [*local_task_ids]
+            for context in context_rows:
+                context_clauses.append(
+                    "(suite_id = ? AND host = ? AND session_id = ? AND generation_id = ? AND request_id = ?)"
+                )
+                context_arguments.extend(
+                    [
+                        context["suite_id"],
+                        context["host"],
+                        context["session_id"],
+                        context["generation_id"],
+                        context["request_id"],
+                    ]
+                )
+            closure_rows = database.execute(
+                "SELECT event_id, stable_identity, suite_id, task_id, host, session_id, "
+                "generation_id, request_id FROM managed_native_events WHERE "
+                + " OR ".join(context_clauses),
+                context_arguments,
+            ).fetchall()
+            by_event_id = {str(row["event_id"]): row for row in managed_rows}
+            by_event_id.update({str(row["event_id"]): row for row in closure_rows})
+            managed_rows = list(by_event_id.values())
+        preview["managed_native_events"] = len(managed_rows)
         if local_task_ids:
             placeholders = ", ".join("?" for _ in local_task_ids)
             active_calls = int(
@@ -1373,18 +2653,31 @@ def delete_records(
             "calls": active_calls,
             "sessions": active_sessions,
         }
-        return local_rows, imported_rows, preview
+        return local_rows, imported_rows, observation_rows, managed_rows, preview
 
     if not apply:
-        _, _, preview = selection()
+        _, _, _, _, preview = selection()
         return {"preview": preview}
 
     # A reserved SQLite write transaction closes the direct-API race as well as
     # the CLI path: a concurrent start either finishes before this recheck (and
     # causes ACTIVE_LEASE) or receives a busy error before it can create a session.
+    owned_private_paths: list[str] = []
     with database:
         database.execute("BEGIN IMMEDIATE")
-        local_rows, imported_rows, preview = selection()
+        deletion_boundary = before or utc_now()
+        local_rows, imported_rows, observation_rows, managed_rows, preview = selection()
+        from .execution_lease import assert_no_live_execution
+
+        task_ids_by_suite: dict[str, list[str]] = {}
+        for row in local_rows:
+            task_ids_by_suite.setdefault(str(row["suite_id"]), []).append(str(row["task_id"]))
+        for selected_suite in sorted(task_ids_by_suite):
+            assert_no_live_execution(
+                database,
+                selected_suite,
+                task_ids=task_ids_by_suite[selected_suite],
+            )
         active_leases = preview["active_leases"]
         if any(int(count) for count in active_leases.values()):
             raise SelcError(
@@ -1392,7 +2685,129 @@ def delete_records(
                 "cannot delete records that still own active tasks, calls, or sessions",
                 "close the active task, call, and session explicitly before applying deletion",
             )
+        deleted_suite = suite_id or "*"
+        deleted_epoch = int(
+            database.execute(
+                "SELECT COALESCE(MAX(delete_epoch), 0) + 1 FROM observation_deletion_ranges"
+            ).fetchone()[0]
+        )
+        database.execute(
+            """INSERT INTO observation_deletion_ranges(
+            suite_id, before_time, delete_epoch, created_at) VALUES (?, ?, ?, ?)""",
+            (deleted_suite, deletion_boundary, deleted_epoch, utc_now()),
+        )
+        for observation in observation_rows:
+            stable_identity = observation["stable_identity"]
+            if stable_identity is not None:
+                database.execute(
+                    """INSERT OR REPLACE INTO observation_tombstones(
+                    stable_identity, source_context, source_epoch, suite_id, task_id, deleted_at)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    (
+                        stable_identity,
+                        observation["source_context"],
+                        observation["source_epoch"],
+                        observation["suite_id"],
+                        observation["task_id"],
+                        utc_now(),
+                    ),
+                )
+            database.execute(
+                """INSERT INTO observation_source_epochs(
+                source_context, invalid_before_epoch, deleted_at) VALUES (?, ?, ?)
+                ON CONFLICT(source_context) DO UPDATE SET
+                  invalid_before_epoch = MAX(
+                    observation_source_epochs.invalid_before_epoch,
+                    excluded.invalid_before_epoch
+                  ),
+                  deleted_at = excluded.deleted_at""",
+                (observation["source_context"], observation["source_epoch"], utc_now()),
+            )
+            database.execute(
+                "DELETE FROM observation_conflicts WHERE original_event_id = ?",
+                (observation["event_id"],),
+            )
+            database.execute(
+                "DELETE FROM observation_events WHERE event_id = ?", (observation["event_id"],)
+            )
+        for managed_event in managed_rows:
+            database.execute(
+                """INSERT OR IGNORE INTO managed_suppressions(
+                stable_identity, suite_id, created_at) VALUES (?, ?, ?)""",
+                (managed_event["stable_identity"], managed_event["suite_id"], utc_now()),
+            )
+            database.execute(
+                """INSERT OR IGNORE INTO managed_context_suppressions(
+                suite_id, host, session_id, generation_id, request_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    managed_event["suite_id"],
+                    managed_event["host"],
+                    managed_event["session_id"],
+                    managed_event["generation_id"],
+                    managed_event["request_id"],
+                    utc_now(),
+                ),
+            )
+            database.execute(
+                "DELETE FROM managed_native_conflicts WHERE original_event_id = ?",
+                (managed_event["event_id"],),
+            )
+            database.execute(
+                "DELETE FROM managed_receipts WHERE native_event_id = ?",
+                (managed_event["event_id"],),
+            )
+            database.execute(
+                "DELETE FROM managed_native_events WHERE event_id = ?",
+                (managed_event["event_id"],),
+            )
         for row in local_rows:
+            # An interrupted exchange can leave a user object in private
+            # staging.  Preserve or prove that object before deletion removes
+            # the directory; a failed preservation intentionally aborts this
+            # deletion and retains both the intent and original bytes.
+            from .managed_runtime import _recover_interrupted_publication_staging
+
+            interrupted = database.execute(
+                """SELECT delivery_id FROM managed_publication_intents
+                WHERE task_id = ? AND state != 'recorded'""",
+                (row["task_id"],),
+            ).fetchall()
+            for intent in interrupted:
+                _recover_interrupted_publication_staging(database, str(intent["delivery_id"]))
+            private_rows = database.execute(
+                """SELECT artifact_path AS path FROM managed_actions WHERE task_id = ?
+                UNION ALL
+                SELECT staging_path AS path FROM managed_publications WHERE task_id = ?
+                UNION ALL
+                SELECT staged_path AS path FROM managed_publication_intents WHERE task_id = ?""",
+                (row["task_id"], row["task_id"], row["task_id"]),
+            ).fetchall()
+            for private_row in private_rows:
+                raw_path = private_row["path"]
+                if not raw_path:
+                    continue
+                candidate = Path(str(raw_path))
+                if "managed-staging" in candidate.parts:
+                    owned_private_paths.append(str(candidate.parent))
+                else:
+                    owned_private_paths.append(str(candidate))
+            if managed_root is not None:
+                action_rows = database.execute(
+                    "SELECT action_run_id FROM managed_actions WHERE task_id = ?",
+                    (row["task_id"],),
+                ).fetchall()
+                for action in action_rows:
+                    action_run_id = str(action["action_run_id"])
+                    if action_run_id.startswith("managed-action-"):
+                        owned_private_paths.append(
+                            str(
+                                managed_root
+                                / "managed-staging"
+                                / str(row["suite_id"])
+                                / action_run_id
+                            )
+                        )
             database.execute(
                 "INSERT OR IGNORE INTO suppressions(origin_id, subject_kind, subject_id, created_at) VALUES (?, 'task', ?, ?)",
                 (row["owner_origin"], row["task_id"], utc_now()),
@@ -1411,6 +2826,32 @@ def delete_records(
                 )
             database.execute("DELETE FROM calls WHERE task_id = ?", (row["task_id"],))
             database.execute("DELETE FROM events WHERE task_id = ?", (row["task_id"],))
+            database.execute(
+                "DELETE FROM observation_assessments WHERE task_id = ?", (row["task_id"],)
+            )
+            database.execute(
+                "DELETE FROM observation_call_assessments WHERE task_id = ?", (row["task_id"],)
+            )
+            database.execute("DELETE FROM managed_assessments WHERE task_id = ?", (row["task_id"],))
+            database.execute("DELETE FROM managed_windows WHERE task_id = ?", (row["task_id"],))
+            database.execute(
+                """DELETE FROM managed_executions
+                WHERE action_run_id IN (
+                    SELECT action_run_id FROM managed_actions WHERE task_id = ?
+                )""",
+                (row["task_id"],),
+            )
+            database.execute(
+                "DELETE FROM managed_publications WHERE task_id = ?", (row["task_id"],)
+            )
+            database.execute(
+                "DELETE FROM managed_publication_intents WHERE task_id = ?", (row["task_id"],)
+            )
+            database.execute(
+                "DELETE FROM managed_publication_counters WHERE task_id = ?", (row["task_id"],)
+            )
+            database.execute("DELETE FROM managed_actions WHERE task_id = ?", (row["task_id"],))
+            database.execute("DELETE FROM managed_contexts WHERE task_id = ?", (row["task_id"],))
             database.execute("DELETE FROM tasks WHERE task_id = ?", (row["task_id"],))
         for row in imported_rows:
             database.execute(
@@ -1419,7 +2860,43 @@ def delete_records(
             )
         database.execute(f"DELETE FROM imported_samples {imported_where}", arguments)
         _bump_snapshot_revision(database)
+    _remove_owned_managed_private_paths(database, owned_private_paths)
     return {"deleted": preview}
+
+
+def _remove_owned_managed_private_paths(
+    database: sqlite3.Connection, candidates: list[str]
+) -> None:
+    """Remove only runtime-private copies after the durable deletion commits."""
+
+    database_file = next(
+        (str(row["file"]) for row in database.execute("PRAGMA database_list") if row["file"]),
+        "",
+    )
+    if not database_file:
+        return
+    selc_root = Path(database_file).parent
+    allowed_roots = (selc_root / "managed-staging", selc_root / "managed-publications")
+    for raw_path in candidates:
+        candidate = Path(raw_path)
+        try:
+            resolved = candidate.resolve(strict=False)
+            allowed_root = next(
+                root for root in allowed_roots if resolved.is_relative_to(root.resolve())
+            )
+        except (OSError, StopIteration):
+            continue
+        if resolved.is_dir():
+            shutil.rmtree(resolved, ignore_errors=True)
+        else:
+            resolved.unlink(missing_ok=True)
+        parent = resolved.parent
+        while parent != allowed_root.parent and parent != allowed_root:
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
 
 
 def _bump_snapshot_revision(database: sqlite3.Connection) -> int:

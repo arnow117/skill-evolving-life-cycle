@@ -28,6 +28,14 @@ FRONTMATTER_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 RUNTIME_PROTOCOL = 1
 SOURCE_BASELINE_NAME = "source-baseline.json"
 ASCII_SPACE = " "
+MAX_ARTIFACT_CHECKS = 64
+MAX_ARTIFACT_CHECK_CONFIGURATION_BYTES = 16_384
+MAX_ARTIFACT_CHECK_RULES = 64
+MAX_ARTIFACT_CHECK_IDENTIFIER_BYTES = 256
+MANAGED_PROTOCOL = 1
+MANAGED_ACTION_TYPES = {"boolean", "integer", "path", "string"}
+MANAGED_ACTION_KINDS = {"text-report-v1", "python-script-v1", "instruction-staging-v1"}
+MANAGED_HOSTS = {"codex", "workbuddy"}
 
 
 def manifest_path(suite_root: Path) -> Path:
@@ -287,6 +295,402 @@ def validate_manifest(manifest: dict[str, Any], suite_root: Path) -> None:
     if not isinstance(skills, list) or not skills:
         raise SelcError("INVALID_MANIFEST", "skills must contain at least one skill", "add a skill")
     validate_declared_skills(suite_root, skills)
+    artifact_checks = normalize_artifact_checks(manifest.get("artifact_checks"))
+    validate_skill_artifact_check_references(skills, artifact_checks)
+    managed_configuration(manifest, suite_root)
+    managed_host_versions(manifest)
+
+
+def managed_configuration(manifest: dict[str, Any], suite_root: Path) -> dict[str, dict[str, Any]]:
+    """Validate optional protocol-1 managed actions without altering manifest bytes."""
+
+    managed = manifest.get("managed")
+    if managed is None:
+        return {}
+    if not isinstance(managed, dict) or managed.get("protocol") != MANAGED_PROTOCOL:
+        raise SelcError(
+            "INVALID_MANAGED_PROTOCOL",
+            "managed configuration must declare protocol 1",
+            "use a supported managed protocol or remove the optional configuration",
+        )
+    actions = managed.get("actions")
+    if not isinstance(actions, dict) or not actions:
+        raise SelcError(
+            "INVALID_MANAGED_ACTION",
+            "managed actions must be a non-empty object",
+            "declare one fixed managed action",
+        )
+    declared_skills = {str(skill["name"]) for skill in manifest["skills"] if isinstance(skill, dict)}
+    normalized: dict[str, dict[str, Any]] = {}
+    for action_id, raw_action in actions.items():
+        if not isinstance(action_id, str) or not NAME.fullmatch(action_id):
+            raise SelcError(
+                "INVALID_MANAGED_ACTION",
+                "managed action ids must be lowercase kebab-case",
+                "choose a bounded action id",
+            )
+        if not isinstance(raw_action, dict):
+            raise SelcError(
+                "INVALID_MANAGED_ACTION",
+                f"managed action {action_id} must be an object",
+                "declare a fixed script, skill, kind, and input schema",
+            )
+        required = {"skill", "kind", "input"}
+        if raw_action.get("kind") != "instruction-staging-v1":
+            required.add("script")
+        if required.difference(raw_action):
+            raise SelcError(
+                "INVALID_MANAGED_ACTION",
+                f"managed action {action_id} is incomplete",
+                "declare skill, kind, script, and input",
+            )
+        skill = raw_action["skill"]
+        kind = raw_action["kind"]
+        script = raw_action.get("script")
+        if not isinstance(skill, str) or skill not in declared_skills:
+            raise SelcError(
+                "INVALID_MANAGED_ACTION",
+                f"managed action {action_id} names an undeclared skill",
+                "bind the action to a declared skill",
+            )
+        if kind not in MANAGED_ACTION_KINDS:
+            raise SelcError(
+                "INVALID_MANAGED_ACTION",
+                f"managed action {action_id} has an unsupported fixed kind",
+                "use a runtime-supported fixed action kind",
+            )
+        if kind == "instruction-staging-v1":
+            if script is not None:
+                raise SelcError(
+                    "INVALID_MANAGED_ACTION",
+                    f"managed action {action_id} instruction staging cannot supply a script",
+                    "let the declared skill stage its private artifact bytes",
+                )
+            script_path = None
+        elif not isinstance(script, str):
+            raise SelcError(
+                "INVALID_MANAGED_ACTION",
+                f"managed action {action_id} script must be a relative file",
+                "select an installed fixed Python script",
+            )
+        else:
+            script_path = require_relative_path(script)
+        if script_path is not None and not (suite_root / script_path).is_file():
+            raise SelcError(
+                "INVALID_MANAGED_ACTION",
+                f"managed action {action_id} script is not installed",
+                "package the declared fixed script with the suite",
+            )
+        input_schema = _normalize_managed_input_schema(
+            raw_action["input"],
+            action_id,
+            allow_empty=kind == "instruction-staging-v1",
+        )
+        normalized[action_id] = {
+            "skill": skill,
+            "kind": kind,
+            "script": script_path.as_posix() if script_path is not None else None,
+            "input": input_schema,
+        }
+    return normalized
+
+
+def managed_host_versions(manifest: dict[str, Any]) -> dict[str, frozenset[str]]:
+    """Return the immutable native host versions allowed by a managed suite.
+
+    A direct environment binding proves that a callback carried identity data;
+    it does not make every host build safe to activate.  Production callers use
+    this explicit, manifest-owned allowlist before supplying an original skill
+    body.  Fixture callbacks remain local-test-only in the runtime and do not
+    add a host version here.
+    """
+
+    managed = manifest.get("managed")
+    if managed is None:
+        return {}
+    if not isinstance(managed, dict) or managed.get("protocol") != MANAGED_PROTOCOL:
+        raise SelcError(
+            "INVALID_MANAGED_PROTOCOL",
+            "managed configuration must declare protocol 1",
+            "use a supported managed protocol or remove the optional configuration",
+        )
+    raw_hosts = managed.get("native_hosts", {})
+    if not isinstance(raw_hosts, dict) or set(raw_hosts).difference(MANAGED_HOSTS):
+        raise SelcError(
+            "INVALID_MANAGED_HOST",
+            "managed native_hosts must name only codex or workbuddy",
+            "declare explicit native host version allowlists",
+        )
+    normalized: dict[str, frozenset[str]] = {}
+    for host, versions in raw_hosts.items():
+        if not isinstance(versions, list) or not versions or len(versions) > 32:
+            raise SelcError(
+                "INVALID_MANAGED_HOST",
+                f"managed native host {host} needs one or more versions",
+                "declare a bounded version allowlist",
+            )
+        if (
+            any(
+                not isinstance(version, str)
+                or not version
+                or len(version.encode("utf-8")) > 128
+                for version in versions
+            )
+            or len(set(versions)) != len(versions)
+        ):
+            raise SelcError(
+                "INVALID_MANAGED_HOST",
+                f"managed native host {host} has invalid versions",
+                "use unique bounded version strings",
+            )
+        normalized[host] = frozenset(versions)
+    return normalized
+
+
+def _normalize_managed_input_schema(
+    value: object,
+    action_id: str,
+    *,
+    allow_empty: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value).difference({"fields", "required"}):
+        raise SelcError(
+            "INVALID_MANAGED_ACTION",
+            f"managed action {action_id} input must contain only fields and required",
+            "use the limited protocol-1 object schema",
+        )
+    fields = value.get("fields")
+    required = value.get("required")
+    if (
+        not isinstance(fields, dict)
+        or (not fields and not allow_empty)
+        or len(fields) > 16
+    ):
+        raise SelcError(
+            "INVALID_MANAGED_ACTION",
+            f"managed action {action_id} input fields are invalid",
+            "declare at most 16 bounded fields",
+        )
+    if not isinstance(required, list) or any(not isinstance(item, str) for item in required):
+        raise SelcError(
+            "INVALID_MANAGED_ACTION",
+            f"managed action {action_id} required fields are invalid",
+            "list declared required fields",
+        )
+    if len(required) != len(set(required)) or not set(required).issubset(fields):
+        raise SelcError(
+            "INVALID_MANAGED_ACTION",
+            f"managed action {action_id} required fields must be declared once",
+            "repair the input schema",
+        )
+    normalized_fields: dict[str, dict[str, Any]] = {}
+    for name, descriptor in fields.items():
+        if not isinstance(name, str) or not NAME.fullmatch(name.replace("_", "-")):
+            raise SelcError(
+                "INVALID_MANAGED_ACTION",
+                f"managed action {action_id} has an invalid input field",
+                "use bounded identifier field names",
+            )
+        if not isinstance(descriptor, dict) or set(descriptor).difference({"type", "enum"}):
+            raise SelcError(
+                "INVALID_MANAGED_ACTION",
+                f"managed action {action_id} field {name} is invalid",
+                "use a type and optional enum",
+            )
+        field_type = descriptor.get("type")
+        if field_type not in MANAGED_ACTION_TYPES:
+            raise SelcError(
+                "INVALID_MANAGED_ACTION",
+                f"managed action {action_id} field {name} has an unsupported type",
+                "use a protocol-1 scalar or path type",
+            )
+        enum = descriptor.get("enum")
+        if enum is not None:
+            if not isinstance(enum, list) or not enum or len(enum) > 64:
+                raise SelcError(
+                    "INVALID_MANAGED_ACTION",
+                    f"managed action {action_id} field {name} enum is invalid",
+                    "use a non-empty bounded enum",
+                )
+        normalized_fields[name] = {"type": field_type, **({"enum": list(enum)} if enum else {})}
+    return {"fields": normalized_fields, "required": list(required)}
+
+
+def normalize_artifact_checks(value: object) -> dict[str, dict[str, Any]]:
+    """Validate optional protocol-1 artifact-check declarations.
+
+    Declarations select an already trusted checker identity and its business
+    rules. They deliberately contain no executable paths, argv values, or
+    environment settings. A project-local maintainer registry is responsible
+    for any external implementation selected at runtime.
+    """
+
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise SelcError(
+            "INVALID_MANIFEST",
+            "artifact_checks must be an object keyed by check id",
+            "declare each artifact check as an object",
+        )
+    if len(value) > MAX_ARTIFACT_CHECKS:
+        raise SelcError(
+            "INVALID_MANIFEST",
+            "artifact_checks exceeds the supported check limit",
+            "split the suite or keep at most 64 checks",
+        )
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for check_id, raw_declaration in value.items():
+        if not isinstance(check_id, str) or not NAME.fullmatch(check_id):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                "artifact check ids must be unique lowercase kebab-case identifiers",
+                "repair the artifact_checks keys",
+            )
+        if not isinstance(raw_declaration, dict):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} must be an object",
+                "repair the check declaration",
+            )
+        allowed = {
+            "checker",
+            "rule_version",
+            "required_rule_ids",
+            "configuration",
+            "require_network_isolation",
+        }
+        unexpected = set(raw_declaration).difference(allowed)
+        if unexpected:
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} has unsupported fields: {', '.join(sorted(unexpected))}",
+                "keep executable registration outside suite.json",
+            )
+
+        checker = raw_declaration.get("checker")
+        if not isinstance(checker, dict) or set(checker).difference({"name", "version", "digest"}):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} needs checker name and version",
+                "repair the checker declaration",
+            )
+        checker_name = checker.get("name")
+        checker_version = checker.get("version")
+        if not _bounded_artifact_check_string(checker_name) or not _bounded_artifact_check_string(
+            checker_version
+        ):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} checker name and version must be bounded strings",
+                "repair the checker declaration",
+            )
+        checker_digest = checker.get("digest")
+        if checker_digest is not None and not _artifact_check_digest(checker_digest):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} checker digest must be SHA-256 hex",
+                "omit it or use the trusted implementation digest",
+            )
+
+        rule_version = raw_declaration.get("rule_version")
+        if not _bounded_artifact_check_string(rule_version):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} rule_version must be a bounded string",
+                "set the rule version",
+            )
+        required_rule_ids = raw_declaration.get("required_rule_ids")
+        if (
+            not isinstance(required_rule_ids, list)
+            or not required_rule_ids
+            or len(required_rule_ids) > MAX_ARTIFACT_CHECK_RULES
+            or any(not _bounded_artifact_check_string(item) for item in required_rule_ids)
+            or len(set(required_rule_ids)) != len(required_rule_ids)
+        ):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} required_rule_ids must be unique bounded strings",
+                "declare one or more unique required rules",
+            )
+        configuration = raw_declaration.get("configuration")
+        if not isinstance(configuration, dict):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} configuration must be an object",
+                "use an object with JSON-compatible values",
+            )
+        try:
+            configuration_bytes = canonical_json(configuration).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} configuration is not JSON-compatible",
+                "use JSON-compatible configuration values",
+            ) from error
+        if len(configuration_bytes) > MAX_ARTIFACT_CHECK_CONFIGURATION_BYTES:
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} configuration exceeds the size limit",
+                "keep configuration at or below 16384 bytes",
+            )
+        require_network_isolation = raw_declaration.get("require_network_isolation", False)
+        if not isinstance(require_network_isolation, bool):
+            raise SelcError(
+                "INVALID_MANIFEST",
+                f"artifact check {check_id} require_network_isolation must be boolean",
+                "use true or false",
+            )
+        normalized[check_id] = {
+            "checker": {
+                "name": checker_name,
+                "version": checker_version,
+                **({"digest": checker_digest} if checker_digest is not None else {}),
+            },
+            "rule_version": rule_version,
+            "required_rule_ids": list(required_rule_ids),
+            "configuration": dict(configuration),
+            "require_network_isolation": require_network_isolation,
+        }
+    return normalized
+
+
+def validate_skill_artifact_check_references(
+    skills: list[Any], artifact_checks: dict[str, dict[str, Any]]
+) -> None:
+    """Ensure an optional skill ``artifact_check`` points to a declared check."""
+
+    for skill in skills:
+        if not isinstance(skill, dict):
+            continue
+        reference = skill.get("artifact_check")
+        if reference is None:
+            continue
+        if not isinstance(reference, str) or reference not in artifact_checks:
+            raise SelcError(
+                "INVALID_MANIFEST",
+                "skill artifact_check must name a declared artifact check",
+                "declare the check in artifact_checks or remove the reference",
+            )
+
+
+def _bounded_artifact_check_string(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and len(value.encode("utf-8")) <= MAX_ARTIFACT_CHECK_IDENTIFIER_BYTES
+    )
+
+
+def _artifact_check_digest(value: object) -> bool:
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    try:
+        int(value, 16)
+    except ValueError:
+        return False
+    return True
 
 
 def normalize_declared_skills(skills: list[Any]) -> list[dict[str, str]]:
@@ -742,23 +1146,11 @@ def create_suite(suite_id: str, version: str, output: Path, skills: list[str]) -
             f"description: {skill} from the {suite_id} suite.\n"
             "---\n\n"
             f"# {skill}\n\n"
-            "Use this installed suite through its own `bin/selc-suite.py` wrapper. Read "
-            "`../../MAINTENANCE.md` before changing a skill or declared resource.\n\n"
-            "For an actual selected execution, first start or reuse the business task, then record "
-            "the selected skill call with the installed version and digest returned by `install`:\n\n"
-            "```bash\n"
-            "# Set SELC_PYTHON to a Python 3.11+ interpreter.\n"
-            "$SELC_PYTHON ../../bin/selc-suite.py task start --project-root <project-root> "
-            "--id <task-id> --suite-id <suite-id> --initiator <initiator> --evidence <evidence>\n"
-            "$SELC_PYTHON ../../bin/selc-suite.py call start --project-root <project-root> "
-            f"--id <call-id> --task-id <task-id> --skill {skill} --executor <executor> "
-            "--evidence <evidence> --expected-version <installed-version> "
-            "--expected-hash <installed-digest>\n"
-            "```\n\n"
-            "Run the declared business command, record its checked artifact with `delivery`, then "
-            "finish the call and task. Scanning, discovery, or merely opening this skill is not a "
-            "selected execution and must not create a task or call record. The `text-report` entry "
-            "uses `$SELC_PYTHON ../../bin/selc-suite.py run text-report --input <input> --output <report>`.\n",
+            "This original skill body is supplied only after the installed managed runtime verifies "
+            "the current native activation. Discovery or scanning creates no lifecycle record. "
+            "Use the managed action declared by this suite; it automatically records the task, "
+            "invocation, checked publication, and timeline without task, call, event, or delivery "
+            "commands. Read `../../MAINTENANCE.md` before changing a skill or declared resource.\n",
             encoding="utf-8",
         )
         skill_entries.append({"name": skill, "path": f"skills/{skill}"})
@@ -776,6 +1168,21 @@ def create_suite(suite_id: str, version: str, output: Path, skills: list[str]) -
         "skills": skill_entries,
         "source": {"kind": "created", "repo": None, "subdir": ".", "commit": None, "base": None},
     }
+    if "text-report" in skills:
+        manifest["managed"] = {
+            "protocol": MANAGED_PROTOCOL,
+            "actions": {
+                "text-report": {
+                    "skill": "text-report",
+                    "kind": "text-report-v1",
+                    "script": "bin/selc-suite.py",
+                    "input": {
+                        "fields": {"input": {"type": "path"}},
+                        "required": ["input"],
+                    },
+                }
+            },
+        }
     write_json(manifest_path(output), manifest)
     _copy_portable_runtime(output)
     _write_portable_files(output)
@@ -845,10 +1252,10 @@ def _write_portable_files(output: Path) -> None:
         "`$SELC_PYTHON bin/selc-suite.py evolve prepare --suite . --output <candidate-parent>`, then edit "
         "only the resulting candidate `skills/` and declared `resources/` files. Evaluate it before "
         "contribution, and use `contribute prepare` with the project root and suite id so the saved "
-        "source baseline is restored. Keep `runtime/` intact. Record only selected, executed skills "
-        "with `task start`, `call start`, `delivery`, and completion commands through "
-        "`bin/selc-suite.py`; discovery never creates lifecycle evidence. This suite works from Codex "
-        "and WorkBuddy installation directories without a full SELC checkout.\n",
+        "source baseline is restored. Keep `runtime/` intact. Installed managed actions record selected "
+        "executions automatically; discovery never creates lifecycle evidence. Legacy record commands "
+        "remain diagnostics for legacy subjects and cannot modify managed-v2 tasks. This suite works "
+        "from Codex and WorkBuddy installation directories without a full SELC checkout.\n",
         encoding="utf-8",
     )
 

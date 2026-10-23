@@ -2,9 +2,13 @@
 
 SELC creates and maintains a versioned suite of skills, then records task and invocation outcomes locally. The authoring skill at `.claude/skills/selc/` is for Codex. A generated suite installs into Codex and WorkBuddy without requiring this repository, a global `selc` command, or Codex at the WorkBuddy installation site.
 
+The `codex/auto-observation` branch is a development preview. Local creation, sealing, packaging, and installation have regression coverage; arbitrary skill generation still needs the managed action and checker declarations described below. Automatic observation and full Codex/WorkBuddy desktop use have not completed acceptance, and there is no formal public Release yet. The authoring skill and end-to-end creation, contribution, publishing, and upgrade workflow are being updated for managed execution. Use this branch for authoring previews until that acceptance is recorded. Legacy record commands in US-003 are evidence/debugging interfaces, not steps required from an ordinary skill user.
+
+Development evidence as of 2026-10-23 includes one synthetic managed business delivery through the public Codex CLI `0.163.0-alpha.10.2`: task and call recording, action execution, publication, and the independent artifact check ran automatically, with a final result of `pass`. Its one-shot result remains `unknown`; this single CLI run does not establish desktop support, native discovery completeness, or the full lifecycle. Current acceptance details and remaining work are tracked in `.sdlc-v1/context/F-002.engineering.md`.
+
 `scripts/selc.py` is the only global usage entrypoint. Its argparse schema is authoritative; use `selc --help` or `selc <command> --help` for the current parameter list. Runtime dependencies are Python 3.11+ and the standard library. `uv` manages the independent command environment; no dependency is installed implicitly.
 
-This v0.1 validates local filesystem, SQLite, local Git, a local release center, and controlled fake GitHub/GitLab clients. It does not claim tested Codex or WorkBuddy desktop hooks, real GitHub/GitLab credentials, real remote mutation, or real model calls. AiTaxs is not included in this repository or example.
+The original v0.1 regression suite validates local filesystem, SQLite, local Git, a local release center, and controlled fake GitHub/GitLab clients. Those tests do not establish Codex or WorkBuddy desktop support, real remote mutation, or real model execution; the development evidence above is tracked separately. AiTaxs is not included in this repository or example.
 
 ## Common setup
 
@@ -86,6 +90,41 @@ selc stats --project-root /tmp/selc-project --include-test
 ```
 
 Reports keep independent task and call denominators. Each axis exposes `N`, `S`, `K`, `U`, success lower bound `S_over_N`, known-result success `S_over_K`, and coverage `K_over_N`; zero denominators are `null`. First one-shot and final delivery stay separate. Necessary input and permission clicks are recorded with `event`; a `business_intervention` makes one-shot fail while final delivery can still be separately assessed. Ordinary self-report results are `unknown`; `--complete-observation-fixture` is rejected outside a test task. A trusted business check can establish final artifact success, but first one-shot remains `unknown` until a test fixture or a complete trusted host observation exists. A business intervention makes the task first result fail without copying that result to unrelated calls. A hard delivery failure stays failed. Feedback binds the original delivery requirement: legacy `first` and `final` scopes both refute that delivery, so a negative assessment changes its first and final outcome; a new passing remedial delivery can restore only the final outcome. A higher revision of the same feedback ID supersedes that feedback thread, while independent negative feedback remains effective. `requirement_change` records a later requirement without rewriting the original delivery. For a normal text report, `--checker text-report-v1 --rule-version text-report-v1 --input <input> --output <report>` performs the built-in, installed-resource check and binds the reported artifact hash; an arbitrary checker name does not prove success.
+
+## US-003A — Diagnose a declared artifact check
+
+An optional schema-1 `suite.json` `artifact_checks` object declares a fixed checker identity, rule version, required rule IDs, JSON configuration, and an optional OS-network-isolation requirement. A skill entry can name one declaration with `artifact_check`. Declarations contain no executable path, argv, or environment values. A missing declaration, unsupported rule, installed-byte drift, source change, unavailable checker, or manifest digest pin mismatch cannot produce a pass.
+
+```bash
+selc check --project-root /tmp/selc-project --suite simple-reports \
+  --check-id item-summary --input /tmp/items.json --artifact /tmp/summary.json
+```
+
+`check` reads fixed input and artifact bytes, runs the selected installed framework's trusted checker, then confirms that those source paths and the installed typed tree did not change. Its JSON result binds the active installation version and typed-tree digest separately from the checker's composite-byte digest, and includes the checker identity, input/artifact/resource digests, and each required rule result. It is diagnostic only: it creates no task, call, delivery, publication, or statistics denominator. A managed adapter can later attach the same internal result to its exact task/call/delivery with one short records transaction after execution.
+
+The built-in `json-item-summary@1` verifies JSON `items` against an artifact `count` and `sum` using exact decimal semantics. For a maintainer-owned extension, register a current digest-pinned local script in the project before any suite declaration selects it:
+
+```bash
+SCRIPT_DIGEST=$(shasum -a 256 /tmp/maintainer-checker.py | awk '{print $1}')
+selc checker register-script --project-root /tmp/selc-project \
+  --name custom-summary --version 1 --script /tmp/maintainer-checker.py \
+  --digest "$SCRIPT_DIGEST" --rule custom
+selc checker inspect --project-root /tmp/selc-project
+```
+
+The project registry is explicit and local; it does not accept a business request's executable, environment, or command line. The runtime verifies the script digest before starting a private snapshot. Script stdin/stdout/stderr and runtime are bounded, but this is not an OS sandbox. A declaration requiring OS-enforced network isolation returns `unknown` unless an implementation can actually provide it.
+
+The runtime also has an internal Python observation store: `selc.observation.ingest`, `replay`, `timeline`, and `assessment`. It accepts only a bounded v1 semantic DTO, persists allowlisted identifiers, hashes, classification facts, and opaque evidence references before projection, and derives formal results from that evidence. Replay restores assessments affected by persisted pending, quarantined, or conflicting evidence after a crash. A formal first pass requires complete execution evidence; a verifier-bound final pass can remain valid when unrelated execution evidence is incomplete, while a verified failure remains fail. Conflicted final-delivery evidence and publication gaps cannot establish a pass.
+
+Installed managed suites add project-owned discovery entries and silent native hooks. The hooks keep unrelated project hooks unchanged, return no command rewrite or permission response, and persist an exact native receipt before activation. A discovery entry invokes the installed `managed invoke` wrapper; it neither carries a receipt nor embeds the skill body. The wrapper binds the current native child identity to one durable receipt and then returns the immutable declared body, including a custom declared skill path.
+
+Normal managed `invoke`, `action`, `stage`, and `publish` commands never accept `--receipt`. Each carries the installed `--host`, `--expected-version`, and `--expected-composite` values, and the collector records the exact wrapper command before the child starts it. The runtime selects the one matching pre-action receipt from the child’s native identity, including the exact activated task and call plus the real input, staged-byte, artifact, and target arguments. A cached entry with a different installation identity, command, input path, or host identity stops before business execution. Declared `instruction-staging-v1` actions use `managed stage` with bounded artifact and checker-input files; they do not require a user to ferry an opaque receipt.
+
+Publication creates a previously absent target atomically from the checked staged bytes. On Darwin, a verified unchanged owned target can be corrected with a durable `renameatx_np(RENAME_SWAP)` intent: SELC verifies both exchanged objects before recording the delivery. A detected late user replacement remains uncertain and the displaced bytes are saved as a user-accessible conflict object. Filesystems without the exchange primitive report that capability limit; SELC does not stream-copy over an existing target.
+
+The collector accepts a finite JSON request object, optionally with a genuine skill prefix. It records ordinary language and unsupported shapes as observed unknown classification rather than treating them as a collector outage: a raw prompt summary protects callback immutability, while only confirmed declared fields bind action input equality. Unknown semantics can execute and keep first-result assessment unknown. Replayed callbacks keep their original frozen transcript prefix even when native history later grows. A managed callback without a verified root, host version, native transcript prefix, or exact fixed wrapper command pauses before the action. The collector also records technical `PermissionRequest` callbacks without returning an allow, denial, retry, or permission change; an unmatched request remains unknown. The collector stores identifiers and hashes, never prompt, command, artifact, or native transcript-path bodies. The immutable manifest must explicitly allow the observed host version; a missing or changed version pauses. Public fixture payloads remain unverified even if their fields claim a native host. The installed runtime owns `managed hook`; its other `managed` subcommands are coordination and local-fixture interfaces, while ordinary managed skill use never calls legacy `task`, `call`, `event`, or `delivery` record commands. Use `scripts/selc.py managed --help` to inspect those interfaces.
+
+This implementation has local fixture coverage only. It does not claim completed Codex or WorkBuddy desktop discovery, body handoff, correction, root/window, or publication acceptance.
 
 Export and import only minimal result samples, not business artifacts or feedback bodies:
 
