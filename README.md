@@ -1,5 +1,7 @@
 # SELC v0.1
 
+The `examples/item-summary` suite on this branch is an unreleased development preview. Real Codex CLI evaluation currently returns `RECEIPT_UNAVAILABLE` before managed callbacks, so contribution and release qualification remain incomplete. Its source and package are available for review; no formal Release or verified WorkBuddy use of this new example is claimed.
+
 SELC creates and maintains a versioned suite of skills, then records task and invocation outcomes locally. The authoring skill at `.claude/skills/selc/` is for Codex. A generated suite installs into Codex and WorkBuddy without requiring this repository, a global `selc` command, or Codex at the WorkBuddy installation site.
 
 `scripts/selc.py` is the only global usage entrypoint. Its argparse schema is authoritative; use `selc --help` or `selc <command> --help` for the current parameter list. Runtime dependencies are Python 3.11+ and the standard library. `uv` manages the independent command environment; no dependency is installed implicitly.
