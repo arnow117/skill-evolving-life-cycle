@@ -345,7 +345,10 @@ def _parser() -> argparse.ArgumentParser:
     evolve_plan.add_argument("--output", type=_path, required=True)
     evolve_policy_template = evolve_commands.add_parser(
         "policy-template",
-        help="write the supported frozen Codex native-policy template before creating a plan",
+        help=(
+            "write the frozen Codex policy and normal hook-trust inheritance template "
+            "before creating a plan"
+        ),
     )
     evolve_policy_template.add_argument(
         "--host-version",

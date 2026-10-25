@@ -20,6 +20,7 @@ import signal
 import sqlite3
 import subprocess
 import time
+import tomllib
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -57,6 +58,15 @@ FRAMEWORK_MIT_LICENSE_HASH = "d25592caa5a6ea2534e6d3e38f84e9786650cdb634af57a0fd
 SUPPORTED_ADAPTERS = frozenset({"codex-cli", "codex-desktop", "workbuddy-desktop"})
 CODEX_POLICY_TEMPLATE_SCHEMA_VERSION = 1
 CODEX_ALPHA11_VERSION = "0.163.0-alpha.11"
+CODEX_HOOK_TRUST_SCHEMA_VERSION = 1
+CODEX_HOOK_TRUST_MODE = "normal-state-inheritance-v1"
+CODEX_MANAGED_HOOK_EVENTS = (
+    ("UserPromptSubmit", "user_prompt_submit"),
+    ("PreToolUse", "pre_tool_use"),
+    ("PostToolUse", "post_tool_use"),
+    ("PermissionRequest", "permission_request"),
+    ("Stop", "stop"),
+)
 CODEX_DISABLED_FEATURES = (
     "apps",
     "plugins",
@@ -128,6 +138,7 @@ def build_codex_policy_template(host_version: str, python_read_root: Path) -> di
         },
         "policy": policy,
         "cli": _fixed_codex_cli_profile(),
+        "hook_trust": _fixed_codex_hook_trust_template(),
     }
 
 
@@ -474,7 +485,16 @@ def launch_codex_cli_attempt(attempt_path: Path) -> dict[str, Any]:
             raise SelcError(
                 "ATTEMPT_TAMPERED", "attempt timeout is invalid", "prepare a new attempt"
             )
-        command = _fixed_codex_cli_command(binary, matrix, state)
+        claim_path = attempt_path / "launch-claim.json"
+        if claim_path.exists():
+            _replace_attempt_state(state_path, state, "unknown", budget_consumed=True)
+            raise SelcError(
+                "ATTEMPT_ALREADY_CLAIMED",
+                "a durable launch claim already exists for this attempt",
+                "collect the existing attempt; an interrupted launch is never retried",
+            )
+        hook_trust_binding = _prepare_codex_hook_trust_binding(state, matrix)
+        command = _fixed_codex_cli_command(binary, matrix, state, hook_trust_binding)
         prompt = _codex_cli_prompt(Path(str(state["request_path"])), state)
         environment = _fixed_codex_environment(attempt_path, state)
         launch = {
@@ -485,9 +505,10 @@ def launch_codex_cli_attempt(attempt_path: Path) -> dict[str, Any]:
             "environment": environment,
             "environment_hash": json_hash(environment),
             "timeout_seconds": timeout_seconds,
+            "hook_trust": hook_trust_binding,
+            "hook_trust_hash": json_hash(hook_trust_binding),
             "prepared_at": _utc_timestamp(),
         }
-        claim_path = attempt_path / "launch-claim.json"
         try:
             _write_no_clobber_json(claim_path, launch)
         except FileExistsError as error:
@@ -497,6 +518,15 @@ def launch_codex_cli_attempt(attempt_path: Path) -> dict[str, Any]:
                 "a durable launch claim already exists for this attempt",
                 "collect the existing attempt; an interrupted launch is never retried",
             ) from error
+        state = dict(state)
+        state["launch_claim_hash"] = json_hash(launch)
+        if _codex_hook_trust_changed(hook_trust_binding, state, matrix):
+            _replace_attempt_state(state_path, state, "unknown", budget_consumed=True)
+            raise SelcError(
+                "HOOK_TRUST_CHANGED",
+                "the normal Codex hook trust state changed before launch",
+                "review and trust the installed hooks again before a new attempt",
+            )
         _replace_attempt_state(state_path, state, "launched", budget_consumed=True)
 
         started = time.monotonic()
@@ -1197,6 +1227,7 @@ def _normalise_codex_policy_template(
         "parameters",
         "policy",
         "cli",
+        "hook_trust",
     }
     if set(value) != required:
         raise SelcError(
@@ -1218,6 +1249,7 @@ def _normalise_codex_policy_template(
             "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
         }
         or value.get("cli") != _fixed_codex_cli_profile()
+        or value.get("hook_trust") != _fixed_codex_hook_trust_template()
     ):
         raise SelcError(
             "INVALID_EVALUATION_PLAN",
@@ -1243,6 +1275,7 @@ def _normalise_codex_policy_template(
         },
         "policy": normalized_policy,
         "cli": _fixed_codex_cli_profile(),
+        "hook_trust": _fixed_codex_hook_trust_template(),
     }
 
 
@@ -1468,6 +1501,26 @@ def _fixed_codex_cli_profile() -> dict[str, object]:
     }
 
 
+def _fixed_codex_hook_trust_template() -> dict[str, object]:
+    """Declare the only normal hook trust state the runner can inherit.
+
+    Codex's public ``--ignore-user-config`` flag otherwise omits the normal
+    UI-reviewed hook state.  The template does not contain a trust hash: those
+    values can only be copied from the current account's normal hook review
+    immediately before launch.
+    """
+
+    return {
+        "schema_version": CODEX_HOOK_TRUST_SCHEMA_VERSION,
+        "mode": CODEX_HOOK_TRUST_MODE,
+        "state_source": "os-account-config-hooks-state",
+        "events": [
+            {"event": event, "state_event": state_event}
+            for event, state_event in CODEX_MANAGED_HOOK_EVENTS
+        ],
+    }
+
+
 def _prepare_policy_binding(matrix: dict[str, Any], project_root: Path) -> dict[str, object]:
     """Bind the only runtime policy parameters before a host can start."""
 
@@ -1504,6 +1557,7 @@ def _prepare_policy_binding(matrix: dict[str, Any], project_root: Path) -> dict[
         "template_hash": template_hash,
         "mapping": mapping,
         "cli": template["cli"],
+        "hook_trust": template["hook_trust"],
     }
     return {
         "status": "bound",
@@ -1524,10 +1578,20 @@ def _qualification_support(matrix: dict[str, Any]) -> str:
     Codex-only parser.
     """
 
+    if matrix.get("host") == "codex" and not _has_supported_codex_hook_trust_template(matrix):
+        return "unverified"
     declared = matrix.get("qualification_support")
     if declared in {"supported", "unverified"}:
         return declared
     return "supported" if matrix.get("host") == "codex" else "unverified"
+
+
+def _has_supported_codex_hook_trust_template(matrix: dict[str, Any]) -> bool:
+    template = matrix.get("tools_policy_template")
+    return (
+        isinstance(template, dict)
+        and template.get("hook_trust") == _fixed_codex_hook_trust_template()
+    )
 
 
 def _normalise_variants(
@@ -2171,6 +2235,10 @@ def _reconstruct_attempt(state: dict[str, Any]) -> dict[str, Any]:
             "status": "unknown",
             "reason": f"qualification-{qualification_reason}",
         }
+    if matrix.get("adapter") == "codex-cli":
+        launch_failure = _codex_cli_launch_trust_failure(state, matrix)
+        if launch_failure is not None:
+            return {"status": "unknown", "reason": launch_failure}
     native_context = _read_attempt_native_context(state, matrix)
     if native_context is None:
         return {"status": "unknown", "reason": "native-attribution-or-policy-unavailable"}
@@ -3151,8 +3219,440 @@ def _codex_cli_prompt(request_path: Path, state: dict[str, Any]) -> bytes:
     return prompt.encode("utf-8")
 
 
+def _prepare_codex_hook_trust_binding(
+    state: dict[str, Any], matrix: dict[str, Any]
+) -> dict[str, object]:
+    """Copy only normal UI-reviewed state for this attempt's installed hooks.
+
+    ``--ignore-user-config`` keeps arbitrary account configuration out of the
+    runner.  Codex stores normal hook review decisions in that configuration,
+    so this helper extracts the five installer-owned entries after they have
+    been reviewed through Codex's normal UI.  It never creates a trust value.
+    """
+
+    template = matrix.get("tools_policy_template")
+    policy_binding = state.get("policy_binding")
+    if (
+        not isinstance(template, dict)
+        or template.get("hook_trust") != _fixed_codex_hook_trust_template()
+        or not isinstance(policy_binding, dict)
+        or policy_binding.get("status") != "bound"
+    ):
+        raise SelcError(
+            "HOOK_TRUST_TEMPLATE_UNAVAILABLE",
+            "the frozen Codex template does not declare normal hook trust inheritance",
+            "prepare a new plan with the current policy template",
+        )
+    account_home = _trusted_posix_account_home()
+    expected_home = template.get("account_home")
+    if account_home is None or expected_home != str(account_home):
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_UNAVAILABLE",
+            "the current OS account does not match the frozen policy template",
+            "prepare the attempt on the account used for its policy template",
+        )
+    project_root = _resolved_directory(state.get("project_root"))
+    if project_root is None:
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_UNAVAILABLE",
+            "the isolated evaluation project is unavailable",
+            "prepare a new isolated attempt",
+        )
+    installation = state.get("installation")
+    if not isinstance(installation, dict) or not isinstance(installation.get("suite_id"), str):
+        raise SelcError(
+            "HOOK_TRUST_INSTALLATION_INVALID",
+            "the prepared installation identity is missing",
+            "prepare a new isolated attempt",
+        )
+    try:
+        installed = current_installation(project_root, installation["suite_id"])
+    except (OSError, SelcError, ValueError) as error:
+        raise SelcError(
+            "HOOK_TRUST_INSTALLATION_INVALID",
+            "the installed Codex hooks cannot be verified",
+            "repair the isolated installation before normal hook review",
+        ) from error
+    if (
+        installed.get("digest") != installation.get("digest")
+        or installed.get("version") != installation.get("version")
+        or json_hash(installed.get("owned_hooks", {})) != installation.get("hooks_hash")
+    ):
+        raise SelcError(
+            "HOOK_TRUST_INSTALLATION_INVALID",
+            "the installed suite differs from the frozen attempt snapshot",
+            "prepare a new isolated attempt",
+        )
+    hook_source = project_root / ".codex" / "hooks.json"
+    definitions, hook_source_sha256 = _codex_installed_hook_definitions(
+        hook_source,
+        installed.get("owned_hooks"),
+    )
+    config_path = account_home / ".codex" / "config.toml"
+    config_bytes = _read_regular_bytes(config_path, "normal Codex hook trust configuration")
+    try:
+        configuration = tomllib.loads(config_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError) as error:
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "normal Codex hook trust configuration is not valid UTF-8 TOML",
+            "review the normal Codex hook trust state before launching",
+        ) from error
+    states = _selected_codex_hook_trust_states(configuration, hook_source, definitions)
+    return {
+        "schema_version": CODEX_HOOK_TRUST_SCHEMA_VERSION,
+        "mode": CODEX_HOOK_TRUST_MODE,
+        "template_hash": matrix.get("tools_policy_template_hash"),
+        "config_source_path": str(config_path),
+        "config_source_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "hook_source_path": str(hook_source.resolve()),
+        "hook_source_sha256": hook_source_sha256,
+        "installation_hooks_hash": installation.get("hooks_hash"),
+        "definitions": definitions,
+        "states": states,
+    }
+
+
+def _read_regular_bytes(path: Path, description: str) -> bytes:
+    try:
+        resolved = path.resolve(strict=True)
+        if path.is_symlink() or not resolved.is_file():
+            raise OSError("not a regular file")
+        return resolved.read_bytes()
+    except OSError as error:
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_UNAVAILABLE",
+            f"{description} is unavailable",
+            "complete normal hook review before launching",
+        ) from error
+
+
+def _codex_installed_hook_definitions(
+    hook_source: Path, owned_hooks: object
+) -> tuple[list[dict[str, object]], str]:
+    """Return the exact five installer entries and their normal state keys."""
+
+    source_bytes = _read_regular_bytes(hook_source, "installed Codex hook definitions")
+    try:
+        configuration = json.loads(source_bytes)
+    except json.JSONDecodeError as error:
+        raise SelcError(
+            "HOOK_TRUST_INSTALLATION_INVALID",
+            "installed Codex hook definitions are not valid JSON",
+            "repair the isolated installation before normal hook review",
+        ) from error
+    if not isinstance(configuration, dict) or not isinstance(configuration.get("hooks"), dict):
+        raise SelcError(
+            "HOOK_TRUST_INSTALLATION_INVALID",
+            "installed Codex hook definitions have no hooks object",
+            "repair the isolated installation before normal hook review",
+        )
+    if not isinstance(owned_hooks, dict):
+        raise SelcError(
+            "HOOK_TRUST_INSTALLATION_INVALID",
+            "installed Codex hook ownership metadata is missing",
+            "repair the isolated installation before normal hook review",
+        )
+    codex_owned = owned_hooks.get("codex")
+    expected_events = {event for event, _state_event in CODEX_MANAGED_HOOK_EVENTS}
+    if not isinstance(codex_owned, dict) or set(codex_owned) != expected_events:
+        raise SelcError(
+            "HOOK_TRUST_INSTALLATION_INVALID",
+            "installed Codex hooks are not the exact managed hook set",
+            "repair the isolated installation before normal hook review",
+        )
+    source_path = str(hook_source.resolve())
+    hooks = configuration["hooks"]
+    definitions: list[dict[str, object]] = []
+    for event, state_event in CODEX_MANAGED_HOOK_EVENTS:
+        command = codex_owned.get(event)
+        entries = hooks.get(event)
+        if not isinstance(command, str) or not isinstance(entries, list):
+            raise SelcError(
+                "HOOK_TRUST_INSTALLATION_INVALID",
+                "an installed managed Codex hook is missing",
+                "repair the isolated installation before normal hook review",
+            )
+        expected_entry: dict[str, object] = {
+            "hooks": [{"type": "command", "command": command, "timeout": 5}]
+        }
+        if event in {"PreToolUse", "PostToolUse"}:
+            expected_entry["matcher"] = "^(Bash|exec_command|shell)$"
+        matches = [
+            (entry_index, entry)
+            for entry_index, entry in enumerate(entries)
+            if entry == expected_entry
+        ]
+        if len(matches) != 1:
+            raise SelcError(
+                "HOOK_TRUST_INSTALLATION_INVALID",
+                "an installed managed Codex hook definition changed or is ambiguous",
+                "repair the isolated installation before normal hook review",
+            )
+        entry_index, entry = matches[0]
+        state_key = f"{source_path}:{state_event}:{entry_index}:0"
+        definitions.append(
+            {
+                "event": event,
+                "state_event": state_event,
+                "entry_index": entry_index,
+                "hook_index": 0,
+                "state_key": state_key,
+                "definition_hash": json_hash(entry),
+                "command_hash": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+            }
+        )
+    return definitions, hashlib.sha256(source_bytes).hexdigest()
+
+
+def _selected_codex_hook_trust_states(
+    configuration: object,
+    hook_source: Path,
+    definitions: list[dict[str, object]],
+) -> list[dict[str, str]]:
+    if not isinstance(configuration, dict):
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "normal Codex hook trust configuration is not an object",
+            "complete normal hook review before launching",
+        )
+    hooks = configuration.get("hooks")
+    states = hooks.get("state") if isinstance(hooks, dict) else None
+    if not isinstance(states, dict):
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "normal Codex hook trust state is missing",
+            "review all installed Codex hooks through the normal UI",
+        )
+    expected_keys = {definition["state_key"] for definition in definitions}
+    if not all(isinstance(key, str) for key in expected_keys):
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "installed Codex hook state keys are invalid",
+            "repair the isolated installation before normal hook review",
+        )
+    source_prefix = f"{hook_source.resolve()}:"
+    matching_keys = {
+        key for key in states if isinstance(key, str) and key.startswith(source_prefix)
+    }
+    if matching_keys != expected_keys:
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "normal Codex hook trust state is missing or has an extra entry for this attempt",
+            "review exactly the installed Codex hooks through the normal UI",
+        )
+    selected: list[dict[str, str]] = []
+    for definition in definitions:
+        key = definition["state_key"]
+        assert isinstance(key, str)
+        value = states.get(key)
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"trusted_hash"}
+            or not isinstance(value.get("trusted_hash"), str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", value["trusted_hash"]) is None
+        ):
+            raise SelcError(
+                "HOOK_TRUST_SOURCE_INVALID",
+                "normal Codex hook trust state is not an unchanged reviewed hash",
+                "review the installed Codex hook through the normal UI",
+            )
+        selected.append({"state_key": key, "trusted_hash": value["trusted_hash"]})
+    return selected
+
+
+def _hook_trust_cli_entries(
+    hook_trust_binding: dict[str, object], state: dict[str, Any], matrix: dict[str, Any]
+) -> list[str]:
+    _validate_saved_codex_hook_trust_binding(hook_trust_binding, state, matrix)
+    states = hook_trust_binding["states"]
+    assert isinstance(states, list)
+    state_values: list[str] = []
+    for item in states:
+        assert isinstance(item, dict)
+        key = item["state_key"]
+        trusted_hash = item["trusted_hash"]
+        assert isinstance(key, str) and isinstance(trusted_hash, str)
+        state_values.append(f"{json.dumps(key)}={{trusted_hash={json.dumps(trusted_hash)}}}")
+    return ["-c", f"hooks.state={{{','.join(state_values)}}}"]
+
+
+def _validate_saved_codex_hook_trust_binding(
+    binding: object, state: dict[str, Any], matrix: dict[str, Any]
+) -> None:
+    """Validate a frozen trust selection without reading current user config."""
+
+    if not isinstance(binding, dict):
+        raise SelcError(
+            "HOOK_TRUST_BINDING_INVALID",
+            "the launch claim has no normal hook trust binding",
+            "collect the attempt as unknown",
+        )
+    template = matrix.get("tools_policy_template")
+    project_root = _resolved_directory(state.get("project_root"))
+    installation = state.get("installation")
+    if (
+        not isinstance(template, dict)
+        or project_root is None
+        or not isinstance(installation, dict)
+        or not isinstance(template.get("account_home"), str)
+    ):
+        raise SelcError(
+            "HOOK_TRUST_BINDING_INVALID",
+            "the frozen normal hook trust context is incomplete",
+            "collect the attempt as unknown",
+        )
+    expected_keys = {
+        "schema_version",
+        "mode",
+        "template_hash",
+        "config_source_path",
+        "config_source_sha256",
+        "hook_source_path",
+        "hook_source_sha256",
+        "installation_hooks_hash",
+        "definitions",
+        "states",
+    }
+    if set(binding) != expected_keys:
+        raise SelcError(
+            "HOOK_TRUST_BINDING_INVALID",
+            "the frozen normal hook trust binding has unsupported fields",
+            "collect the attempt as unknown",
+        )
+    expected_config_path = str(Path(template["account_home"]) / ".codex" / "config.toml")
+    expected_hook_source = str(project_root / ".codex" / "hooks.json")
+    if (
+        binding.get("schema_version") != CODEX_HOOK_TRUST_SCHEMA_VERSION
+        or binding.get("mode") != CODEX_HOOK_TRUST_MODE
+        or binding.get("template_hash") != matrix.get("tools_policy_template_hash")
+        or binding.get("config_source_path") != expected_config_path
+        or binding.get("hook_source_path") != expected_hook_source
+        or binding.get("installation_hooks_hash") != installation.get("hooks_hash")
+        or not _is_digest(binding.get("config_source_sha256"))
+        or not _is_digest(binding.get("hook_source_sha256"))
+    ):
+        raise SelcError(
+            "HOOK_TRUST_BINDING_INVALID",
+            "the frozen normal hook trust binding does not match this attempt",
+            "collect the attempt as unknown",
+        )
+    definitions = binding.get("definitions")
+    states = binding.get("states")
+    if not isinstance(definitions, list) or not isinstance(states, list):
+        raise SelcError(
+            "HOOK_TRUST_BINDING_INVALID",
+            "the frozen normal hook trust entries are invalid",
+            "collect the attempt as unknown",
+        )
+    try:
+        current_definitions, source_hash = _codex_installed_hook_definitions(
+            Path(expected_hook_source),
+            current_installation(project_root, str(installation["suite_id"])).get("owned_hooks"),
+        )
+    except (OSError, SelcError, ValueError) as error:
+        raise SelcError(
+            "HOOK_TRUST_BINDING_INVALID",
+            "the installed hook definitions are unavailable for qualification",
+            "collect the attempt as unknown",
+        ) from error
+    if definitions != current_definitions or binding.get("hook_source_sha256") != source_hash:
+        raise SelcError(
+            "HOOK_TRUST_BINDING_INVALID",
+            "the installed hook definitions differ from the frozen launch binding",
+            "collect the attempt as unknown",
+        )
+    expected_state_keys = [definition["state_key"] for definition in current_definitions]
+    if len(states) != len(expected_state_keys):
+        raise SelcError(
+            "HOOK_TRUST_BINDING_INVALID",
+            "the frozen normal hook trust state count is invalid",
+            "collect the attempt as unknown",
+        )
+    for item, expected_key in zip(states, expected_state_keys, strict=True):
+        if (
+            not isinstance(item, dict)
+            or set(item) != {"state_key", "trusted_hash"}
+            or item.get("state_key") != expected_key
+            or not isinstance(item.get("trusted_hash"), str)
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", item["trusted_hash"]) is None
+        ):
+            raise SelcError(
+                "HOOK_TRUST_BINDING_INVALID",
+                "the frozen normal hook trust state is invalid",
+                "collect the attempt as unknown",
+            )
+
+
+def _codex_hook_trust_changed(
+    binding: dict[str, object], state: dict[str, Any], matrix: dict[str, Any]
+) -> bool:
+    try:
+        current = _prepare_codex_hook_trust_binding(state, matrix)
+    except SelcError:
+        return True
+    return current != binding
+
+
+def _codex_cli_launch_trust_failure(state: dict[str, Any], matrix: dict[str, Any]) -> str | None:
+    """Check the frozen launch binding without rereading later account config."""
+
+    attempt_root = _resolved_directory(state.get("attempt_path"))
+    if attempt_root is None:
+        return "launch-claim-unavailable"
+    claim_path = attempt_root / "launch-claim.json"
+    try:
+        launch = read_json(claim_path)
+    except (OSError, SelcError, ValueError, json.JSONDecodeError):
+        return "launch-claim-unavailable"
+    required = {
+        "schema_version",
+        "attempt_id",
+        "command",
+        "command_hash",
+        "environment",
+        "environment_hash",
+        "timeout_seconds",
+        "hook_trust",
+        "hook_trust_hash",
+        "prepared_at",
+    }
+    if not isinstance(launch, dict) or set(launch) != required:
+        return "launch-claim-invalid"
+    binding = launch.get("hook_trust")
+    try:
+        _validate_saved_codex_hook_trust_binding(binding, state, matrix)
+    except SelcError:
+        return "hook-trust-binding-invalid"
+    if (
+        launch.get("attempt_id") != _attempt_id(state)
+        or state.get("launch_claim_hash") != json_hash(launch)
+        or launch.get("hook_trust_hash") != json_hash(binding)
+        or launch.get("command_hash") != json_hash(launch.get("command"))
+    ):
+        return "launch-claim-tampered"
+    executor = matrix.get("executor")
+    if not isinstance(executor, dict) or not isinstance(executor.get("binary"), str):
+        return "launch-executor-invalid"
+    try:
+        expected_command = _fixed_codex_cli_command(
+            Path(executor["binary"]),
+            matrix,
+            state,
+            binding,
+        )
+    except (OSError, SelcError, ValueError):
+        return "hook-trust-command-invalid"
+    if launch.get("command") != expected_command:
+        return "hook-trust-command-tampered"
+    return None
+
+
 def _fixed_codex_cli_command(
-    binary: Path, matrix: dict[str, Any], state: dict[str, Any]
+    binary: Path,
+    matrix: dict[str, Any],
+    state: dict[str, Any],
+    hook_trust_binding: dict[str, object] | None = None,
 ) -> list[str]:
     """Return the only CLI argument vector accepted by the real adapter."""
 
@@ -3245,6 +3745,13 @@ def _fixed_codex_cli_command(
             "-",
         )
     )
+    if hook_trust_binding is not None:
+        hook_trust_entries = _hook_trust_cli_entries(
+            hook_trust_binding,
+            state,
+            matrix,
+        )
+        command[-1:-1] = hook_trust_entries
     return command
 
 
