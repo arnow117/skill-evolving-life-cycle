@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -68,6 +69,46 @@ class InstallModeTests(unittest.TestCase):
             check=False,
             text=True,
         )
+
+    def create_distinct_interpreters(self) -> tuple[Path, Path]:
+        source_interpreter = Path(sys.executable).resolve(strict=True)
+        interpreter_a = self.root / "interpreter A"
+        interpreter_b = self.root / "interpreter B"
+        shutil.copy2(source_interpreter, interpreter_a)
+        shutil.copy2(source_interpreter, interpreter_b)
+        self.assertNotEqual(interpreter_a.resolve(strict=True), interpreter_b.resolve(strict=True))
+        return interpreter_a, interpreter_b
+
+    def assert_managed_entry_binds_to_interpreter(
+        self,
+        project: Path,
+        *,
+        expected_interpreter: Path,
+        other_interpreter: Path,
+    ) -> None:
+        from selc import managed_runtime
+
+        entry = project / ".agents" / "skills" / "text-report" / "SKILL.md"
+        body = entry.read_text(encoding="utf-8")
+        code_blocks = re.findall(r"```sh\n(.*?)\n```", body, flags=re.DOTALL)
+        self.assertEqual(len(code_blocks), 1)
+        command = code_blocks[0]
+        with patch.object(managed_runtime.sys, "executable", str(expected_interpreter)):
+            self.assertIsNotNone(
+                managed_runtime.parse_installed_managed_command(
+                    command,
+                    "mode-suite",
+                    project_root=project,
+                )
+            )
+        with patch.object(managed_runtime.sys, "executable", str(other_interpreter)):
+            self.assertIsNone(
+                managed_runtime.parse_installed_managed_command(
+                    command,
+                    "mode-suite",
+                    project_root=project,
+                )
+            )
 
     def test_fresh_basic_workbuddy_install_ignores_malformed_hooks_and_runs(self) -> None:
         suite = self.create_suite()
@@ -474,8 +515,7 @@ class InstallModeTests(unittest.TestCase):
 
         import selc.install as install_module
 
-        interpreter_a = self.root / "interpreter A"
-        interpreter_b = self.root / "interpreter B"
+        interpreter_a, interpreter_b = self.create_distinct_interpreters()
         with (
             patch.object(install_module.sys, "executable", str(interpreter_a)),
             patch.object(
@@ -511,6 +551,11 @@ class InstallModeTests(unittest.TestCase):
         self.assertEqual(recovered_installation["mode"], "observed")
         self.assertIn(str(interpreter_a), json.dumps(recovered_installation["owned_hooks"]))
         self.assertNotIn(str(interpreter_b), json.dumps(recovered_installation["owned_hooks"]))
+        self.assert_managed_entry_binds_to_interpreter(
+            project,
+            expected_interpreter=interpreter_a,
+            other_interpreter=interpreter_b,
+        )
         for hook_file in (codex_hooks, workbuddy_settings):
             contents = hook_file.read_text(encoding="utf-8")
             self.assertIn(str(interpreter_a), contents)
@@ -538,8 +583,7 @@ class InstallModeTests(unittest.TestCase):
 
         import selc.install as install_module
 
-        interpreter_a = self.root / "interpreter A"
-        interpreter_b = self.root / "interpreter B"
+        interpreter_a, interpreter_b = self.create_distinct_interpreters()
         with patch.object(install_module.sys, "executable", str(interpreter_a)):
             install_suite(
                 source=suite,
@@ -604,6 +648,11 @@ class InstallModeTests(unittest.TestCase):
         self.assertEqual(installation["mode"], "observed")
         self.assertIn(str(interpreter_a), json.dumps(installation["owned_hooks"]))
         self.assertNotIn(str(interpreter_b), json.dumps(installation["owned_hooks"]))
+        self.assert_managed_entry_binds_to_interpreter(
+            project,
+            expected_interpreter=interpreter_a,
+            other_interpreter=interpreter_b,
+        )
         contents = codex_hooks.read_text(encoding="utf-8")
         self.assertIn(str(interpreter_a), contents)
         self.assertNotIn(str(interpreter_b), contents)
@@ -655,6 +704,21 @@ class InstallModeTests(unittest.TestCase):
 
         self.assertEqual(malformed_harnesses["state"], "needs_recovery")
         self.assertTrue(journal.is_file())
+
+        record = json.loads(journal.read_text(encoding="utf-8"))
+        invalid_owned_hooks = json.loads(json.dumps(journal_owned_hooks))
+        invalid_owned_hooks["codex"]["Stop"] = "not an installed collector command"
+        record["new_installation"]["harnesses"] = ["codex"]
+        record["new_installation"]["owned_hooks"] = invalid_owned_hooks
+        journal.write_text(json.dumps(record), encoding="utf-8")
+        hooks_path = project / ".codex" / "hooks.json"
+        hooks_before = hooks_path.read_text(encoding="utf-8")
+
+        invalid_command = recover_installation(project, "mode-suite")
+
+        self.assertEqual(invalid_command["state"], "needs_recovery")
+        self.assertTrue(journal.is_file())
+        self.assertEqual(hooks_path.read_text(encoding="utf-8"), hooks_before)
 
     def test_recovery_removes_a_new_harness_after_a_partial_observed_switch(self) -> None:
         suite = self.create_suite()

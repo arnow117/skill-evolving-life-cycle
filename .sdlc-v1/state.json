@@ -217,10 +217,10 @@
           "id": "T017",
           "status": "done",
           "title": "基础版发布评审三项修正",
-          "updated_at": "2026-10-26T04:37:54Z"
+          "updated_at": "2026-10-26T04:46:23Z"
         }
       },
-      "updated_at": "2026-10-26T04:37:54Z",
+      "updated_at": "2026-10-26T04:46:23Z",
       "validation": {
         "at": null,
         "command": null,
@@ -267,7 +267,7 @@
       "product_context_ref": ".sdlc-v1/context/REQ-003.product.md",
       "status": "in_delivery",
       "title": "SELC基础可用版首发与双端同步",
-      "updated_at": "2026-10-26T04:37:54Z"
+      "updated_at": "2026-10-26T04:46:23Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

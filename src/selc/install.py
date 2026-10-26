@@ -521,10 +521,15 @@ def _managed_entry_body(
 
 
 def _materialize_managed_entries(
-    root: Path, manifest: dict[str, Any], harnesses: list[str]
+    root: Path,
+    manifest: dict[str, Any],
+    harnesses: list[str],
+    *,
+    interpreter: str | None = None,
 ) -> dict[str, dict[str, str]]:
     """Create one separately-owned immutable discovery entry per suite and harness."""
 
+    entry_interpreter = interpreter or sys.executable
     entries: dict[str, dict[str, str]] = {}
     digest = portable_tree_hash(root / "current")
     for harness in harnesses:
@@ -542,7 +547,7 @@ def _materialize_managed_entries(
             project_root = root.parents[2]
             activation_command = shlex.join(
                 (
-                    sys.executable,
+                    entry_interpreter,
                     str(root / "current" / "bin" / "selc-suite.py"),
                     "managed",
                     "invoke",
@@ -907,6 +912,91 @@ def _validated_recovery_owned_hooks(
     return validated
 
 
+def _frozen_hook_interpreter(
+    project_root: Path,
+    root: Path,
+    suite_id: str,
+    owned_hooks: dict[str, dict[str, str]],
+) -> str | None:
+    """Return the one verified interpreter recorded by an observed journal.
+
+    The journal command is accepted only when every recorded event is the
+    complete installed collector invocation for this project, suite, and
+    harness. Recovery uses this interpreter for its discovery entries so their
+    parser binding stays aligned with the restored collector hooks.
+    """
+
+    if not owned_hooks:
+        return None
+
+    expected_wrapper = str(root / "current" / "bin" / "selc-suite.py")
+    resolved_interpreters: set[Path] = set()
+    for harness, events in owned_hooks.items():
+        commands = set(events.values())
+        if len(commands) != 1:
+            raise SelcError(
+                "RECOVERY_INCOMPLETE",
+                "journal hook commands do not use one interpreter per harness",
+                "restore the recorded observed installation before recovering",
+            )
+        command = commands.pop()
+        try:
+            argv = shlex.split(command, posix=True)
+        except ValueError as error:
+            raise SelcError(
+                "RECOVERY_INCOMPLETE",
+                "journal hook command cannot be parsed safely",
+                "restore the recorded observed installation before recovering",
+            ) from error
+        expected_arguments = (
+            expected_wrapper,
+            "managed",
+            "hook",
+            "--project-root",
+            str(project_root),
+            "--suite",
+            suite_id,
+            "--host",
+            harness,
+        )
+        if len(argv) != len(expected_arguments) + 1 or tuple(argv[1:]) != expected_arguments:
+            raise SelcError(
+                "RECOVERY_INCOMPLETE",
+                "journal hook command does not match the installed collector",
+                "restore the recorded observed installation before recovering",
+            )
+        interpreter = Path(argv[0])
+        if not interpreter.is_absolute():
+            raise SelcError(
+                "RECOVERY_INCOMPLETE",
+                "journal hook interpreter must be an absolute installed file",
+                "restore the recorded observed installation before recovering",
+            )
+        try:
+            resolved = interpreter.resolve(strict=True)
+        except OSError as error:
+            raise SelcError(
+                "RECOVERY_INCOMPLETE",
+                "journal hook interpreter is no longer available",
+                "restore the recorded observed installation before recovering",
+            ) from error
+        if not resolved.is_file():
+            raise SelcError(
+                "RECOVERY_INCOMPLETE",
+                "journal hook interpreter is not an executable file",
+                "restore the recorded observed installation before recovering",
+            )
+        resolved_interpreters.add(resolved)
+
+    if len(resolved_interpreters) != 1:
+        raise SelcError(
+            "RECOVERY_INCOMPLETE",
+            "journal hook commands do not share one interpreter",
+            "restore the recorded observed installation before recovering",
+        )
+    return str(resolved_interpreters.pop())
+
+
 def _entry_commands(entry: object) -> set[str]:
     if not isinstance(entry, dict):
         return set()
@@ -1088,10 +1178,20 @@ def _sync_installation_mode(
     previous: dict[str, Any] | None,
     mode: str,
     frozen_owned_hooks: dict[str, dict[str, str]] | None = None,
+    frozen_interpreter: str | None = None,
 ) -> tuple[dict[str, dict[str, str]], dict[str, list[str]], dict[str, dict[str, str]]]:
     _preflight_installation_mode(project_root, harnesses, previous, mode)
     skill_paths = _registration_paths(manifest, root / "current", mode)
-    entries = _materialize_managed_entries(root, manifest, harnesses) if mode == "observed" else {}
+    entries = (
+        _materialize_managed_entries(
+            root,
+            manifest,
+            harnesses,
+            interpreter=frozen_interpreter,
+        )
+        if mode == "observed"
+        else {}
+    )
     registrations = _sync_all_harnesses(
         project_root,
         root,
@@ -1935,6 +2035,12 @@ def recover_installation(project_root: Path, suite_id: str) -> dict[str, Any]:
         try:
             frozen_owned_hooks = _validated_recovery_owned_hooks(new_installation)
             old_owned_hooks = _validated_recovery_owned_hooks(old_installation)
+            frozen_interpreter = _frozen_hook_interpreter(
+                project_root, root, suite_id, frozen_owned_hooks
+            )
+            old_frozen_interpreter = _frozen_hook_interpreter(
+                project_root, root, suite_id, old_owned_hooks
+            )
         except SelcError:
             return {"recovered": False, "state": "needs_recovery", "journal": record}
         if (
@@ -1967,6 +2073,7 @@ def recover_installation(project_root: Path, suite_id: str) -> dict[str, Any]:
                     old_installation,
                     mode,
                     frozen_owned_hooks,
+                    frozen_interpreter,
                 )
                 new_installation["managed_entries"] = entries
                 new_installation["registrations"] = registrations
@@ -2036,6 +2143,7 @@ def recover_installation(project_root: Path, suite_id: str) -> dict[str, Any]:
                         new_installation,
                         mode,
                         old_owned_hooks,
+                        old_frozen_interpreter,
                     )
                     old_installation["managed_entries"] = entries
                     old_installation["registrations"] = registrations
