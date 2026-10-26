@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import json
-import shlex
+import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,41 @@ class InstallModeTests(unittest.TestCase):
         suite = self.root / suite_id
         create_suite(suite_id, "1.0.0", suite, ["text-report"])
         return suite
+
+    def run_generated_basic_body(
+        self,
+        body: str,
+        *,
+        project: Path,
+        python_executable: Path,
+        replacements: dict[str, str],
+    ) -> subprocess.CompletedProcess[str]:
+        code_blocks = re.findall(r"```sh\n(.*?)\n```", body, flags=re.DOTALL)
+        self.assertEqual(len(code_blocks), 2)
+        self.assertIn(
+            'SELC_PYTHON="<absolute path to a Python 3.11+ executable>"',
+            code_blocks[0],
+        )
+        self.assertIn('"$SELC_PYTHON"', code_blocks[1])
+
+        command = "\n".join(code_blocks).replace(
+            "<absolute path to a Python 3.11+ executable>", str(python_executable)
+        )
+        for placeholder, replacement in replacements.items():
+            self.assertIn(placeholder, command)
+            command = command.replace(placeholder, replacement)
+
+        environment = os.environ.copy()
+        environment.pop("SELC_PYTHON", None)
+        self.assertNotIn("SELC_PYTHON", environment)
+        return subprocess.run(
+            ["/bin/sh", "-c", command],
+            cwd=project,
+            env=environment,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
 
     def test_fresh_basic_workbuddy_install_ignores_malformed_hooks_and_runs(self) -> None:
         suite = self.create_suite()
@@ -74,7 +110,15 @@ class InstallModeTests(unittest.TestCase):
         completed = subprocess.run(
             [
                 sys.executable,
-                str(project / ".selc" / "installs" / "mode-suite" / "current" / "bin" / "selc-suite.py"),
+                str(
+                    project
+                    / ".selc"
+                    / "installs"
+                    / "mode-suite"
+                    / "current"
+                    / "bin"
+                    / "selc-suite.py"
+                ),
                 "run",
                 "text-report",
                 "--input",
@@ -110,25 +154,82 @@ class InstallModeTests(unittest.TestCase):
         self.assertIn('cd -P "$(dirname "$SELC_SKILL_FILE")"', body)
 
         (project / "input.txt").write_text("relative input\n", encoding="utf-8")
-        command = "\n".join(
-            (
-                f"SELC_SKILL_FILE={shlex.quote(str(discovery_skill))}",
-                'SELC_SKILL_DIR="$(cd -P "$(dirname "$SELC_SKILL_FILE")" && pwd)"',
-                'SELC_SUITE="$(cd "$SELC_SKILL_DIR/../.." && pwd)"',
-                '"$SELC_PYTHON" "$SELC_SUITE/bin/selc-suite.py" run text-report '
-                "--input input.txt --output output.md",
-            )
-        )
-        completed = subprocess.run(
-            ["/bin/sh", "-c", command],
-            cwd=project,
-            env={"SELC_PYTHON": sys.executable},
-            capture_output=True,
-            check=False,
-            text=True,
+        python_executable = self.root / "Python 3.11 executable"
+        python_executable.symlink_to(sys.executable)
+        completed = self.run_generated_basic_body(
+            body,
+            project=project,
+            python_executable=python_executable,
+            replacements={
+                "<absolute path to this loaded SKILL.md>": str(discovery_skill),
+                "<input.txt>": "input.txt",
+                "<report.md>": "output.md",
+            },
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
         self.assertIn("relative input", (project / "output.md").read_text(encoding="utf-8"))
+
+    def test_generated_python_script_body_uses_its_declared_python(self) -> None:
+        suite = self.root / "python-suite"
+        create_suite(
+            "python-suite",
+            "1.0.0",
+            suite,
+            ["script-report"],
+            managed={
+                "protocol": 1,
+                "actions": {
+                    "script-report": {
+                        "skill": "script-report",
+                        "kind": "python-script-v1",
+                        "script": "resources/run.py",
+                        "input": {
+                            "fields": {"request": {"type": "path"}},
+                            "required": ["request"],
+                        },
+                    }
+                },
+            },
+        )
+        declared_script = suite / "resources" / "run.py"
+        declared_script.write_text(
+            "from pathlib import Path\n"
+            "import sys\n\n"
+            "output = Path(sys.argv[sys.argv.index('--output') + 1])\n"
+            "output.write_text('script branch\\n', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        seal_suite(suite)
+
+        project = self.root / "project"
+        install_suite(
+            source=suite,
+            project_root=project,
+            harness="workbuddy",
+            ref=None,
+        )
+        discovery_skill = project / ".codebuddy" / "skills" / "script-report" / "SKILL.md"
+        body = discovery_skill.read_text(encoding="utf-8")
+        python_executable = self.root / "Python 3.11 executable"
+        python_executable.symlink_to(sys.executable)
+        (project / "request.json").write_text("{}\n", encoding="utf-8")
+
+        completed = self.run_generated_basic_body(
+            body,
+            project=project,
+            python_executable=python_executable,
+            replacements={
+                "<absolute path to this loaded SKILL.md>": str(discovery_skill),
+                "<request.json>": "request.json",
+                "<artifact>": "artifact.json",
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(
+            (project / "artifact.json").read_text(encoding="utf-8"),
+            "script branch\n",
+        )
 
     def test_legacy_omitted_mode_stays_observed_and_requires_a_receipt(self) -> None:
         suite = self.create_suite()
@@ -155,9 +256,9 @@ class InstallModeTests(unittest.TestCase):
         self.assertEqual(preserved["mode"], "observed")
         self.assertTrue(preserved["owned_hooks"])
         self.assertTrue(
-            (project / ".agents" / "skills" / "text-report").resolve().is_relative_to(
-                (project / ".selc" / "installs" / "mode-suite" / "entries").resolve()
-            )
+            (project / ".agents" / "skills" / "text-report")
+            .resolve()
+            .is_relative_to((project / ".selc" / "installs" / "mode-suite" / "entries").resolve())
         )
         from selc.managed_runtime import activate
 
@@ -346,6 +447,214 @@ class InstallModeTests(unittest.TestCase):
         self.assertEqual(current_installation(project, "mode-suite")["mode"], "basic")
         for hook_file in (project / ".codex" / "hooks.json", workbuddy_settings):
             self.assertNotIn("managed hook", hook_file.read_text(encoding="utf-8"))
+
+    def test_recovery_replaces_interrupted_hooks_from_an_earlier_interpreter(self) -> None:
+        suite = self.create_suite()
+        project = self.root / "project"
+        install_suite(source=suite, project_root=project, harness="codex", ref=None)
+        install_suite(source=suite, project_root=project, harness="workbuddy", ref=None)
+
+        third_party_command = "echo preserve-third-party-hook"
+        codex_hooks = project / ".codex" / "hooks.json"
+        workbuddy_settings = project / ".codebuddy" / "settings.json"
+        for hook_file in (codex_hooks, workbuddy_settings):
+            hook_file.parent.mkdir(parents=True, exist_ok=True)
+            hook_file.write_text(
+                json.dumps(
+                    {
+                        "hooks": {
+                            "Stop": [
+                                {"hooks": [{"type": "command", "command": third_party_command}]}
+                            ]
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+        import selc.install as install_module
+
+        interpreter_a = self.root / "interpreter A"
+        interpreter_b = self.root / "interpreter B"
+        with (
+            patch.object(install_module.sys, "executable", str(interpreter_a)),
+            patch.object(
+                install_module,
+                "_write_registry",
+                side_effect=SelcError(
+                    "WRITE_FAILED",
+                    "injected registry write interruption",
+                    "recover the interrupted installation",
+                ),
+            ),
+            self.assertRaisesRegex(SelcError, "registry write interruption"),
+        ):
+            install_suite(
+                source=suite,
+                project_root=project,
+                harness="codex",
+                ref=None,
+                mode="observed",
+            )
+
+        journal = project / ".selc" / "installs" / "mode-suite" / "journal.json"
+        journal_record = json.loads(journal.read_text(encoding="utf-8"))
+        self.assertIn(
+            str(interpreter_a),
+            json.dumps(journal_record["new_installation"]["owned_hooks"]),
+        )
+
+        with patch.object(install_module.sys, "executable", str(interpreter_b)):
+            recovered = recover_installation(project, "mode-suite")
+        self.assertEqual(recovered["state"], "completed")
+        recovered_installation = current_installation(project, "mode-suite")
+        self.assertEqual(recovered_installation["mode"], "observed")
+        self.assertIn(str(interpreter_a), json.dumps(recovered_installation["owned_hooks"]))
+        self.assertNotIn(str(interpreter_b), json.dumps(recovered_installation["owned_hooks"]))
+        for hook_file in (codex_hooks, workbuddy_settings):
+            contents = hook_file.read_text(encoding="utf-8")
+            self.assertIn(str(interpreter_a), contents)
+            self.assertNotIn(str(interpreter_b), contents)
+            self.assertIn(third_party_command, contents)
+
+        with patch.object(install_module.sys, "executable", str(interpreter_b)):
+            basic = install_suite(
+                source=suite,
+                project_root=project,
+                harness="codex",
+                ref=None,
+                mode="basic",
+            )
+        self.assertEqual(basic["mode"], "basic")
+        for hook_file in (codex_hooks, workbuddy_settings):
+            contents = hook_file.read_text(encoding="utf-8")
+            self.assertNotIn(str(interpreter_a), contents)
+            self.assertNotIn(str(interpreter_b), contents)
+            self.assertIn(third_party_command, contents)
+
+    def test_recovery_rollback_reuses_old_frozen_hook_commands(self) -> None:
+        suite = self.create_suite()
+        project = self.root / "project"
+
+        import selc.install as install_module
+
+        interpreter_a = self.root / "interpreter A"
+        interpreter_b = self.root / "interpreter B"
+        with patch.object(install_module.sys, "executable", str(interpreter_a)):
+            install_suite(
+                source=suite,
+                project_root=project,
+                harness="codex",
+                ref=None,
+                mode="observed",
+            )
+
+        resource = suite / "resources" / "text-report.json"
+        resource_data = json.loads(resource.read_text(encoding="utf-8"))
+        resource_data["heading"] = "Updated text report"
+        resource.write_text(json.dumps(resource_data), encoding="utf-8")
+        seal_suite(suite)
+
+        codex_hooks = project / ".codex" / "hooks.json"
+        original_write_json = install_module.write_json
+
+        def fail_after_new_hook_write(path: Path, value: object) -> None:
+            original_write_json(path, value)
+            if path == codex_hooks and str(interpreter_b) in json.dumps(value):
+                raise SelcError(
+                    "HOOK_CONFIG_CONFLICT",
+                    "injected new hook write interruption",
+                    "recover the interrupted installation",
+                )
+
+        with (
+            patch.object(install_module.sys, "executable", str(interpreter_b)),
+            patch.object(install_module, "write_json", side_effect=fail_after_new_hook_write),
+            self.assertRaisesRegex(SelcError, "new hook write interruption"),
+        ):
+            install_suite(
+                source=suite,
+                project_root=project,
+                harness="codex",
+                ref=None,
+                mode="observed",
+            )
+
+        def fail_new_recovery_hook_write(path: Path, value: object) -> None:
+            if path == codex_hooks and str(interpreter_b) in json.dumps(value):
+                raise SelcError(
+                    "HOOK_CONFIG_CONFLICT",
+                    "injected completion hook write interruption",
+                    "roll back the interrupted installation",
+                )
+            original_write_json(path, value)
+
+        with (
+            patch.object(install_module.sys, "executable", str(interpreter_b)),
+            patch.object(
+                install_module,
+                "write_json",
+                side_effect=fail_new_recovery_hook_write,
+            ),
+        ):
+            recovered = recover_installation(project, "mode-suite")
+
+        self.assertEqual(recovered["state"], "rolled_back")
+        installation = current_installation(project, "mode-suite")
+        self.assertEqual(installation["mode"], "observed")
+        self.assertIn(str(interpreter_a), json.dumps(installation["owned_hooks"]))
+        self.assertNotIn(str(interpreter_b), json.dumps(installation["owned_hooks"]))
+        contents = codex_hooks.read_text(encoding="utf-8")
+        self.assertIn(str(interpreter_a), contents)
+        self.assertNotIn(str(interpreter_b), contents)
+
+    def test_recovery_requires_complete_journal_hook_ownership(self) -> None:
+        suite = self.create_suite()
+        project = self.root / "project"
+        install_suite(source=suite, project_root=project, harness="codex", ref=None)
+
+        import selc.install as install_module
+
+        with (
+            patch.object(
+                install_module,
+                "_write_registry",
+                side_effect=SelcError(
+                    "WRITE_FAILED",
+                    "injected registry write interruption",
+                    "recover the interrupted installation",
+                ),
+            ),
+            self.assertRaisesRegex(SelcError, "registry write interruption"),
+        ):
+            install_suite(
+                source=suite,
+                project_root=project,
+                harness="codex",
+                ref=None,
+                mode="observed",
+            )
+
+        journal = project / ".selc" / "installs" / "mode-suite" / "journal.json"
+        record = json.loads(journal.read_text(encoding="utf-8"))
+        journal_owned_hooks = record["new_installation"]["owned_hooks"]
+        record["new_installation"]["owned_hooks"] = {}
+        journal.write_text(json.dumps(record), encoding="utf-8")
+
+        recovered = recover_installation(project, "mode-suite")
+
+        self.assertEqual(recovered["state"], "needs_recovery")
+        self.assertTrue(journal.is_file())
+
+        record = json.loads(journal.read_text(encoding="utf-8"))
+        record["new_installation"]["owned_hooks"] = journal_owned_hooks
+        record["new_installation"]["harnesses"] = ["codex", {"invalid": "harness"}]
+        journal.write_text(json.dumps(record), encoding="utf-8")
+
+        malformed_harnesses = recover_installation(project, "mode-suite")
+
+        self.assertEqual(malformed_harnesses["state"], "needs_recovery")
+        self.assertTrue(journal.is_file())
 
     def test_recovery_removes_a_new_harness_after_a_partial_observed_switch(self) -> None:
         suite = self.create_suite()

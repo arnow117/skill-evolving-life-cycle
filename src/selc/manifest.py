@@ -1346,17 +1346,19 @@ def _created_basic_skill_body(skill: str, suite_id: str, action: dict[str, Any])
     if kind == "text-report-v1":
         return (
             frontmatter
-            + "Set `SELC_SKILL_FILE` to the absolute path of this loaded `SKILL.md`. Resolve its "
+            + "Set `SELC_PYTHON` to the absolute path of a Python 3.11+ executable, and set "
+            "`SELC_SKILL_FILE` to the absolute path of this loaded `SKILL.md`. Resolve its "
             "physical directory before using its grandparent as `SELC_SUITE`; keep the project working directory unchanged "
             "so project-relative inputs keep working. This path does not require native hooks "
             "or create observation records.\n\n"
             "```sh\n"
+            'SELC_PYTHON="<absolute path to a Python 3.11+ executable>"\n'
             'SELC_SKILL_FILE="<absolute path to this loaded SKILL.md>"\n'
             'SELC_SKILL_DIR="$(cd -P "$(dirname "$SELC_SKILL_FILE")" && pwd)"\n'
             'SELC_SUITE="$(cd "$SELC_SKILL_DIR/../.." && pwd)"\n'
             "```\n\n"
             "```sh\n"
-            '$SELC_PYTHON "$SELC_SUITE/bin/selc-suite.py" run text-report --input <input.txt> --output <report.md>\n'
+            '"$SELC_PYTHON" "$SELC_SUITE/bin/selc-suite.py" run text-report --input <input.txt> --output <report.md>\n'
             "```\n"
         )
     if kind == "python-script-v1":
@@ -1364,16 +1366,18 @@ def _created_basic_skill_body(skill: str, suite_id: str, action: dict[str, Any])
         if isinstance(script, str):
             return (
                 frontmatter
-                + "Set `SELC_SKILL_FILE` to the absolute path of this loaded `SKILL.md`. Resolve its "
+                + "Set `SELC_PYTHON` to the absolute path of a Python 3.11+ executable, and set "
+                "`SELC_SKILL_FILE` to the absolute path of this loaded `SKILL.md`. Resolve its "
                 "physical directory before using its grandparent as `SELC_SUITE`; keep the project working directory unchanged "
                 "so project-relative inputs keep working. This path does not require a runtime receipt.\n\n"
                 "```sh\n"
+                'SELC_PYTHON="<absolute path to a Python 3.11+ executable>"\n'
                 'SELC_SKILL_FILE="<absolute path to this loaded SKILL.md>"\n'
                 'SELC_SKILL_DIR="$(cd -P "$(dirname "$SELC_SKILL_FILE")" && pwd)"\n'
                 'SELC_SUITE="$(cd "$SELC_SKILL_DIR/../.." && pwd)"\n'
                 "```\n\n"
                 "```sh\n"
-                f'$SELC_PYTHON "$SELC_SUITE/{script}" managed-run --request <request.json> --output <artifact>\n'
+                f'"$SELC_PYTHON" "$SELC_SUITE/{script}" managed-run --request <request.json> --output <artifact>\n'
                 "```\n"
             )
     return (

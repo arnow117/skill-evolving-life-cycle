@@ -433,14 +433,10 @@ def _selected_install_mode(mode: str | None, existing: dict[str, Any] | None) ->
     return _installation_mode(existing) if mode is None else mode
 
 
-def _registration_paths(
-    manifest: dict[str, Any], suite_root: Path, mode: str
-) -> dict[str, str]:
+def _registration_paths(manifest: dict[str, Any], suite_root: Path, mode: str) -> dict[str, str]:
     if mode == "basic":
         return basic_registration_paths(manifest, suite_root)
-    return {
-        skill["name"]: skill["path"] for skill in normalize_declared_skills(manifest["skills"])
-    }
+    return {skill["name"]: skill["path"] for skill in normalize_declared_skills(manifest["skills"])}
 
 
 def _registered_names(installation: dict[str, Any] | None, harness: str) -> list[str]:
@@ -854,6 +850,63 @@ def _preflight_installation_mode(
     _preflight_owned_hook_removal(project_root, harnesses, previous)
 
 
+def _validated_recovery_owned_hooks(
+    installation: dict[str, Any] | None,
+) -> dict[str, dict[str, str]]:
+    """Return complete observed-hook ownership stored in a recovery record.
+
+    Recovery can only remove commands whose exact strings were journaled. An
+    observed installation with incomplete ownership must therefore stay pending
+    instead of guessing which shared hooks belong to this suite.
+    """
+
+    if installation is None or _installation_mode(installation) == "basic":
+        return {}
+
+    raw_harnesses = installation.get("harnesses")
+    if (
+        not isinstance(raw_harnesses, list)
+        or not raw_harnesses
+        or any(
+            not isinstance(harness, str) or harness not in {"codex", "workbuddy"}
+            for harness in raw_harnesses
+        )
+        or len(raw_harnesses) != len(set(raw_harnesses))
+    ):
+        raise SelcError(
+            "RECOVERY_INCOMPLETE",
+            "installation has invalid managed hook ownership metadata",
+            "restore the recorded observed installation before recovering",
+        )
+
+    owned = installation.get("owned_hooks")
+    if not isinstance(owned, dict):
+        raise SelcError(
+            "RECOVERY_INCOMPLETE",
+            "installation has invalid managed hook ownership metadata",
+            "restore the recorded observed installation before recovering",
+        )
+
+    validated: dict[str, dict[str, str]] = {}
+    for harness in raw_harnesses:
+        recorded_events = owned.get(harness)
+        expected_events = set(_managed_hook_events(harness))
+        if not isinstance(recorded_events, dict) or set(recorded_events) != expected_events:
+            raise SelcError(
+                "RECOVERY_INCOMPLETE",
+                "installation has incomplete managed hook ownership metadata",
+                "restore the recorded observed installation before recovering",
+            )
+        if any(not isinstance(command, str) or not command for command in recorded_events.values()):
+            raise SelcError(
+                "RECOVERY_INCOMPLETE",
+                "installation has invalid managed hook ownership metadata",
+                "restore the recorded observed installation before recovering",
+            )
+        validated[harness] = dict(recorded_events)
+    return validated
+
+
 def _entry_commands(entry: object) -> set[str]:
     if not isinstance(entry, dict):
         return set()
@@ -895,13 +948,23 @@ def _sync_managed_hooks(
     suite_id: str,
     harnesses: list[str],
     previous: dict[str, Any] | None,
+    frozen_owned_hooks: dict[str, dict[str, str]] | None = None,
 ) -> dict[str, dict[str, str]]:
-    """Merge the suite's silent collector hooks without touching other hooks."""
+    """Merge the suite's silent collector hooks without touching other hooks.
+
+    Recovery supplies its journaled commands as ``frozen_owned_hooks`` so a
+    later interpreter cannot create a second collector command before the
+    journal records it.
+    """
 
     previous_hooks = (previous or {}).get("owned_hooks", {})
     if not isinstance(previous_hooks, dict):
         previous_hooks = {}
-    planned = _planned_managed_hooks(project_root, root, suite_id, harnesses)
+    planned = (
+        frozen_owned_hooks
+        if frozen_owned_hooks is not None
+        else _planned_managed_hooks(project_root, root, suite_id, harnesses)
+    )
     owned: dict[str, dict[str, str]] = {}
     for harness in harnesses:
         harness_events = _managed_hook_events(harness)
@@ -914,10 +977,10 @@ def _sync_managed_hooks(
                 "project hook configuration has invalid hooks entries",
                 "repair the project hook configuration before installing",
             )
-        old_commands = set()
+        old_commands: set[str] = set()
         prior = previous_hooks.get(harness)
         if isinstance(prior, dict):
-            old_commands = {value for value in prior.values() if isinstance(value, str)}
+            old_commands.update(value for value in prior.values() if isinstance(value, str))
         expected = planned[harness]
         for event in harness_events:
             current = hooks.get(event, [])
@@ -1024,12 +1087,11 @@ def _sync_installation_mode(
     harnesses: list[str],
     previous: dict[str, Any] | None,
     mode: str,
+    frozen_owned_hooks: dict[str, dict[str, str]] | None = None,
 ) -> tuple[dict[str, dict[str, str]], dict[str, list[str]], dict[str, dict[str, str]]]:
     _preflight_installation_mode(project_root, harnesses, previous, mode)
     skill_paths = _registration_paths(manifest, root / "current", mode)
-    entries = (
-        _materialize_managed_entries(root, manifest, harnesses) if mode == "observed" else {}
-    )
+    entries = _materialize_managed_entries(root, manifest, harnesses) if mode == "observed" else {}
     registrations = _sync_all_harnesses(
         project_root,
         root,
@@ -1039,7 +1101,14 @@ def _sync_installation_mode(
         mode,
     )
     owned_hooks = (
-        _sync_managed_hooks(project_root, root, suite_id, harnesses, previous)
+        _sync_managed_hooks(
+            project_root,
+            root,
+            suite_id,
+            harnesses,
+            previous,
+            frozen_owned_hooks,
+        )
         if mode == "observed"
         else _remove_owned_hooks(project_root, harnesses, previous)
     )
@@ -1849,14 +1918,35 @@ def recover_installation(project_root: Path, suite_id: str) -> dict[str, Any]:
                 }
         if not isinstance(new_installation, dict):
             return {"recovered": False, "state": "needs_recovery", "journal": record}
+        previous = record.get("old_installation")
+        old_installation = previous if isinstance(previous, dict) else None
+        raw_harnesses = new_installation.get("harnesses")
+        if (
+            not isinstance(raw_harnesses, list)
+            or not raw_harnesses
+            or any(
+                not isinstance(harness, str) or harness not in {"codex", "workbuddy"}
+                for harness in raw_harnesses
+            )
+            or len(raw_harnesses) != len(set(raw_harnesses))
+        ):
+            return {"recovered": False, "state": "needs_recovery", "journal": record}
+        harnesses = list(raw_harnesses)
+        try:
+            frozen_owned_hooks = _validated_recovery_owned_hooks(new_installation)
+            old_owned_hooks = _validated_recovery_owned_hooks(old_installation)
+        except SelcError:
+            return {"recovered": False, "state": "needs_recovery", "journal": record}
+        if (
+            _installation_mode(new_installation) == "observed"
+            and set(frozen_owned_hooks) != set(harnesses)
+        ) or not set(old_owned_hooks).issubset(harnesses):
+            return {"recovered": False, "state": "needs_recovery", "journal": record}
         new_digest = str(record.get("new_digest", ""))
         new_contents = root / "contents" / new_digest
         try:
             if new_contents.is_dir() and portable_tree_hash(new_contents) == new_digest:
                 manifest = load_manifest(new_contents)
-                harnesses = [str(name) for name in new_installation.get("harnesses", [])]
-                previous = record.get("old_installation")
-                old_installation = previous if isinstance(previous, dict) else None
                 _assert_registration_available(
                     project_root, root, manifest, harnesses, old_installation
                 )
@@ -1876,10 +1966,13 @@ def recover_installation(project_root: Path, suite_id: str) -> dict[str, Any]:
                     harnesses,
                     old_installation,
                     mode,
+                    frozen_owned_hooks,
                 )
                 new_installation["managed_entries"] = entries
                 new_installation["registrations"] = registrations
                 new_installation["owned_hooks"] = owned_hooks
+                record["new_installation"] = new_installation
+                write_json(journal, record)
                 registry = _registry(project_root)
                 registry["installations"][suite_id] = new_installation
                 _write_registry(project_root, registry)
@@ -1942,6 +2035,7 @@ def recover_installation(project_root: Path, suite_id: str) -> dict[str, Any]:
                         old_harnesses,
                         new_installation,
                         mode,
+                        old_owned_hooks,
                     )
                     old_installation["managed_entries"] = entries
                     old_installation["registrations"] = registrations

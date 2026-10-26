@@ -57,6 +57,7 @@ selc install --source /tmp/hello-suite.zip --project-root /tmp/hello-project \
 Run the script from the project working directory so a relative input name resolves in that project:
 
 ```bash
+mkdir -p reports
 python3 examples/item-summary/scripts/item_summary.py managed-run \
   --request request.json --output reports/item-summary.json
 ```
