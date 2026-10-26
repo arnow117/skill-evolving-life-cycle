@@ -234,17 +234,17 @@
       "engineering_context_ref": ".sdlc-v1/context/F-004.engineering.md",
       "id": "F-004",
       "release": {
-        "at": null,
-        "commit": null,
-        "status": "pending"
+        "at": "2026-10-26T13:19:10Z",
+        "commit": "6e08a71b1317ad4785e84635d041d4ac63e0ebca",
+        "status": "released"
       },
       "requirement_id": "REQ-004",
       "review": {
-        "at": null,
-        "by": null,
-        "decision": "pending"
+        "at": "2026-10-26T13:12:54Z",
+        "by": "/root/stats_report_review_committed",
+        "decision": "approved"
       },
-      "status": "in_progress",
+      "status": "released",
       "tasks": {
         "T018": {
           "depends_on": [],
@@ -254,12 +254,12 @@
           "updated_at": "2026-10-26T13:07:57Z"
         }
       },
-      "updated_at": "2026-10-26T13:07:57Z",
+      "updated_at": "2026-10-26T13:19:10Z",
       "validation": {
-        "at": null,
-        "command": null,
-        "commit": null,
-        "result": "pending"
+        "at": "2026-10-26T13:10:48Z",
+        "command": "npm run test:e2e:stats-report -- --output .e2e/runs/validate-6e08a71-elevated",
+        "commit": "6e08a71b1317ad4785e84635d041d4ac63e0ebca",
+        "result": "pass"
       }
     }
   },
@@ -312,9 +312,9 @@
       "id": "REQ-004",
       "priority": "P1",
       "product_context_ref": ".sdlc-v1/context/REQ-004.product.md",
-      "status": "in_delivery",
+      "status": "released",
       "title": "本地统计查看与多项目总览",
-      "updated_at": "2026-10-26T13:07:57Z"
+      "updated_at": "2026-10-26T13:19:10Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",
