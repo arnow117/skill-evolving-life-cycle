@@ -40,6 +40,7 @@ from selc.evaluation import (
     _native_publication_result_failure,
     _native_window_failure,
     _prepare_codex_hook_trust_binding,
+    _project_trust_cli_configuration,
     _qualification_support,
     _read_attempt_native_context,
     bind_real_evaluation_candidate,
@@ -184,7 +185,11 @@ class RealEvaluationContractsTests(unittest.TestCase):
 
     def _prepared_hook_trust_attempt(
         self,
+        *,
+        ancestor_git_root: bool = True,
     ) -> tuple[Path, Path, dict[str, object], dict[str, object]]:
+        if ancestor_git_root:
+            git(["init", "-b", "main"], self.root)
         suite = self.root / "hook-trust-source"
         create_suite("hook-trust-source", "1.0.0", suite, ["text-report"])
         input_path = self.root / "hook-trust-input.json"
@@ -225,8 +230,14 @@ class RealEvaluationContractsTests(unittest.TestCase):
         replacement_source: Path | None = None,
         disabled: bool = False,
         extra_same_source: bool = False,
+        project_trust: str | None = "trusted",
+        project_key: str | None = None,
+        more_specific_untrusted: bool = False,
+        unrelated_sibling_untrusted: bool = False,
+        trust_root: Path | None = None,
     ) -> list[dict[str, object]]:
         project_root = Path(str(state["project_root"]))
+        actual_root = (trust_root or self.root).resolve()
         installation = current_installation(project_root, str(state["installation"]["suite_id"]))
         definitions, _source_hash = _codex_installed_hook_definitions(
             project_root / ".codex" / "hooks.json",
@@ -234,6 +245,33 @@ class RealEvaluationContractsTests(unittest.TestCase):
         )
         source = replacement_source or (project_root / ".codex" / "hooks.json")
         lines: list[str] = []
+        if project_trust is not None:
+            trusted_project_key = project_key or str(actual_root)
+            lines.extend(
+                (
+                    f"[projects.{json.dumps(trusted_project_key)}]",
+                    f"trust_level = {json.dumps(project_trust)}",
+                    "",
+                )
+            )
+        if more_specific_untrusted:
+            child_key = str(project_root.parent.resolve())
+            lines.extend(
+                (
+                    f"[projects.{json.dumps(child_key)}]",
+                    'trust_level = "untrusted"',
+                    "",
+                )
+            )
+        if unrelated_sibling_untrusted:
+            sibling_key = str((actual_root / "unrelated-sibling").resolve())
+            lines.extend(
+                (
+                    f"[projects.{json.dumps(sibling_key)}]",
+                    'trust_level = "untrusted"',
+                    "",
+                )
+            )
         for index, definition in enumerate(definitions):
             state_key = str(definition["state_key"])
             if replacement_source is not None:
@@ -294,7 +332,7 @@ class RealEvaluationContractsTests(unittest.TestCase):
         self.assertEqual(template["policy"]["approval_policy"], "never")
         self.assertEqual(
             template["hook_trust"]["mode"],
-            "normal-state-inheritance-v1",
+            "normal-project-and-hook-state-inheritance-v2",
         )
 
     def test_codex_template_without_normal_hook_trust_remains_unverified(self) -> None:
@@ -303,6 +341,22 @@ class RealEvaluationContractsTests(unittest.TestCase):
         template = build_codex_policy_template("0.163.0-alpha.11", python_root)
         template.pop("hook_trust")
 
+        self.assertEqual(
+            _qualification_support(
+                {
+                    "host": "codex",
+                    "qualification_support": "supported",
+                    "tools_policy_template": template,
+                }
+            ),
+            "unverified",
+        )
+
+        template = build_codex_policy_template("0.163.0-alpha.11", python_root)
+        template["hook_trust"] = {
+            "schema_version": 1,
+            "mode": "normal-state-inheritance-v1",
+        }
         self.assertEqual(
             _qualification_support(
                 {
@@ -335,8 +389,14 @@ class RealEvaluationContractsTests(unittest.TestCase):
             for index, argument in enumerate(command)
             if argument == "-c" and command[index + 1].startswith("hooks.state=")
         )
+        project_configuration = next(
+            command[index + 1]
+            for index, argument in enumerate(command)
+            if argument == "-c" and command[index + 1].startswith("projects=")
+        )
         parsed_configuration = tomllib.loads(trust_configuration)
-        self.assertEqual(command.count("-c"), 8)
+        parsed_project_configuration = tomllib.loads(project_configuration)
+        self.assertEqual(command.count("-c"), 9)
         self.assertEqual(
             parsed_configuration["hooks"]["state"],
             {
@@ -344,7 +404,21 @@ class RealEvaluationContractsTests(unittest.TestCase):
                 for index, definition in enumerate(definitions)
             },
         )
+        self.assertEqual(
+            trust_binding["project_trust"],
+            {
+                "raw_key": str(self.root.resolve()),
+                "trust_level": "trusted",
+            },
+        )
+        self.assertEqual(trust_binding["account_home"], str(account_home))
+        self.assertEqual(
+            parsed_project_configuration["projects"],
+            {str(self.root.resolve()): {"trust_level": "trusted"}},
+        )
+        self.assertFalse((Path(str(state["project_root"])) / ".git").exists())
         self.assertNotIn(str(self.root / "other-project"), trust_configuration)
+        self.assertNotIn(str(self.root / "other-project"), project_configuration)
 
         launch = {
             "schema_version": 1,
@@ -365,6 +439,22 @@ class RealEvaluationContractsTests(unittest.TestCase):
         (attempt_path / "launch-claim.json").write_text(json.dumps(launch), encoding="utf-8")
         self.assertIsNone(_codex_cli_launch_trust_failure(state, matrix))
 
+        tampered_binding = json.loads(json.dumps(trust_binding))
+        tampered_binding["project_trust"]["raw_key"] = "/unexpected/project"
+        tampered_launch = dict(launch)
+        tampered_launch["hook_trust"] = tampered_binding
+        tampered_launch["hook_trust_hash"] = json_hash(tampered_binding)
+        state["launch_claim_hash"] = json_hash(tampered_launch)
+        (attempt_path / "launch-claim.json").write_text(
+            json.dumps(tampered_launch),
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            _codex_cli_launch_trust_failure(state, matrix),
+            "hook-trust-binding-invalid",
+        )
+
+        state["launch_claim_hash"] = json_hash(launch)
         launch["command"] = [*command, "--unexpected"]
         (attempt_path / "launch-claim.json").write_text(json.dumps(launch), encoding="utf-8")
         self.assertEqual(_codex_cli_launch_trust_failure(state, matrix), "launch-claim-tampered")
@@ -402,6 +492,98 @@ class RealEvaluationContractsTests(unittest.TestCase):
         self.assertTrue(config_path.is_file())
         self.assertTrue((project_root / ".codex" / "hooks.json").is_file())
 
+    def test_hook_trust_binding_rejects_missing_untrusted_aliased_or_more_specific_project_trust(
+        self,
+    ) -> None:
+        account_home, _attempt_path, state, matrix = self._prepared_hook_trust_attempt()
+
+        with patch("selc.evaluation._trusted_posix_account_home", return_value=account_home):
+            self._write_normal_hook_trust_state(account_home, state, project_trust=None)
+            with self.assertRaises(SelcError) as missing:
+                _prepare_codex_hook_trust_binding(state, matrix)
+            self.assertEqual(missing.exception.code, "HOOK_TRUST_SOURCE_INVALID")
+
+            self._write_normal_hook_trust_state(account_home, state, project_trust="untrusted")
+            with self.assertRaises(SelcError) as untrusted:
+                _prepare_codex_hook_trust_binding(state, matrix)
+            self.assertEqual(untrusted.exception.code, "HOOK_TRUST_SOURCE_INVALID")
+
+            alias = str(self.root / "hook-trust-plan" / "..")
+            self._write_normal_hook_trust_state(account_home, state, project_key=alias)
+            with self.assertRaises(SelcError) as aliased:
+                _prepare_codex_hook_trust_binding(state, matrix)
+            self.assertEqual(aliased.exception.code, "HOOK_TRUST_SOURCE_INVALID")
+
+            self._write_normal_hook_trust_state(
+                account_home,
+                state,
+                more_specific_untrusted=True,
+            )
+            with self.assertRaises(SelcError) as more_specific:
+                _prepare_codex_hook_trust_binding(state, matrix)
+            self.assertEqual(more_specific.exception.code, "HOOK_TRUST_SOURCE_INVALID")
+
+            self._write_normal_hook_trust_state(
+                account_home,
+                state,
+                unrelated_sibling_untrusted=True,
+            )
+            self.assertIsNotNone(_prepare_codex_hook_trust_binding(state, matrix))
+
+    def test_hook_trust_binding_accepts_a_direct_trusted_repository_root(self) -> None:
+        account_home, _attempt_path, state, matrix = self._prepared_hook_trust_attempt(
+            ancestor_git_root=False
+        )
+        project_root = Path(str(state["project_root"])).resolve()
+        self.assertFalse((project_root / ".git").exists())
+        git(["init", "-b", "main"], project_root)
+        self._write_normal_hook_trust_state(account_home, state, trust_root=project_root)
+
+        with patch("selc.evaluation._trusted_posix_account_home", return_value=account_home):
+            trust_binding = _prepare_codex_hook_trust_binding(state, matrix)
+
+        self.assertEqual(trust_binding["git_identity"]["repository_root"], str(project_root))
+
+    def test_hook_trust_binding_rejects_a_nested_git_repository(self) -> None:
+        account_home, _attempt_path, state, matrix = self._prepared_hook_trust_attempt()
+        project_root = Path(str(state["project_root"]))
+        self._write_normal_hook_trust_state(account_home, state)
+        git(["init", "-b", "main"], project_root)
+
+        with (
+            patch("selc.evaluation._trusted_posix_account_home", return_value=account_home),
+            self.assertRaises(SelcError) as nested,
+        ):
+            _prepare_codex_hook_trust_binding(state, matrix)
+        self.assertEqual(nested.exception.code, "HOOK_TRUST_SOURCE_INVALID")
+
+    def test_hook_trust_binding_rejects_a_worktree_git_file(self) -> None:
+        account_home, _attempt_path, state, matrix = self._prepared_hook_trust_attempt()
+        project_root = Path(str(state["project_root"]))
+        self._write_normal_hook_trust_state(account_home, state)
+        (project_root / ".git").write_text(
+            "gitdir: /unexpected/worktree\n",
+            encoding="utf-8",
+        )
+
+        with (
+            patch("selc.evaluation._trusted_posix_account_home", return_value=account_home),
+            self.assertRaises(SelcError) as worktree,
+        ):
+            _prepare_codex_hook_trust_binding(state, matrix)
+        self.assertEqual(worktree.exception.code, "HOOK_TRUST_SOURCE_INVALID")
+
+    def test_hook_trust_binding_rejects_a_git_environment_identity_change(self) -> None:
+        account_home, _attempt_path, state, matrix = self._prepared_hook_trust_attempt()
+        self._write_normal_hook_trust_state(account_home, state)
+        with (
+            patch("selc.evaluation._trusted_posix_account_home", return_value=account_home),
+            patch.dict(os.environ, {"GIT_DIR": str(self.root / ".git")}, clear=False),
+            self.assertRaises(SelcError) as altered_environment,
+        ):
+            _prepare_codex_hook_trust_binding(state, matrix)
+        self.assertEqual(altered_environment.exception.code, "HOOK_TRUST_SOURCE_INVALID")
+
     def test_hook_trust_binding_rechecks_definition_and_selected_state_before_launch(self) -> None:
         account_home, _attempt_path, state, matrix = self._prepared_hook_trust_attempt()
         self._write_normal_hook_trust_state(account_home, state)
@@ -421,6 +603,42 @@ class RealEvaluationContractsTests(unittest.TestCase):
             hooks["hooks"]["Stop"][0]["unexpected"] = True
             hook_path.write_text(json.dumps(hooks), encoding="utf-8")
             self.assertTrue(_codex_hook_trust_changed(trust_binding, state, matrix))
+
+    def test_hook_trust_binding_rechecks_project_repository_and_config_before_launch(self) -> None:
+        account_home, _attempt_path, state, matrix = self._prepared_hook_trust_attempt()
+        self._write_normal_hook_trust_state(account_home, state)
+
+        with patch("selc.evaluation._trusted_posix_account_home", return_value=account_home):
+            trust_binding = _prepare_codex_hook_trust_binding(state, matrix)
+            config_path = account_home / ".codex" / "config.toml"
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8") + "\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(_codex_hook_trust_changed(trust_binding, state, matrix))
+
+            self._write_normal_hook_trust_state(account_home, state)
+            project_root = Path(str(state["project_root"]))
+            git_directory = project_root / ".git"
+            self.assertFalse(git_directory.exists())
+            git_directory.write_text(
+                "gitdir: /unexpected/worktree\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(_codex_hook_trust_changed(trust_binding, state, matrix))
+
+    def test_project_trust_cli_configuration_preserves_a_dotted_path_as_one_key(self) -> None:
+        configuration = _project_trust_cli_configuration(
+            {
+                "raw_key": "/private/evaluation.project/with.dots",
+                "trust_level": "trusted",
+            }
+        )
+
+        self.assertEqual(
+            tomllib.loads(configuration),
+            {"projects": {"/private/evaluation.project/with.dots": {"trust_level": "trusted"}}},
+        )
 
     def test_codex_policy_template_matches_only_its_two_runtime_parameters(self) -> None:
         python_root = self.root / "template-python"

@@ -5,3 +5,5 @@ __pycache__/
 .venv/
 .selc/
 dist/
+node_modules/
+.e2e/

@@ -227,6 +227,40 @@
         "commit": "33345ea55492c508d2e153a3b6195d394fcd8d51",
         "result": "pass"
       }
+    },
+    "F-004": {
+      "branch": "codex/auto-observation",
+      "created_at": "2026-10-26T11:12:13Z",
+      "engineering_context_ref": ".sdlc-v1/context/F-004.engineering.md",
+      "id": "F-004",
+      "release": {
+        "at": null,
+        "commit": null,
+        "status": "pending"
+      },
+      "requirement_id": "REQ-004",
+      "review": {
+        "at": null,
+        "by": null,
+        "decision": "pending"
+      },
+      "status": "in_progress",
+      "tasks": {
+        "T018": {
+          "depends_on": [],
+          "id": "T018",
+          "status": "done",
+          "title": "实现只读统计 HTML 报告与完整离线验证",
+          "updated_at": "2026-10-26T11:56:09Z"
+        }
+      },
+      "updated_at": "2026-10-26T11:56:09Z",
+      "validation": {
+        "at": null,
+        "command": null,
+        "commit": null,
+        "result": "pending"
+      }
     }
   },
   "requirements": {
@@ -268,6 +302,19 @@
       "status": "released",
       "title": "SELC基础可用版首发与双端同步",
       "updated_at": "2026-10-26T04:56:44Z"
+    },
+    "REQ-004": {
+      "created_at": "2026-10-26T09:57:44Z",
+      "depends_on": [],
+      "description": "只读查看显式指定本机项目的四轴统计、筛选与并列总览，保持现有口径和数据边界。",
+      "domain": "skill-observability",
+      "feature_id": "F-004",
+      "id": "REQ-004",
+      "priority": "P1",
+      "product_context_ref": ".sdlc-v1/context/REQ-004.product.md",
+      "status": "in_delivery",
+      "title": "本地统计查看与多项目总览",
+      "updated_at": "2026-10-26T11:56:09Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",
