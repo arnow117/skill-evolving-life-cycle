@@ -54,6 +54,16 @@ class BoundaryContractTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
+        self.qualification = patch(
+            "selc.evolve.validate_real_evaluation",
+            return_value={
+                "schema_version": 2,
+                "execution_type": "real-harness",
+                "evaluation_hash": "synthetic-fixture-only",
+            },
+        )
+        self.qualification.start()
+        self.addCleanup(self.qualification.stop)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()

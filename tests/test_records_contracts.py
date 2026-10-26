@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 import threading
@@ -11,7 +12,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
-from selc import records
+from selc import observation, records
 from selc.errors import SelcError
 from selc.util import json_hash, read_json, write_json
 
@@ -223,6 +224,69 @@ class RecordContractTests(unittest.TestCase):
         records.close_task(database, "task")
         deleted = records.delete_records(database, suite_id="suite", before=None, apply=True)
         self.assertEqual(deleted["deleted"]["local_tasks"], 1)
+
+    def test_delete_preview_cli_serializes_observation_rows_without_mutating_records(self) -> None:
+        project = self.root / "delete-preview"
+        database = records.open_database(project)
+        self.start_task(database)
+        observation.ingest(
+            database,
+            {
+                "protocol": 1,
+                "adapter": {"name": "fixture", "version": "1"},
+                "identity": {
+                    "installation_id": "installation",
+                    "host": "codex",
+                    "surface": "test",
+                    "session_id": "session",
+                    "turn_id": "turn",
+                    "native_event_id": "delete-preview-event",
+                    "phase": "lifecycle",
+                },
+                "source_context": {"id": "delete-preview", "epoch": 1},
+                "kind": "automatic_retry",
+                "occurred_at": "2026-10-20T02:00:00Z",
+                "classification": {
+                    "version": "observation-v1",
+                    "facts": {
+                        "task_id": "task",
+                        "actor": "agent",
+                        "origin": "managed_semantic",
+                        "causation": "automatic_retry",
+                    },
+                    "evidence": ["fixture"],
+                },
+            },
+        )
+        database.close()
+
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(REPO_ROOT / "scripts" / "selc.py"),
+                "delete",
+                "--project-root",
+                str(project),
+                "--suite-id",
+                "suite",
+            ],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        preview = json.loads(completed.stdout)
+        self.assertEqual(preview["preview"]["observations"], 1)
+        reopened = records.open_database(project)
+        try:
+            self.assertEqual(reopened.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 1)
+            self.assertEqual(
+                reopened.execute("SELECT COUNT(*) FROM observation_events").fetchone()[0], 1
+            )
+        finally:
+            reopened.close()
 
     def test_sequence_readiness_and_permission_events_are_preserved(self) -> None:
         database = self.database("sequence")

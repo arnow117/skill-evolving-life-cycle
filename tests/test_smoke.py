@@ -10,7 +10,10 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CLI = REPO_ROOT / "scripts" / "selc.py"
@@ -148,6 +151,35 @@ def write_release_fake(
 
 
 class SelcSmokeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        qualification = patch(
+            "selc.evolve.validate_real_evaluation",
+            return_value={
+                "schema_version": 2,
+                "execution_type": "real-harness",
+                "evaluation_hash": "synthetic-fixture-only",
+            },
+        )
+        qualification.start()
+        self.addCleanup(qualification.stop)
+
+    def _run_cli_in_process(self, *arguments: str, expected: int = 0) -> dict[str, object]:
+        """Keep legacy contribution tests focused on their own safety contracts.
+
+        Fixture evaluation remains a public CLI rejection.  The old provider
+        adapter exercise uses the shared qualification seam in process so it
+        does not become a fixture-based production bypass.
+        """
+
+        import selc.cli as cli_module
+
+        stdout = StringIO()
+        with redirect_stdout(stdout):
+            exit_code = cli_module.main(list(arguments))
+        value = json.loads(stdout.getvalue())
+        self.assertEqual(exit_code, expected, value)
+        return value
+
     def test_create_install_run_and_stats(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary = Path(temporary_directory)
@@ -182,8 +214,8 @@ class SelcSmokeTests(unittest.TestCase):
                 skill_body = archive.read("skills/text-report/SKILL.md").decode("utf-8")
             self.assertNotIn(".selc/business-output.txt", names)
             self.assertNotIn(".git/config", names)
-            self.assertIn("task start", skill_body)
-            self.assertIn("Scanning, discovery", skill_body)
+            self.assertIn("managed runtime verifies", skill_body)
+            self.assertIn("Discovery or scanning creates no lifecycle record", skill_body)
             unsafe_package = run_cli(
                 "package",
                 "--suite",
@@ -545,6 +577,9 @@ class SelcSmokeTests(unittest.TestCase):
             )
 
     def test_git_update_leases_local_edits_candidate_and_release(self) -> None:
+        cli_patch = patch(f"{__name__}.run_cli", side_effect=self._run_cli_in_process)
+        cli_patch.start()
+        self.addCleanup(cli_patch.stop)
         with tempfile.TemporaryDirectory() as temporary_directory:
             temporary = Path(temporary_directory)
             repository = temporary / "repository"

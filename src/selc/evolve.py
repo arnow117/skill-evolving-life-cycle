@@ -15,6 +15,7 @@ from typing import Any
 from urllib.parse import quote, urlparse
 
 from .errors import SelcError
+from .evaluation import FIXTURE_EXECUTION_TYPE, REPORT_SCHEMA_VERSION, validate_real_evaluation
 from .manifest import (
     load_framework,
     load_manifest,
@@ -120,7 +121,8 @@ def evaluate_candidate(
         )
     if candidate_number > candidate_limit:
         report = {
-            "schema_version": 1,
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "execution_type": FIXTURE_EXECUTION_TYPE,
             "status": "budget_exhausted",
             "budget": "candidate_limit",
             "candidate_number": candidate_number,
@@ -183,7 +185,8 @@ def evaluate_candidate(
             elapsed_total = time.monotonic() - started_at
             if elapsed_run > run_timeout_seconds or elapsed_total > total_timeout_seconds:
                 report = {
-                    "schema_version": 1,
+                    "schema_version": REPORT_SCHEMA_VERSION,
+                    "execution_type": FIXTURE_EXECUTION_TYPE,
                     "status": "timeout",
                     "candidate_hash": candidate_hash,
                     "oracle_hash": protected["oracle_hash"],
@@ -205,7 +208,8 @@ def evaluate_candidate(
                 }
             )
     report = {
-        "schema_version": 1,
+        "schema_version": REPORT_SCHEMA_VERSION,
+        "execution_type": FIXTURE_EXECUTION_TYPE,
         "status": "passed" if all(item["candidate_pass"] for item in results) else "failed",
         "baseline_hash": protected["baseline_hash"],
         "candidate_hash": candidate_hash,
@@ -242,6 +246,7 @@ def prepare_contribution(
             f"contribution workspace already exists: {workspace}",
             "choose an empty workspace path",
         )
+    qualification = validate_real_evaluation(evaluation_path, candidate_root)
     manifest = load_manifest(suite_root)
     (
         source_location,
@@ -258,20 +263,33 @@ def prepare_contribution(
         suite_id,
     )
     evaluation = read_json(evaluation_path)
-    if evaluation.get("status") != "passed":
+    if (
+        evaluation.get("execution_type") != "real-harness"
+        and evaluation.get("status") != "passed"
+    ):
         raise SelcError(
             "EVALUATION_REQUIRED",
             "a passed evaluation is required before contribution preparation",
             "evaluate the candidate before preparing a contribution",
         )
-    _validate_candidate_structure(candidate_root, evaluation)
     candidate_hash = tree_hash(candidate_root)
-    if evaluation.get("candidate_hash") != candidate_hash:
+    if (
+        evaluation.get("execution_type") == "real-harness"
+        and qualification.get("candidate_business_hash", candidate_hash) != candidate_hash
+    ):
         raise SelcError(
             "EVALUATION_STALE",
             "candidate changed after evaluation",
             "evaluate the current candidate again",
         )
+    if evaluation.get("execution_type") != "real-harness":
+        _validate_candidate_structure(candidate_root, evaluation)
+        if evaluation.get("candidate_hash") != candidate_hash:
+            raise SelcError(
+                "EVALUATION_STALE",
+                "candidate changed after evaluation",
+                "evaluate the current candidate again",
+            )
     branch = f"codex/contribution-{candidate_hash[:12]}"
     run_argv(["git", "clone", "--no-checkout", source_location, str(workspace)])
     run_argv(["git", "checkout", "--detach", source_commit], cwd=workspace)
@@ -286,8 +304,26 @@ def prepare_contribution(
             "edit the candidate before preparing a contribution",
         )
     _apply_candidate_business(candidate_root, workspace_suite)
+    qualified_version = qualification.get("version")
+    if evaluation.get("execution_type") == "real-harness":
+        if not isinstance(qualified_version, str) or not qualified_version:
+            raise SelcError(
+                "EVALUATION_STALE",
+                "real evaluation has no exact qualified manifest version",
+                "evaluate and bind the exact portable snapshot again",
+            )
+        _set_suite_version(workspace_suite, qualified_version)
     _refresh_manifest_hash(workspace_suite)
     prepared_suite_hash = portable_tree_hash(workspace_suite)
+    if (
+        evaluation.get("execution_type") == "real-harness"
+        and qualification.get("candidate_snapshot_hash") != prepared_suite_hash
+    ):
+        raise SelcError(
+            "EVALUATION_STALE",
+            "prepared contribution does not exactly match the evaluated portable snapshot",
+            "evaluate the current portable candidate again",
+        )
     prepared_business_hash = _business_content_hash(workspace_suite)
     prepared_manifest_hash = file_hash(workspace_suite / "suite.json")
     prepared_runtime_hash = tree_hash(workspace_suite / "runtime")
@@ -311,6 +347,7 @@ def prepare_contribution(
         "candidate_hash": candidate_hash,
         "evaluation": str(evaluation_path.resolve()),
         "evaluation_hash": file_hash(evaluation_path),
+        "qualification": qualification,
         "workspace": str(workspace.resolve()),
         "workspace_base_head": source_commit,
         "workspace_suite_hash": prepared_suite_hash,
@@ -563,16 +600,37 @@ def execute_contribution(
             "prepare a new contribution workspace",
         )
     evaluation = read_json(evaluation_path)
+    qualification = validate_real_evaluation(evaluation_path, candidate_root)
+    if qualification != plan.get("qualification"):
+        raise SelcError(
+            "CONTRIBUTION_STALE",
+            "real evaluation qualification changed after contribution preparation",
+            "prepare a new contribution workspace",
+        )
     if (
-        evaluation.get("status") != "passed"
-        or evaluation.get("candidate_hash") != plan["candidate_hash"]
+        evaluation.get("execution_type") != "real-harness"
+        and evaluation.get("status") != "passed"
     ):
         raise SelcError(
             "CONTRIBUTION_STALE",
             "contribution no longer has a passed evaluation for its candidate",
             "evaluate the candidate and prepare a new contribution workspace",
         )
-    _validate_candidate_structure(candidate_root, evaluation)
+    if evaluation.get("execution_type") == "real-harness":
+        if qualification.get("candidate_business_hash", plan["candidate_hash"]) != plan["candidate_hash"]:
+            raise SelcError(
+                "CONTRIBUTION_STALE",
+                "real evaluation no longer matches the candidate business content",
+                "prepare a new contribution workspace",
+            )
+    else:
+        _validate_candidate_structure(candidate_root, evaluation)
+        if evaluation.get("candidate_hash") != plan["candidate_hash"]:
+            raise SelcError(
+                "CONTRIBUTION_STALE",
+                "contribution no longer has a passed evaluation for its candidate",
+                "evaluate the candidate and prepare a new contribution workspace",
+            )
     if not diff_path.is_file() or file_hash(diff_path) != plan["diff_hash"]:
         raise SelcError(
             "CONTRIBUTION_STALE",
@@ -897,7 +955,16 @@ def _apply_candidate_business(candidate_root: Path, suite_root: Path) -> None:
 
 def _refresh_manifest_hash(suite_root: Path) -> None:
     manifest = read_json(suite_root / "suite.json")
+    manifest.pop("content_hash", None)
+    write_json(suite_root / "suite.json", manifest)
     manifest["content_hash"] = suite_content_hash(suite_root)
+    write_json(suite_root / "suite.json", manifest)
+
+
+def _set_suite_version(suite_root: Path, version: str) -> None:
+    manifest = read_json(suite_root / "suite.json")
+    manifest["version"] = version
+    manifest.pop("content_hash", None)
     write_json(suite_root / "suite.json", manifest)
 
 
@@ -1264,6 +1331,7 @@ def prepare_release(
     center: Path | None,
     repository: str | None,
 ) -> dict[str, Any]:
+    qualification = validate_real_evaluation(evaluation_path, candidate_root)
     load_manifest(suite_root)
     safe_tag = _release_tag_path(tag)
     repository_root = _find_git_root(suite_root)
@@ -1301,19 +1369,33 @@ def prepare_release(
             )
         destination = {"kind": provider, "repository": repository}
     evaluation = read_json(evaluation_path)
-    if evaluation.get("status") != "passed":
+    if (
+        evaluation.get("execution_type") != "real-harness"
+        and evaluation.get("status") != "passed"
+    ):
         raise SelcError(
             "EVALUATION_REQUIRED",
             "a passed evaluation is required before release preparation",
             "fix the candidate and evaluate it",
         )
-    if evaluation.get("candidate_hash") != tree_hash(candidate_root):
+    candidate_hash = tree_hash(candidate_root)
+    if (
+        evaluation.get("execution_type") == "real-harness"
+        and qualification.get("candidate_business_hash", candidate_hash) != candidate_hash
+    ):
         raise SelcError(
             "EVALUATION_STALE",
             "candidate changed after evaluation",
             "evaluate the current candidate again",
         )
-    _validate_candidate_structure(candidate_root, evaluation)
+    if evaluation.get("execution_type") != "real-harness":
+        _validate_candidate_structure(candidate_root, evaluation)
+        if evaluation.get("candidate_hash") != candidate_hash:
+            raise SelcError(
+                "EVALUATION_STALE",
+                "candidate changed after evaluation",
+                "evaluate the current candidate again",
+            )
     package_path = output.with_suffix(".zip")
     with tempfile.TemporaryDirectory(prefix="selc-release-suite-") as temporary:
         checkout = Path(temporary) / "checkout"
@@ -1332,6 +1414,24 @@ def prepare_release(
         target_suite = checkout / suite_subdir
         target_manifest = load_manifest(target_suite)
         target_suite_hash = portable_tree_hash(target_suite)
+        if (
+            evaluation.get("execution_type") == "real-harness"
+            and qualification.get("candidate_snapshot_hash") != target_suite_hash
+        ):
+            raise SelcError(
+                "CANDIDATE_NOT_IN_TARGET",
+                "release target portable tree differs from the evaluated snapshot",
+                "build the release from the exact evaluated contribution commit",
+            )
+        if (
+            evaluation.get("execution_type") == "real-harness"
+            and target_manifest["version"] != qualification.get("version")
+        ):
+            raise SelcError(
+                "CANDIDATE_NOT_IN_TARGET",
+                "release target manifest version differs from the qualified snapshot",
+                "release the exact qualified version instead of relabeling a different snapshot",
+            )
         if _business_content_hash(target_suite) != _business_content_hash(candidate_root):
             raise SelcError(
                 "CANDIDATE_NOT_IN_TARGET",
@@ -1367,10 +1467,11 @@ def prepare_release(
         },
         "suite_hash": released_suite_hash,
         "target_suite_hash": target_suite_hash,
-        "candidate_hash": tree_hash(candidate_root),
+        "candidate_hash": candidate_hash,
         "candidate_path": str(candidate_root.resolve()),
         "evaluation_hash": file_hash(evaluation_path),
         "evaluation_path": str(evaluation_path.resolve()),
+        "qualification": qualification,
         "package": str(package_path),
         "package_hash": file_hash(package_path),
         "package_summary": package,
@@ -1529,6 +1630,13 @@ def _validate_release_execution(plan_path: Path, confirmation_path: Path) -> dic
         raise SelcError(
             "CONFIRMATION_STALE",
             "evaluation changed after release preparation",
+            "prepare and confirm a new release plan",
+        )
+    qualification = validate_real_evaluation(evaluation_path, candidate_path)
+    if qualification != plan.get("qualification"):
+        raise SelcError(
+            "CONFIRMATION_STALE",
+            "real evaluation qualification changed after release preparation",
             "prepare and confirm a new release plan",
         )
     source_repository = str(plan.get("source_repository", ""))
