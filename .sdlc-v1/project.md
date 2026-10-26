@@ -1,5 +1,9 @@
 # SELC 项目上下文
 
+当前正式基础版为 [v0.1.0](https://github.com/arnow117/skill-evolving-life-cycle/releases/tag/v0.1.0)，2026-10-26 发布。GitHub/Gitee 的同一注释 tag 固定到 `33345ea55492c508d2e153a3b6195d394fcd8d51`；默认 `codex/design` 已整合对应代码。GitHub 提供源码、framework ZIP、普通 skill ZIP、basic suite ZIP、SHA256SUMS。Gitee 同步公开源码/tag，固定资产使用 GitHub 同版入口；没有创建 Gitee native Release。正式验证、独立评审、重新下载后的 hash/doctor/basic 安装输出证据见 F-003 工程上下文。
+
+BASIC 新安装默认不启用 hooks、不要求 receipt、不自动统计。observed/自动统计/真实 creator及评估/自动贡献发布流水线为实验功能，F-002/T011 仍未完成。本次发布没有模型/provider/桌面测试，旧验证范围不能扩推为实验功能完成。以下较早事实保留历史语境，当前发布以 F-003 为准。
+
 更新：2026-10-26。项目根为本文件上两级的独立 Git 仓库；F-002分支 `codex/auto-observation`，初始实现 commit `7cab4b8`，当前业务版本以 Git HEAD/正式 validation 绑定为准。origin 为公开 GitHub 仓库 https://github.com/arnow117/skill-evolving-life-cycle；基线及用户选择的MIT许可证`8d8328c`已推到`codex/design`，该分支为当前PR基线。
 
 当前安装接口按 SRC-212 分为 basic/observed：新安装默认 basic，普通正文直接注册到 `.codebuddy/skills` 或 `.agents/skills`，不安装采集 hooks、不要求 receipt；已有安装省略模式保留原选择，旧无模式登记按 observed。显式 `--mode observed` 才启用自动统计/受管执行。manifest 可选 `basic_path` 为 skills/ 下独立普通正文；受管旧包没有该正文时需作者补齐或继续 observed。README 是唯一 usage 入口，CLI 参数为权威。T011 真实评估仍未完成，不由基础模式的离线检查替代。

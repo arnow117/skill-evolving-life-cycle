@@ -191,17 +191,17 @@
       "engineering_context_ref": ".sdlc-v1/context/F-003.engineering.md",
       "id": "F-003",
       "release": {
-        "at": null,
-        "commit": null,
-        "status": "pending"
+        "at": "2026-10-26T04:56:44Z",
+        "commit": "33345ea55492c508d2e153a3b6195d394fcd8d51",
+        "status": "released"
       },
       "requirement_id": "REQ-003",
       "review": {
-        "at": null,
-        "by": null,
-        "decision": "pending"
+        "at": "2026-10-26T04:51:37Z",
+        "by": "basic_release_review",
+        "decision": "approved"
       },
-      "status": "in_progress",
+      "status": "released",
       "tasks": {
         "T016": {
           "depends_on": [],
@@ -220,12 +220,12 @@
           "updated_at": "2026-10-26T04:46:23Z"
         }
       },
-      "updated_at": "2026-10-26T04:46:23Z",
+      "updated_at": "2026-10-26T04:56:44Z",
       "validation": {
-        "at": null,
-        "command": null,
-        "commit": null,
-        "result": "pending"
+        "at": "2026-10-26T04:50:00Z",
+        "command": "Fresh 33345ea archive doctor, tests.test_install_modes (17), portable BASIC installation and output, runtime/license byte comparisons, source and ZIP integrity, SHA256SUMS; reused unchanged README/item-summary smoke per F-003 Validation",
+        "commit": "33345ea55492c508d2e153a3b6195d394fcd8d51",
+        "result": "pass"
       }
     }
   },
@@ -265,9 +265,9 @@
       "id": "REQ-003",
       "priority": "P0",
       "product_context_ref": ".sdlc-v1/context/REQ-003.product.md",
-      "status": "in_delivery",
+      "status": "released",
       "title": "SELC基础可用版首发与双端同步",
-      "updated_at": "2026-10-26T04:46:23Z"
+      "updated_at": "2026-10-26T04:56:44Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",
