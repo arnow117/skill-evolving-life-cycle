@@ -251,10 +251,10 @@
           "id": "T018",
           "status": "done",
           "title": "实现只读统计 HTML 报告与完整离线验证",
-          "updated_at": "2026-10-26T11:56:09Z"
+          "updated_at": "2026-10-26T13:07:57Z"
         }
       },
-      "updated_at": "2026-10-26T11:56:09Z",
+      "updated_at": "2026-10-26T13:07:57Z",
       "validation": {
         "at": null,
         "command": null,
@@ -314,7 +314,7 @@
       "product_context_ref": ".sdlc-v1/context/REQ-004.product.md",
       "status": "in_delivery",
       "title": "本地统计查看与多项目总览",
-      "updated_at": "2026-10-26T11:56:09Z"
+      "updated_at": "2026-10-26T13:07:57Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

@@ -228,9 +228,45 @@ def _record_unknown_project(project: Path) -> None:
         database.close()
 
 
+def _record_test_only_project(project: Path) -> None:
+    database = records.open_database(project)
+    try:
+        records.start_task(
+            database,
+            task_id="test-only-task",
+            suite_id="test-only-suite",
+            suite_version="1.0",
+            harness="codex",
+            initiator="fixture",
+            evidence="fixture-only",
+            is_test=True,
+        )
+        records.start_call(
+            database,
+            call_id="test-only-call",
+            task_id="test-only-task",
+            skill="summary",
+            executor="codex",
+            evidence="fixture-only",
+            expected_version="1.0",
+            expected_hash="fixture-hash",
+            trigger_kind="explicit",
+        )
+        database.execute(
+            "UPDATE tasks SET first_result = 'pass', current_result = 'pass' WHERE task_id = 'test-only-task'"
+        )
+        database.execute(
+            "UPDATE calls SET first_result = 'pass', result = 'pass' WHERE call_id = 'test-only-call'"
+        )
+        database.commit()
+    finally:
+        database.close()
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--include-test", action="store_true")
     arguments = parser.parse_args()
     root = arguments.output.parent
     root.mkdir(parents=True, exist_ok=True)
@@ -240,6 +276,7 @@ def main() -> int:
     conflict = root / "conflict"
     malicious = root / "malicious"
     unknown = root / "unknown"
+    test_only = root / "test-only"
     _record_project(
         alpha,
         suite="suite-alpha",
@@ -252,6 +289,7 @@ def main() -> int:
     _record_conflict_project(conflict)
     _record_project(malicious, suite=MALICIOUS_SUITE, version="1.0", harness="codex")
     _record_unknown_project(unknown)
+    _record_test_only_project(test_only)
     registry = basic / ".selc" / "installations.json"
     registry.parent.mkdir(parents=True, exist_ok=True)
     registry.write_text(
@@ -259,9 +297,9 @@ def main() -> int:
         encoding="utf-8",
     )
     generate_stats_report(
-        [alpha, beta, root / "unavailable", basic, conflict, malicious, unknown],
+        [alpha, beta, root / "unavailable", basic, conflict, malicious, unknown, test_only],
         arguments.output,
-        include_test=False,
+        include_test=arguments.include_test,
     )
     return 0
 

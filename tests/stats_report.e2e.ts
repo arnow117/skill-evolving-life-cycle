@@ -14,11 +14,17 @@ const reportUrl = 'http://127.0.0.1:9/report.html';
 const maliciousSuite = '</script><!--<script><img src=x onerror="window.injected=true">';
 let expectedReportHash = '';
 
-function createReport(): void {
-  execFileSync(python, ['tests/stats_report_fixture.py', '--output', reportPath], {
+function createReport(includeTest = false): void {
+  const commandArguments = ['tests/stats_report_fixture.py', '--output', reportPath];
+  if (includeTest) commandArguments.push('--include-test');
+  execFileSync(python, commandArguments, {
     cwd: resolve(repositoryRoot, '..'),
     stdio: 'pipe',
   });
+}
+
+function refreshExpectedReportHash(): void {
+  expectedReportHash = createHash('sha256').update(readFileSync(reportPath)).digest('hex');
 }
 
 async function cardMetrics(browser: { evaluate: (fn: () => unknown) => Promise<unknown> }): Promise<number[][]> {
@@ -45,7 +51,7 @@ function assertAllCards(metrics: number[][], expected: number[]): void {
 
 test.beforeEach(async ({ browser }) => {
   createReport();
-  expectedReportHash = createHash('sha256').update(readFileSync(reportPath)).digest('hex');
+  refreshExpectedReportHash();
 
   await browser.route('**/*', async (route) => {
     await route.abort();
@@ -74,6 +80,9 @@ test('opens the generated file report at desktop width without external resource
     screen.getByText('suite-alpha · 1.0 · codex · manual', { exact: true }),
   ).toBeVisible();
   await expect(screen.getByText('SOURCE_NOT_FOUND', { exact: false })).toBeVisible();
+  await expect(
+    screen.getByText('恢复：verify the selected project directory and regenerate', { exact: false }),
+  ).toBeVisible();
   const alphaFirstMetric = await browser.evaluate(() =>
     Array.from(document.querySelector('#metrics .metric-card')?.querySelectorAll('dd') ?? []).map(
       (value) => Number(value.textContent),
@@ -175,6 +184,47 @@ test('keeps a test-only filter selected when returning to production-only data',
   await expect(
     screen.getByText('suite-alpha · 1.0 · codex · manual', { exact: true }),
   ).toBeVisible();
+});
+
+test('keeps a test-only project status aligned with the initial scope and toggle', async ({ app, browser, screen }) => {
+  createReport(true);
+  refreshExpectedReportHash();
+  await browser.setViewport({ width: 768, height: 900 });
+  await app.open();
+  await browser.goto(reportUrl);
+  await screen.getByLabel('项目').selectOption({ value: 'project-8' });
+  await expect(
+    screen.getByText('test-only-suite · 1.0 · codex · fixture', { exact: true }),
+  ).toBeVisible();
+  await expect(screen.getByText('当前统计范围包含测试样本。', { exact: false })).toBeVisible();
+  assertAllCards(await cardMetrics(browser), [1, 1, 1, 0]);
+
+  const initialStatus = await browser.evaluate(() =>
+    Array.from(document.querySelectorAll('#project-overview tr')).find(
+      (row) => row.cells[0]?.textContent === 'test-only',
+    )?.cells[1]?.textContent,
+  );
+  if (initialStatus !== '可读快照') {
+    throw new Error(`unexpected test-only status with initial --include-test: ${initialStatus}`);
+  }
+
+  await screen.getByLabel('包含测试样本').uncheck();
+  await expect(
+    screen.getByText('可读记录库：当前统计范围（不含测试样本）暂无样本', { exact: true }),
+  ).toBeVisible();
+  await expect(screen.getByText('当前统计范围不包含测试样本。', { exact: false })).toBeVisible();
+  assertAllCards(await cardMetrics(browser), [0, 0, 0, 0]);
+
+  await screen.getByLabel('包含测试样本').check();
+  assertAllCards(await cardMetrics(browser), [1, 1, 1, 0]);
+  const restoredStatus = await browser.evaluate(() =>
+    Array.from(document.querySelectorAll('#project-overview tr')).find(
+      (row) => row.cells[0]?.textContent === 'test-only',
+    )?.cells[1]?.textContent,
+  );
+  if (restoredStatus !== '可读快照') {
+    throw new Error(`unexpected test-only status after restoring test scope: ${restoredStatus}`);
+  }
 });
 
 test('renders hostile grouping text as text under the report CSP', async ({ app, browser, screen }) => {

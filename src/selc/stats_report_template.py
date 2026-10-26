@@ -414,10 +414,19 @@ function renderOverview() {
 }
 
 function projectStatusText(project) {
-  if (project.status === 'error') return `${project.error.code}：${project.error.message}`;
+  if (project.status === 'error') {
+    return `${project.error.code}：${project.error.message} · 恢复：${project.error.recovery}`;
+  }
   if (project.status === 'basic_no_records') return '基础模式：默认不采集';
-  if (project.status === 'empty') return '可读记录库：暂无样本';
+  if (selectedProjection(project).cells.length === 0) {
+    const scope = state.includeTest ? '包含测试样本' : '不含测试样本';
+    return `可读记录库：当前统计范围（${scope}）暂无样本`;
+  }
   return '可读快照';
+}
+
+function projectionScopeText() {
+  return state.includeTest ? '当前统计范围包含测试样本。' : '当前统计范围不包含测试样本。';
 }
 
 function modeDescription(project) {
@@ -544,7 +553,7 @@ function renderDetail() {
   }
   notice.hidden = false;
   notice.className = 'notice';
-  notice.textContent = `快照读取于 ${project.read_at}。筛选只重新计算本报告内的数据；需要更新记录时请重新生成。${modeDescription(project)}`;
+  notice.textContent = `快照读取于 ${project.read_at}。${projectionScopeText()}筛选只重新计算本报告内的数据；需要更新记录时请重新生成。${modeDescription(project)}`;
   renderMetrics(project);
   renderGroups(project);
 }
