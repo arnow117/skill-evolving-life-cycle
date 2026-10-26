@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from .errors import SelcError
+from .install import install_root
 from .managed_runtime import (
     PERMISSION_DENIED_PHASE,
     PERMISSION_PHASE,
@@ -24,15 +25,18 @@ from .managed_runtime import (
     PRE_PHASE,
     STOP_PHASE,
     USER_PROMPT_PHASE,
+    WORKBUDDY_SUPPORTED_CLIENT_VERSIONS,
     observe_request_boundary,
     parse_installed_managed_command,
 )
+from .manifest import load_manifest, normalize_declared_skills
 
 HOOK_EVENT_TO_PHASE = {"PreToolUse": PRE_PHASE, "PostToolUse": POST_PHASE}
 HOST_TOOL_NAMES = {
     "codex": {"Bash", "exec_command", "shell"},
     "workbuddy": {"Bash", "exec_command", "shell"},
 }
+WORKBUDDY_SKILL_TOOL_NAME = "Skill"
 
 
 def receive_native_hook(
@@ -82,6 +86,14 @@ def receive_native_hook(
     if phase is None:
         return {"status": "ignored", "reason": "event-not-a-tool-boundary"}
     tool_name = _required_string(payload, "tool_name")
+    if host == "workbuddy" and tool_name == WORKBUDDY_SKILL_TOOL_NAME:
+        return _receive_workbuddy_skill_boundary(
+            project_root=project_root,
+            suite_id=suite_id,
+            payload=payload,
+            environment=environment,
+            phase=phase,
+        )
     if tool_name not in HOST_TOOL_NAMES.get(host, set()):
         return {"status": "ignored", "reason": "tool-not-shell-boundary"}
     tool_input = payload.get("tool_input")
@@ -148,6 +160,113 @@ def receive_native_hook(
     return result
 
 
+def _receive_workbuddy_skill_boundary(
+    *,
+    project_root: Path,
+    suite_id: str,
+    payload: dict[str, object],
+    environment: dict[str, str],
+    phase: str,
+) -> dict[str, object]:
+    """Record a WorkBuddy ``Skill`` hook without issuing a business receipt.
+
+    WorkBuddy invokes its pre-hook while the pending native Skill call is still
+    present in the transcript.  The runtime independently verifies that
+    frozen fact before it records a request anchor.  This adapter retains only
+    a parsed DTO digest and the original ``args`` digest, never the raw Skill
+    arguments or an inferred command.
+    """
+
+    tool_input = payload.get("tool_input")
+    request, skill_name, args_digest, valid = _workbuddy_skill_request(
+        tool_input,
+        declared_skills=_declared_skill_names(project_root, suite_id),
+    )
+    identity = _hook_identity("workbuddy", payload, require_tool=True)
+    collector_payload: dict[str, object] = {
+        "host": "workbuddy",
+        **_host_metadata("workbuddy", payload, environment),
+        "cwd": _required_string(payload, "cwd"),
+        "session_id": identity["session_id"],
+        "generation_id": identity["generation_id"],
+        "request_id": identity["request_id"],
+        "tool_use_id": identity["tool_use_id"],
+        "phase": phase,
+        "tool_name": WORKBUDDY_SKILL_TOOL_NAME,
+        "request": request,
+        "technical_skill_event": True,
+        "technical_skill_pre": phase == PRE_PHASE,
+        "technical_skill_valid": valid,
+        "technical_skill_name": skill_name,
+        "technical_skill_args_digest": args_digest,
+        "transcript_path": _required_string(payload, "transcript_path"),
+        "prefix_length": _prompt_prefix_length(payload),
+        "causation": _native_causation(payload),
+    }
+    for key in ("message_id", "root_request_id", "parent_request_id", "parent_message_id"):
+        value = identity.get(key)
+        if value is not None:
+            collector_payload[key] = value
+    return observe_request_boundary(
+        project_root=project_root,
+        suite_id=suite_id,
+        payload=collector_payload,
+        trusted_producer=True,
+    )
+
+
+def _workbuddy_skill_request(
+    tool_input: object,
+    *,
+    declared_skills: frozenset[str],
+) -> tuple[dict[str, object], str, str, bool]:
+    """Decode the one observed WorkBuddy ``Skill`` input object.
+
+    Invalid variants are still represented by an immutable technical event so
+    a later, different callback cannot replace the first failed proof.  They
+    use the finite unknown DTO and never reach a business receipt.
+    """
+
+    skill_name = ""
+    args_value: object = None
+    if isinstance(tool_input, dict) and set(tool_input) == {"skill", "args"}:
+        candidate_skill = tool_input.get("skill")
+        if isinstance(candidate_skill, str):
+            skill_name = candidate_skill
+        args_value = tool_input.get("args")
+
+    args_text = args_value if isinstance(args_value, str) else ""
+    args_digest = hashlib.sha256(args_text.encode("utf-8")).hexdigest()
+    parsed_input = _complete_json_object(args_text)
+    if not skill_name or parsed_input is None:
+        return (
+            {"skill": skill_name, "input": {"classification": "unknown"}},
+            skill_name,
+            args_digest,
+            False,
+        )
+
+    business_input = dict(parsed_input)
+    has_correction = "selc" in business_input
+    correction_value = business_input.pop("selc") if has_correction else None
+    request: dict[str, object] = {"skill": skill_name, "input": business_input}
+    if has_correction:
+        request["correction"] = _correction_declaration(correction_value)
+    return request, skill_name, args_digest, skill_name in declared_skills
+
+
+def _complete_json_object(value: str) -> dict[str, object] | None:
+    """Accept one complete JSON object without unwrapping or decoding extras."""
+
+    try:
+        parsed, end = json.JSONDecoder().raw_decode(value)
+    except json.JSONDecodeError:
+        return None
+    if end != len(value) or not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
 def _receive_user_prompt(
     *,
     project_root: Path,
@@ -163,7 +282,11 @@ def _receive_user_prompt(
     than being silently discarded or promoted into an objective.
     """
 
-    request = _managed_prompt_request(payload)
+    request = _managed_prompt_request(
+        host,
+        payload,
+        declared_skills=_declared_skill_names(project_root, suite_id),
+    )
     identity = _hook_identity(host, payload, require_tool=False)
     _validate_hook_environment_identity(host, identity, environment)
     collector_payload: dict[str, object] = {
@@ -314,30 +437,114 @@ def _is_managed_command(command: str, suite_id: str, project_root: Path | None =
     )
 
 
-def _managed_prompt_request(payload: dict[str, object]) -> dict[str, object]:
+def _declared_skill_names(project_root: Path, suite_id: str) -> frozenset[str]:
+    """Read names only from the active installation for a native skill chip."""
+
+    try:
+        manifest = load_manifest(install_root(project_root) / suite_id / "current")
+        return frozenset(entry["name"] for entry in normalize_declared_skills(manifest["skills"]))
+    except (OSError, SelcError, TypeError, KeyError):
+        return frozenset()
+
+
+def _managed_prompt_request(
+    host: str,
+    payload: dict[str, object],
+    *,
+    declared_skills: frozenset[str] | None = None,
+) -> dict[str, object]:
     prompt = payload.get("prompt")
     if not isinstance(prompt, str):
         raise SelcError("NATIVE_COLLECTOR_INVALID", "native prompt is not text")
     skill = ""
     encoded_input = prompt
-    if prompt.startswith("@"):
+    workbuddy_version = payload.get("version")
+    workbuddy_skill_chip = (
+        host == "workbuddy"
+        and isinstance(workbuddy_version, str)
+        and workbuddy_version in WORKBUDDY_SUPPORTED_CLIENT_VERSIONS
+        and prompt.startswith("@//")
+    )
+    if workbuddy_skill_chip:
+        parsed = _workbuddy_skill_chip_request(prompt)
+        if parsed is None:
+            return _unknown_prompt_request(prompt)
+        skill, input_value = parsed
+    elif prompt.startswith("@"):
         prefix, separator, encoded_input = prompt.partition(" ")
         skill = prefix[1:]
         if not separator or not skill:
             return _unknown_prompt_request(prompt)
-    try:
-        input_value = json.loads(encoded_input)
-    except json.JSONDecodeError:
-        return _unknown_prompt_request(prompt)
+        try:
+            input_value = json.loads(encoded_input)
+        except json.JSONDecodeError:
+            return _unknown_prompt_request(prompt)
+    else:
+        try:
+            input_value = json.loads(encoded_input)
+        except json.JSONDecodeError:
+            return _unknown_prompt_request(prompt)
     if not isinstance(input_value, dict):
         return _unknown_prompt_request(prompt)
+    if workbuddy_skill_chip and (declared_skills is None or skill not in declared_skills):
+        return _unknown_prompt_request(prompt)
+    business_input = dict(input_value)
+    has_correction = "selc" in business_input
+    correction = business_input.pop("selc") if has_correction else None
     result: dict[str, object] = {
-        "input": input_value,
+        "input": business_input,
         "raw_prompt_digest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
     }
     if skill:
         result["skill"] = skill
+    if has_correction:
+        result["correction"] = _correction_declaration(correction)
     return result
+
+
+def _workbuddy_skill_chip_request(prompt: str) -> tuple[str, object] | None:
+    """Decode only the supported WorkBuddy skill-chip serialization we observed."""
+
+    encoded = prompt.removeprefix("@//")
+    skill, separator, body = encoded.partition("/")
+    if not skill or not separator or not body or "/" in skill:
+        return None
+    try:
+        value, end = json.JSONDecoder().raw_decode(body)
+    except json.JSONDecodeError:
+        return None
+    if end != len(body) or not isinstance(value, dict):
+        return None
+    return skill, value
+
+
+def _correction_declaration(value: object) -> dict[str, object]:
+    """Keep a narrow correction opt-in outside the declared business DTO.
+
+    The original prompt digest and the frozen native history prove this value
+    later.  This parser does not attach a task, call, receipt, or any other
+    caller-supplied runtime identifier to the request.
+    """
+
+    if not isinstance(value, dict) or set(value) != {"intent", "target", "preserve_goal"}:
+        return {"valid": False}
+    intent = value.get("intent")
+    target = value.get("target")
+    preserve_goal = value.get("preserve_goal")
+    if (
+        intent != "correct_delivery"
+        or not isinstance(target, str)
+        or not target
+        or type(preserve_goal) is not bool
+        or preserve_goal is not True
+    ):
+        return {"valid": False}
+    return {
+        "intent": intent,
+        "target": target,
+        "preserve_goal": True,
+        "valid": True,
+    }
 
 
 def _unknown_prompt_request(prompt: str) -> dict[str, object]:

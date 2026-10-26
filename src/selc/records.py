@@ -14,7 +14,7 @@ from . import SCHEMA_VERSION
 from .errors import SelcError
 from .util import json_hash, read_json, write_json
 
-WRITER_PROTOCOL_VERSION = 3
+WRITER_PROTOCOL_VERSION = 6
 
 
 def utc_now() -> str:
@@ -383,7 +383,7 @@ def _create_observation_tables(database: sqlite3.Connection) -> None:
 
 
 def _create_managed_runtime_tables(database: sqlite3.Connection) -> None:
-    """Create the protocol-3 managed-runtime ledger.
+    """Create the protocol-6 managed-runtime ledger.
 
     Managed records retain only native identifiers, allowlisted metadata, and
     hashes.  The public snapshot/export protocol intentionally remains v1.
@@ -404,6 +404,7 @@ def _create_managed_runtime_tables(database: sqlite3.Connection) -> None:
             phase TEXT NOT NULL,
             received_at TEXT NOT NULL,
             status TEXT NOT NULL,
+            projection_status TEXT NOT NULL DEFAULT 'pending',
             task_id TEXT,
             call_id TEXT
         )""",
@@ -424,6 +425,9 @@ def _create_managed_runtime_tables(database: sqlite3.Connection) -> None:
             root_request_id TEXT NOT NULL DEFAULT '',
             request_digest TEXT NOT NULL,
             input_skill TEXT NOT NULL DEFAULT '',
+            business_dto_digest TEXT,
+            business_dto_rule_version TEXT,
+            selected_skill TEXT,
             root_event_id TEXT NOT NULL,
             root_valid INTEGER NOT NULL,
             task_id TEXT,
@@ -565,18 +569,74 @@ def _create_managed_runtime_tables(database: sqlite3.Connection) -> None:
             created_at TEXT NOT NULL,
             PRIMARY KEY(suite_id, host, session_id, generation_id, request_id)
         )""",
+        """CREATE TABLE IF NOT EXISTS managed_request_anchors (
+            context_key TEXT PRIMARY KEY REFERENCES managed_contexts(context_key) ON DELETE CASCADE,
+            p0_event_id TEXT NOT NULL,
+            pre_event_id TEXT NOT NULL,
+            rule_version TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
+        """CREATE TABLE IF NOT EXISTS managed_correction_bindings (
+            context_key TEXT PRIMARY KEY REFERENCES managed_contexts(context_key) ON DELETE CASCADE,
+            suite_id TEXT NOT NULL,
+            task_id TEXT NOT NULL REFERENCES tasks(task_id),
+            source_delivery_id TEXT NOT NULL,
+            source_ordinal INTEGER NOT NULL,
+            target_path TEXT NOT NULL,
+            target_device INTEGER NOT NULL,
+            target_inode INTEGER NOT NULL,
+            target_digest TEXT NOT NULL,
+            target_parent_device INTEGER NOT NULL,
+            target_parent_inode INTEGER NOT NULL,
+            business_dto_digest TEXT,
+            business_dto_rule_version TEXT,
+            input_digest TEXT NOT NULL,
+            checker_input_digest TEXT NOT NULL,
+            checker_name TEXT NOT NULL,
+            checker_version TEXT NOT NULL,
+            checker_digest TEXT NOT NULL,
+            rule_version TEXT NOT NULL,
+            resource_identity TEXT NOT NULL,
+            resource_digest TEXT NOT NULL,
+            composite_identity TEXT NOT NULL,
+            composite_digest TEXT NOT NULL,
+            installation_digest TEXT NOT NULL,
+            installation_version TEXT NOT NULL,
+            anchor_event_id TEXT NOT NULL,
+            anchor_rule_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )""",
         "CREATE INDEX IF NOT EXISTS managed_native_events_task_idx ON managed_native_events(task_id)",
         "CREATE INDEX IF NOT EXISTS managed_publications_task_idx ON managed_publications(task_id, ordinal)",
+        "CREATE INDEX IF NOT EXISTS managed_correction_bindings_task_idx ON managed_correction_bindings(task_id, status)",
     )
     for statement in statements:
         database.execute(statement)
     _migrate_managed_context_identity(database)
     _ensure_column(database, "managed_native_events", "request_id", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(
+        database,
+        "managed_native_events",
+        "projection_status",
+        "TEXT NOT NULL DEFAULT 'applied'",
+    )
     _ensure_column(database, "managed_receipts", "request_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(database, "managed_receipts", "host_version", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(database, "managed_receipts", "operation_digest", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(database, "managed_contexts", "root_request_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(database, "managed_contexts", "input_skill", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(database, "managed_contexts", "business_dto_digest", "TEXT")
+    _ensure_column(database, "managed_contexts", "business_dto_rule_version", "TEXT")
+    _ensure_column(database, "managed_contexts", "selected_skill", "TEXT")
+    _ensure_column(database, "managed_correction_bindings", "business_dto_digest", "TEXT")
+    _ensure_column(database, "managed_correction_bindings", "business_dto_rule_version", "TEXT")
+    _ensure_column(
+        database,
+        "managed_correction_bindings",
+        "checker_input_digest",
+        "TEXT NOT NULL DEFAULT ''",
+    )
     _ensure_column(database, "managed_windows", "request_id", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(database, "managed_windows", "pre_prefix_hash", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(database, "managed_windows", "pre_prefix_length", "INTEGER NOT NULL DEFAULT -1")
@@ -690,6 +750,8 @@ def _install_writer_protocol_triggers(database: sqlite3.Connection) -> None:
         "managed_assessments",
         "managed_suppressions",
         "managed_context_suppressions",
+        "managed_request_anchors",
+        "managed_correction_bindings",
     )
     for table in protected_tables:
         for operation in ("INSERT", "UPDATE", "DELETE"):

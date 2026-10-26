@@ -7,17 +7,16 @@ They deliberately do not assert desktop-host support.
 from __future__ import annotations
 
 import hashlib
-import io
 import json
 import os
 import shlex
 import sqlite3
 import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 import unittest
+import zipfile
 from contextlib import suppress
 from pathlib import Path
 from unittest import mock
@@ -27,10 +26,17 @@ from selc.errors import SelcError
 from selc.execution_lease import ProcessIdentity, assert_no_live_execution, process_group_is_live
 from selc.install import install_suite
 from selc.manifest import create_suite, seal_suite
-from selc.native_adapter import _native_causation, receive_native_hook
+from selc.native_adapter import (
+    _managed_prompt_request,
+    _native_causation,
+    _workbuddy_skill_request,
+    receive_native_hook,
+)
 from selc.records import close_task, delete_records, open_database, record_feedback
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+PROTOCOL_FIVE_RUNTIME_ARCHIVE = REPO_ROOT / "tests" / "fixtures" / "c20-protocol5-runtime.zip"
+PROTOCOL_FIVE_RUNTIME_METADATA = REPO_ROOT / "tests" / "fixtures" / "c20-protocol5-runtime.json"
 
 
 class ManagedRuntimeTests(unittest.TestCase):
@@ -64,6 +70,7 @@ class ManagedRuntimeTests(unittest.TestCase):
             project_root=self.project,
             harness="codex",
             ref=None,
+            mode="observed",
         )
         self.input_path = self.root / "input.txt"
         self.input_path.write_text("first\nsecond\n", encoding="utf-8")
@@ -123,6 +130,10 @@ class ManagedRuntimeTests(unittest.TestCase):
 
         settings_path = self.project / ".codebuddy" / "settings.json"
         hooks = json.loads(settings_path.read_text(encoding="utf-8"))["hooks"]
+        for event_name in ("PreToolUse", "PostToolUse"):
+            managed_entries = [entry for entry in hooks[event_name] if "hooks" in entry]
+            self.assertEqual(len(managed_entries), 1)
+            self.assertEqual(managed_entries[0]["matcher"], "^(Bash|exec_command|shell|Skill)$")
         for event_name in ("PermissionRequest", "PermissionDenied"):
             managed_entries = [entry for entry in hooks[event_name] if "hooks" in entry]
             self.assertEqual(len(managed_entries), 1)
@@ -160,6 +171,60 @@ class ManagedRuntimeTests(unittest.TestCase):
         )
         self.assertIsNotNone(parsed)
 
+        same_project_prefix = f"cd {self.project.resolve()} && {command}"
+        prefixed = managed_runtime.parse_installed_managed_command(
+            same_project_prefix,
+            "managed-reports",
+            project_root=self.project,
+        )
+        self.assertIsNotNone(prefixed)
+        self.assertEqual(prefixed, parsed)
+
+        project_alias = self.root / "project-alias"
+        project_alias.symlink_to(self.project, target_is_directory=True)
+        canonical_alias_prefix = f"cd {project_alias} && {command}"
+        self.assertEqual(
+            managed_runtime.parse_installed_managed_command(
+                canonical_alias_prefix,
+                "managed-reports",
+                project_root=self.project,
+            ),
+            parsed,
+        )
+
+        other_project = self.root / "other-project"
+        other_project.mkdir()
+        current_install = self.project / ".selc" / "installs" / "managed-reports" / "current"
+        logical_escape = current_install / "../../../../.."
+        self.assertEqual(logical_escape.resolve(), self.project.resolve())
+        invalid_prefixes = (
+            f"cd relative-project && {command}",
+            f"cd {other_project} && {command}",
+            f"cd {logical_escape} && {command}",
+            f"cd $PROJECT_ROOT && {command}",
+            f"cd $(pwd) && {command}",
+            f"cd {self.project.resolve()}\x00 && {command}",
+            f"cd {self.project.resolve()} '&&' {command}",
+            f"cd {self.project.resolve()} && {command} && echo extra",
+            f"cd {self.project.resolve()} && {command} | cat",
+            f"cd {self.project.resolve()} && {command} > output.json",
+        )
+        self.assertIsNone(
+            managed_runtime.parse_installed_managed_command(
+                same_project_prefix,
+                "managed-reports",
+            )
+        )
+        for candidate in invalid_prefixes:
+            self.assertIsNone(
+                managed_runtime.parse_installed_managed_command(
+                    candidate,
+                    "managed-reports",
+                    project_root=self.project,
+                ),
+                candidate,
+            )
+
         impostor = shlex.split(command)
         impostor[1] = str(self.root / "impostor" / "selc-suite.py")
         self.assertIsNone(
@@ -170,35 +235,77 @@ class ManagedRuntimeTests(unittest.TestCase):
             )
         )
 
-    def test_installed_wrapper_completes_a_normal_shell_flow_without_receipts(self) -> None:
-        """The generated wrapper selects each native receipt from child identity."""
+    def test_codex_selectorless_dto_reuses_a_failed_task_for_a_structured_correction(self) -> None:
+        self._assert_codex_dto_correction_chain(
+            first_selectorless=True,
+            correction_selectorless=True,
+        )
+
+    def test_codex_explicit_goal_may_be_corrected_automatically(self) -> None:
+        self._assert_codex_dto_correction_chain(
+            first_selectorless=False,
+            correction_selectorless=True,
+        )
+
+    def test_codex_automatic_goal_may_be_corrected_explicitly(self) -> None:
+        self._assert_codex_dto_correction_chain(
+            first_selectorless=True,
+            correction_selectorless=False,
+        )
+
+    def test_codex_pathless_automatic_goal_stages_an_instruction_artifact(self) -> None:
+        self._assert_codex_dto_correction_chain(
+            first_selectorless=True,
+            correction_selectorless=True,
+            instruction_staging=True,
+            pathless_business_dto=True,
+        )
+
+    def _assert_codex_dto_correction_chain(
+        self,
+        *,
+        first_selectorless: bool,
+        correction_selectorless: bool,
+        instruction_staging: bool = False,
+        pathless_business_dto: bool = False,
+    ) -> None:
+        """Exercise selector-independent goal binding through an installed Codex wrapper."""
 
         manifest_path = self.suite / "suite.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["managed"]["native_hosts"] = {"codex": ["0.163.0-alpha.10.2"]}
-        manifest["managed"]["actions"]["text-report"] = {
-            "skill": "text-report",
-            "kind": "python-script-v1",
-            "script": "bin/json-summary.py",
-            "input": {"fields": {"input": {"type": "path"}}, "required": ["input"]},
-        }
-        (self.suite / "bin" / "json-summary.py").write_text(
-            "import argparse\n"
-            "import json\n"
-            "from pathlib import Path\n"
-            "parser = argparse.ArgumentParser()\n"
-            "parser.add_argument('command')\n"
-            "parser.add_argument('--request', required=True)\n"
-            "parser.add_argument('--output', required=True)\n"
-            "arguments = parser.parse_args()\n"
-            "if arguments.command != 'managed-run':\n"
-            "    raise SystemExit(2)\n"
-            "request = json.loads(Path(arguments.request).read_text(encoding='utf-8'))\n"
-            "items = json.loads(Path(request['input']).read_text(encoding='utf-8'))['items']\n"
-            "artifact = {'count': len(items), 'sum': sum(item['value'] for item in items)}\n"
-            "Path(arguments.output).write_text(json.dumps(artifact), encoding='utf-8')\n",
-            encoding="utf-8",
-        )
+        manifest["managed"]["native_hosts"] = {"codex": ["0.163.0-alpha.11"]}
+        if instruction_staging:
+            manifest["managed"]["actions"]["text-report"] = {
+                "skill": "text-report",
+                "kind": "instruction-staging-v1",
+                "input": {"fields": {}, "required": []},
+            }
+        else:
+            manifest["managed"]["actions"]["text-report"] = {
+                "skill": "text-report",
+                "kind": "python-script-v1",
+                "script": "bin/json-summary.py",
+                "input": {"fields": {"input": {"type": "path"}}, "required": ["input"]},
+            }
+            (self.suite / "bin" / "json-summary.py").write_text(
+                "import argparse\n"
+                "import json\n"
+                "from pathlib import Path\n"
+                "parser = argparse.ArgumentParser()\n"
+                "parser.add_argument('command')\n"
+                "parser.add_argument('--request', required=True)\n"
+                "parser.add_argument('--output', required=True)\n"
+                "arguments = parser.parse_args()\n"
+                "if arguments.command != 'managed-run':\n"
+                "    raise SystemExit(2)\n"
+                "request = json.loads(Path(arguments.request).read_text(encoding='utf-8'))\n"
+                "items = json.loads(Path(request['input']).read_text(encoding='utf-8'))['items']\n"
+                "expected_sum = sum(item['value'] for item in items)\n"
+                f"marker = Path({str(self.root / 'allow-correction-pass')!r})\n"
+                "artifact = {'count': len(items), 'sum': expected_sum if marker.is_file() else expected_sum - 1}\n"
+                "Path(arguments.output).write_text(json.dumps(artifact), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         seal_suite(self.suite)
         self.installation = install_suite(
@@ -210,12 +317,31 @@ class ManagedRuntimeTests(unittest.TestCase):
 
         session_id = "session-automatic"
         turn_id = "turn-automatic"
-        automatic_input = self.root / "automatic-items.json"
-        automatic_input.write_text(
-            json.dumps({"items": [{"id": "first", "value": 2}, {"id": "second", "value": 3}]}),
-            encoding="utf-8",
+        account_home = managed_runtime._trusted_posix_account_home()
+        self.assertIsNotNone(account_home)
+        old_filesystem = (
+            "<filesystem><cwd>project</cwd><path>"
+            f"{account_home}/.codex/tmp/arg0-macos/codex-arg0OLD123"
+            "</path></entry></filesystem>"
         )
-        prompt_text = "@text-report " + json.dumps({"input": str(automatic_input)})
+        new_filesystem = old_filesystem.replace("codex-arg0OLD123", "codex-arg0NEW456")
+        automatic_input = self.root / "automatic-items.json"
+        automatic_input_body = json.dumps(
+            {"items": [{"id": "first", "value": 2}, {"id": "second", "value": 3}]}
+        )
+        automatic_input.write_text(automatic_input_body, encoding="utf-8")
+        business_dto: dict[str, object]
+        if pathless_business_dto:
+            business_dto = {"objective": "summarize the current inventory"}
+        else:
+            business_dto = {"input": str(automatic_input)}
+        first_business_dto = json.dumps(business_dto)
+        prompt_text = (
+            first_business_dto if first_selectorless else "@text-report " + first_business_dto
+        )
+        if pathless_business_dto:
+            self.assertNotIn(str(automatic_input), prompt_text)
+            self.assertNotIn("text-report", prompt_text)
         history = self.root / ".codex" / "sessions" / "2026" / f"{session_id}.jsonl"
         history.parent.mkdir(parents=True)
         initial_history = [
@@ -225,7 +351,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                     "id": session_id,
                     "session_id": session_id,
                     "cwd": str(self.project.resolve()),
-                    "cli_version": "0.163.0-alpha.10.2",
+                    "cli_version": "0.163.0-alpha.11",
                     "source": "exec",
                     "history_mode": "paginated",
                 },
@@ -297,7 +423,13 @@ class ManagedRuntimeTests(unittest.TestCase):
                     },
                 },
             },
-            {"type": "world_state", "payload": {"full": True, "state": {}}},
+            {
+                "type": "world_state",
+                "payload": {
+                    "full": True,
+                    "state": {"environments": {"filesystem": old_filesystem}},
+                },
+            },
             {
                 "type": "turn_context",
                 "payload": {
@@ -329,7 +461,7 @@ class ManagedRuntimeTests(unittest.TestCase):
             **os.environ,
             "CODEX_SESSION_ID": session_id,
             "CODEX_THREAD_ID": session_id,
-            "CODEX_VERSION": "0.163.0-alpha.10.2",
+            "CODEX_VERSION": "0.163.0-alpha.11",
         }
         base_environment.pop("CODEX_TOOL_CALL_ID", None)
 
@@ -356,6 +488,17 @@ class ManagedRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
             return json.loads(completed.stdout)
+
+        def run_failure(command: list[str], tool_use_id: str) -> subprocess.CompletedProcess[str]:
+            completed = subprocess.run(
+                command,
+                env={**base_environment, "CODEX_TOOL_CALL_ID": tool_use_id},
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+            self.assertNotEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+            return completed
 
         prompt = {
             "hook_event_name": "UserPromptSubmit",
@@ -494,34 +637,72 @@ class ManagedRuntimeTests(unittest.TestCase):
         )
         activated = run(invoke_command, "tool-automatic-invoke")["managed"]
 
-        request_path = self.root / "automatic-request.json"
-        request_path.write_text(json.dumps({"input": str(automatic_input)}), encoding="utf-8")
-        action_command = [
-            sys.executable,
-            str(wrapper),
-            "managed",
-            "action",
-            "--project-root",
-            str(self.project),
-            "--suite",
-            "managed-reports",
-            "--skill",
-            "text-report",
-            "--task-id",
-            str(activated["task_id"]),
-            "--call-id",
-            str(activated["call_id"]),
-            "--action",
-            "text-report",
-            "--request",
-            str(request_path),
-            "--host",
-            "codex",
-            "--expected-version",
-            str(self.installation["version"]),
-            "--expected-composite",
-            str(self.installation["digest"]),
-        ]
+        instruction_artifact = self.root / "automatic-instruction-artifact.json"
+        if instruction_staging:
+            checker_input = automatic_input
+            items = json.loads(checker_input.read_text(encoding="utf-8"))["items"]
+            expected_sum = sum(item["value"] for item in items)
+            instruction_artifact.write_text(
+                json.dumps({"count": len(items), "sum": expected_sum - 1}),
+                encoding="utf-8",
+            )
+            action_command = [
+                sys.executable,
+                str(wrapper),
+                "managed",
+                "stage",
+                "--project-root",
+                str(self.project),
+                "--suite",
+                "managed-reports",
+                "--skill",
+                "text-report",
+                "--task-id",
+                str(activated["task_id"]),
+                "--call-id",
+                str(activated["call_id"]),
+                "--action",
+                "text-report",
+                "--artifact-bytes",
+                str(instruction_artifact),
+                "--checker-input",
+                str(checker_input),
+                "--host",
+                "codex",
+                "--expected-version",
+                str(self.installation["version"]),
+                "--expected-composite",
+                str(self.installation["digest"]),
+            ]
+        else:
+            request_path = self.root / "automatic-request.json"
+            request_path.write_text(json.dumps({"input": str(automatic_input)}), encoding="utf-8")
+            action_command = [
+                sys.executable,
+                str(wrapper),
+                "managed",
+                "action",
+                "--project-root",
+                str(self.project),
+                "--suite",
+                "managed-reports",
+                "--skill",
+                "text-report",
+                "--task-id",
+                str(activated["task_id"]),
+                "--call-id",
+                str(activated["call_id"]),
+                "--action",
+                "text-report",
+                "--request",
+                str(request_path),
+                "--host",
+                "codex",
+                "--expected-version",
+                str(self.installation["version"]),
+                "--expected-composite",
+                str(self.installation["digest"]),
+            ]
         receive(
             {
                 "hook_event_name": "PreToolUse",
@@ -643,10 +824,550 @@ class ManagedRuntimeTests(unittest.TestCase):
             ).fetchone()["status"]
         finally:
             database.close()
-        self.assertEqual((health["first_result"], health["final_result"]), ("pass", "pass"))
+        self.assertEqual((health["first_result"], health["final_result"]), ("fail", "fail"))
         self.assertEqual(health["evidence"]["windows_closed"], 1)
         self.assertEqual(task_status, "closed")
         self.assertEqual(call_status, "closed")
+
+        (self.root / "allow-correction-pass").write_text("pass", encoding="utf-8")
+        correction_turn = "turn-automatic-correction"
+        correction_business_dto = json.dumps(
+            {
+                **business_dto,
+                "selc": {
+                    "intent": "correct_delivery",
+                    "target": "reports/automatic.md",
+                    "preserve_goal": True,
+                },
+            }
+        )
+        correction_prompt = (
+            correction_business_dto
+            if correction_selectorless
+            else "@text-report " + correction_business_dto
+        )
+        correction_p0 = [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": correction_turn,
+                    "root_turn_id": correction_turn,
+                    "turn_attribution": {
+                        "turn_id": correction_turn,
+                        "root_turn_id": correction_turn,
+                        "parent_turn_id": None,
+                    },
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": new_filesystem}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": correction_turn,
+                        "content_item_kinds": ["environments.environment_context"],
+                    },
+                },
+            },
+            {
+                "type": "world_state",
+                "payload": {
+                    "full": False,
+                    "state": {"environments": {"filesystem": new_filesystem}},
+                },
+            },
+            {
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": correction_turn,
+                    "root_turn_id": correction_turn,
+                    "cwd": str(self.project.resolve()),
+                },
+            },
+        ]
+        with history.open("ab") as stream:
+            for record in correction_p0:
+                stream.write((json.dumps(record) + "\n").encode("utf-8"))
+        self.assertEqual(
+            receive(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "cwd": str(self.project),
+                    "session_id": session_id,
+                    "turn_id": correction_turn,
+                    "transcript_path": str(history),
+                    "prefix_length": history.stat().st_size,
+                    "prompt": correction_prompt,
+                }
+            )["status"],
+            "prompt_recorded",
+        )
+        with history.open("ab") as stream:
+            stream.write(
+                (
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": correction_prompt}],
+                                "internal_chat_message_metadata_passthrough": {
+                                    "turn_id": correction_turn,
+                                    "content_item_kinds": ["user.text"],
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+
+        correction_invoke_tool = "tool-automatic-correction-invoke"
+        receive(
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": str(self.project),
+                "session_id": session_id,
+                "turn_id": correction_turn,
+                "tool_call_id": correction_invoke_tool,
+                "tool_name": "Bash",
+                "tool_input": {"command": shlex.join(invoke_command)},
+                "transcript_path": str(history),
+                "prefix_length": history.stat().st_size,
+            }
+        )
+        correction = run(invoke_command, correction_invoke_tool)["managed"]
+        self.assertEqual(correction["task_id"], activated["task_id"])
+        self.assertNotEqual(correction["call_id"], activated["call_id"])
+
+        correction_action_command = list(action_command)
+        correction_action_command[correction_action_command.index("--call-id") + 1] = str(
+            correction["call_id"]
+        )
+        receive(
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": str(self.project),
+                "session_id": session_id,
+                "turn_id": correction_turn,
+                "tool_call_id": "tool-automatic-correction-action",
+                "tool_name": "Bash",
+                "tool_input": {"command": shlex.join(correction_action_command)},
+                "transcript_path": str(history),
+                "prefix_length": history.stat().st_size,
+            }
+        )
+        if instruction_staging:
+            instruction_artifact.write_text(
+                json.dumps({"count": 2, "sum": 5}),
+                encoding="utf-8",
+            )
+            correction_action = run(
+                correction_action_command,
+                "tool-automatic-correction-action",
+            )["managed"]
+        else:
+            automatic_input.write_text(
+                json.dumps(
+                    {"items": [{"id": "first", "value": 102}, {"id": "second", "value": 3}]}
+                ),
+                encoding="utf-8",
+            )
+            rejected_input = run_failure(
+                correction_action_command,
+                "tool-automatic-correction-action",
+            )
+            self.assertIn("CORRECTION_BINDING_STALE", rejected_input.stdout + rejected_input.stderr)
+            self.assertEqual(
+                managed_runtime.health(self.project, "managed-reports", str(activated["task_id"]))[
+                    "final_result"
+                ],
+                "fail",
+            )
+            automatic_input.write_text(automatic_input_body, encoding="utf-8")
+            correction_action = run(
+                correction_action_command,
+                "tool-automatic-correction-action",
+            )["managed"]
+
+        correction_publish_command = list(publish_command)
+        correction_publish_command[correction_publish_command.index("--call-id") + 1] = str(
+            correction["call_id"]
+        )
+        correction_publish_command[correction_publish_command.index("--artifact") + 1] = str(
+            correction_action["artifact_path"]
+        )
+        wrong_target_command = list(correction_publish_command)
+        wrong_target_command[wrong_target_command.index("--target") + 1] = (
+            "reports/different-goal.json"
+        )
+        wrong_target_tool = "tool-automatic-correction-wrong-publish"
+        receive(
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": str(self.project),
+                "session_id": session_id,
+                "turn_id": correction_turn,
+                "tool_call_id": wrong_target_tool,
+                "tool_name": "Bash",
+                "tool_input": {"command": shlex.join(wrong_target_command)},
+                "transcript_path": str(history),
+                "prefix_length": history.stat().st_size,
+            }
+        )
+        rejected_target = run_failure(wrong_target_command, wrong_target_tool)
+        self.assertIn("CORRECTION_TARGET_MISMATCH", rejected_target.stdout + rejected_target.stderr)
+        self.assertFalse((self.project / "reports" / "different-goal.json").exists())
+        self.assertEqual(
+            managed_runtime.health(self.project, "managed-reports", str(activated["task_id"]))[
+                "final_result"
+            ],
+            "fail",
+        )
+        correction_publish_tool = "tool-automatic-correction-publish"
+        receive(
+            {
+                "hook_event_name": "PreToolUse",
+                "cwd": str(self.project),
+                "session_id": session_id,
+                "turn_id": correction_turn,
+                "tool_call_id": correction_publish_tool,
+                "tool_name": "Bash",
+                "tool_input": {"command": shlex.join(correction_publish_command)},
+                "transcript_path": str(history),
+                "prefix_length": history.stat().st_size,
+            }
+        )
+        correction_published = run(correction_publish_command, correction_publish_tool)["managed"]
+        self.assertEqual(correction_published["status"], "published")
+        receive(
+            {
+                "hook_event_name": "PostToolUse",
+                "cwd": str(self.project),
+                "session_id": session_id,
+                "turn_id": correction_turn,
+                "tool_call_id": correction_publish_tool,
+                "tool_name": "Bash",
+                "tool_input": {"command": shlex.join(correction_publish_command)},
+                "transcript_path": str(history),
+                "prefix_length": history.stat().st_size,
+            }
+        )
+        with history.open("ab") as stream:
+            stream.write(
+                (
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "item_completed",
+                                "thread_id": session_id,
+                                "turn_id": correction_turn,
+                                "item": {
+                                    "type": "CommandExecution",
+                                    "id": correction_publish_tool,
+                                    "command": [
+                                        "/bin/zsh",
+                                        "-lc",
+                                        shlex.join(correction_publish_command),
+                                    ],
+                                    "cwd": str(self.project.resolve()),
+                                    "status": "completed",
+                                    "exit_code": 0,
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+        self.assertEqual(
+            receive(
+                {
+                    "hook_event_name": "Stop",
+                    "cwd": str(self.project),
+                    "session_id": session_id,
+                    "turn_id": correction_turn,
+                    "transcript_path": str(history),
+                    "prefix_length": history.stat().st_size,
+                }
+            )["status"],
+            "stop_recorded",
+        )
+
+        correction_health = managed_runtime.health(
+            self.project,
+            "managed-reports",
+            str(activated["task_id"]),
+        )
+        database = open_database(self.project)
+        try:
+            context = database.execute(
+                "SELECT root_valid FROM managed_contexts WHERE generation_id = ?",
+                (correction_turn,),
+            ).fetchone()
+            anchor = database.execute("SELECT rule_version FROM managed_request_anchors").fetchone()
+            binding = database.execute(
+                "SELECT status, anchor_rule_version FROM managed_correction_bindings"
+            ).fetchone()
+            task_count = database.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            call_count = database.execute(
+                "SELECT COUNT(*) FROM calls WHERE task_id = ?",
+                (activated["task_id"],),
+            ).fetchone()[0]
+            trigger_kinds = [
+                row["trigger_kind"]
+                for row in database.execute(
+                    "SELECT trigger_kind FROM calls WHERE task_id = ? ORDER BY rowid",
+                    (activated["task_id"],),
+                )
+            ]
+            checker_results = [
+                row["result"]
+                for row in database.execute("SELECT result FROM checker_runs ORDER BY created_at")
+            ]
+        finally:
+            database.close()
+        self.assertEqual(
+            (correction_health["first_result"], correction_health["final_result"]),
+            ("fail", "pass"),
+            (correction_published, checker_results),
+        )
+        self.assertEqual(context["root_valid"], 0)
+        self.assertEqual(binding["status"], "closed")
+        self.assertEqual(anchor["rule_version"], "current-request-v3-codex-alpha11-arg0")
+        self.assertEqual(
+            binding["anchor_rule_version"],
+            "current-request-v3-codex-alpha11-arg0",
+        )
+        self.assertEqual((task_count, call_count), (1, 2))
+        self.assertEqual(
+            trigger_kinds,
+            [
+                "automatic" if first_selectorless else "explicit",
+                "automatic" if correction_selectorless else "explicit",
+            ],
+        )
+
+    def test_codex_alpha11_current_turn_proves_only_a_strict_arg0_delta(self) -> None:
+        """An alpha.11 resumed turn may change only its native arg0 directory."""
+
+        session_id = "alpha11-session"
+        turn_id = "alpha11-turn"
+        current_home = Path("/Users/current-account")
+        home_patch = mock.patch(
+            "selc.managed_runtime._trusted_posix_account_home",
+            return_value=current_home,
+        )
+        home_patch.start()
+        self.addCleanup(home_patch.stop)
+        old_filesystem = (
+            "<filesystem><cwd>/project</cwd><path>"
+            f"{current_home}/.codex/tmp/arg0-macos/codex-arg0OLD123"
+            "</path></entry></filesystem>"
+        )
+        earlier_filesystem = old_filesystem.replace("<cwd>/project", "<cwd>/previous-project")
+        middle_filesystem = old_filesystem.replace("codex-arg0OLD123", "codex-arg0MID456")
+        new_filesystem = old_filesystem.replace("codex-arg0OLD123", "codex-arg0NEW456")
+
+        def delta(filesystem: str) -> dict[str, object]:
+            return {
+                "type": "world_state",
+                "payload": {
+                    "full": False,
+                    "state": {"environments": {"filesystem": filesystem}},
+                },
+            }
+
+        history = [
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "session_id": session_id,
+                    "cwd": str(self.project.resolve()),
+                    "cli_version": "0.163.0-alpha.11",
+                },
+            },
+            {
+                "type": "world_state",
+                "payload": {
+                    "full": True,
+                    "state": {"environments": {"filesystem": earlier_filesystem}},
+                },
+            },
+            {
+                "type": "world_state",
+                "payload": {
+                    "full": True,
+                    "state": {"environments": {"filesystem": old_filesystem}},
+                },
+            },
+            delta(middle_filesystem),
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": turn_id,
+                    "root_turn_id": turn_id,
+                    "turn_attribution": {
+                        "turn_id": turn_id,
+                        "root_turn_id": turn_id,
+                        "parent_turn_id": None,
+                    },
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": new_filesystem}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": turn_id,
+                        "content_item_kinds": ["environments.environment_context"],
+                    },
+                },
+            },
+            delta(new_filesystem),
+            {
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": turn_id,
+                    "root_turn_id": turn_id,
+                    "cwd": str(self.project.resolve()),
+                },
+            },
+        ]
+
+        def rule_version(candidate: list[dict[str, object]]) -> str | None:
+            return managed_runtime._codex_current_turn_anchor_rule_version(
+                candidate,
+                session_id=session_id,
+                cwd=self.project.resolve(),
+                generation_id=turn_id,
+                prompt_version="0.163.0-alpha.11",
+                pre_version="0.163.0-alpha.11",
+            )
+
+        self.assertEqual(
+            rule_version(history),
+            "current-request-v3-codex-alpha11-arg0",
+        )
+
+        no_full_baseline = json.loads(json.dumps(history))
+        no_full_baseline[1] = delta(earlier_filesystem)
+        no_full_baseline[2] = delta(old_filesystem)
+        self.assertIsNone(rule_version(no_full_baseline))
+
+        extra_delta_field = json.loads(json.dumps(history))
+        extra_delta_field[3]["payload"]["unexpected"] = True
+        self.assertIsNone(rule_version(extra_delta_field))
+
+        second_path = json.loads(json.dumps(history))
+        second_filesystem = new_filesystem.replace(
+            "</path>",
+            f"</path><path>{current_home}/.codex/tmp/arg0-macos/codex-arg0SECOND789</path>",
+        )
+        second_path[5]["payload"]["content"][0]["text"] = second_filesystem
+        second_path[6]["payload"]["state"]["environments"]["filesystem"] = second_filesystem
+        self.assertIsNone(rule_version(second_path))
+
+        changed_non_path_bytes = json.loads(json.dumps(history))
+        changed_non_path_bytes[3]["payload"]["state"]["environments"]["filesystem"] = (
+            middle_filesystem.replace("<cwd>/project", "<cwd>/different-project")
+        )
+        self.assertIsNone(rule_version(changed_non_path_bytes))
+
+        wrong_environment = json.loads(json.dumps(history))
+        wrong_environment[5]["payload"]["content"][0]["text"] = "not the filesystem"
+        self.assertIsNone(rule_version(wrong_environment))
+
+        wrong_user = json.loads(json.dumps(history))
+        wrong_user[2]["payload"]["state"]["environments"]["filesystem"] = old_filesystem.replace(
+            str(current_home), "/Users/another-user"
+        )
+        self.assertIsNone(rule_version(wrong_user))
+
+        other_home = Path("/Users/other-current-account")
+        other_history = json.loads(json.dumps(history).replace(str(current_home), str(other_home)))
+        with mock.patch(
+            "selc.managed_runtime._trusted_posix_account_home",
+            return_value=other_home,
+        ):
+            self.assertEqual(
+                rule_version(other_history),
+                "current-request-v3-codex-alpha11-arg0",
+            )
+            self.assertIsNone(rule_version(history))
+
+        untrusted_old = old_filesystem.replace(
+            f"<path>{current_home}",
+            f"<path>/untrusted{current_home}",
+        )
+        untrusted_new = new_filesystem.replace(
+            f"<path>{current_home}",
+            f"<path>/untrusted{current_home}",
+        )
+        self.assertFalse(
+            managed_runtime._codex_alpha11_arg0_transition_is_verified(
+                untrusted_old,
+                untrusted_new,
+            )
+        )
+
+        nested_old = old_filesystem.replace("</path>", "/nested</path>")
+        nested_new = new_filesystem.replace("</path>", "/nested</path>")
+        self.assertFalse(
+            managed_runtime._codex_alpha11_arg0_transition_is_verified(
+                nested_old,
+                nested_new,
+            )
+        )
+        with mock.patch(
+            "selc.managed_runtime._trusted_posix_account_home",
+            return_value=None,
+        ):
+            self.assertFalse(
+                managed_runtime._codex_alpha11_arg0_transition_is_verified(
+                    old_filesystem,
+                    new_filesystem,
+                )
+            )
+
+        conflicting_version = json.loads(json.dumps(history))
+        conflicting_version[0]["payload"]["cli_version"] = "0.163.0-alpha.10.2"
+        self.assertIsNone(rule_version(conflicting_version))
+        self.assertIsNone(
+            managed_runtime._codex_current_turn_anchor_rule_version(
+                history,
+                session_id=session_id,
+                cwd=self.project.resolve(),
+                generation_id=turn_id,
+                prompt_version="0.163.0-alpha.10.2",
+                pre_version="0.163.0-alpha.11",
+            )
+        )
+        self.assertIsNone(
+            managed_runtime._codex_current_turn_anchor_rule_version(
+                history,
+                session_id=session_id,
+                cwd=self.project.resolve(),
+                generation_id=turn_id,
+                prompt_version="0.163.0-alpha.11",
+                pre_version="0.163.0-alpha.10.2",
+            )
+        )
+        self.assertFalse(
+            managed_runtime._current_request_anchor_rule_is_supported(
+                "codex",
+                "current-request-v999-unknown",
+            )
+        )
 
     def test_codex_unmanaged_pre_promotes_prompt_anchor_without_issuing_a_receipt(self) -> None:
         """A discovery command can prove P1 without becoming a managed operation."""
@@ -929,12 +1650,303 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertTrue(activated["task_id"])
         self.assertTrue(activated["call_id"])
 
-    def test_workbuddy_wrapper_flow_closes_post_before_result_and_links_correction(self) -> None:
-        """Exercise the installed WorkBuddy path with bounded native-shaped history."""
+    def test_workbuddy_wrapper_reuses_failed_delivery_for_current_json_correction(self) -> None:
+        """Allow a new correction request to use the other supported release."""
+
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.8.3",
+            first_rejected_bash_version="5.8.3",
+            correction_rejected_bash_version="5.9.2",
+        )
+
+    def test_workbuddy_592_wrapper_reuses_failed_delivery_for_current_json_correction(
+        self,
+    ) -> None:
+        """Exercise the installed WorkBuddy failure and correction path at 5.9.2."""
+
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+        )
+
+    def test_workbuddy_592_same_project_cd_prefixed_action_completes_the_wrapper_chain(
+        self,
+    ) -> None:
+        """The finite shell prefix still binds a full native command digest."""
+
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+            same_project_cd_action_prefix=True,
+        )
+
+    def test_workbuddy_592_selectorless_dto_reuses_failed_delivery_automatically(self) -> None:
+        """A verified native Skill choice may activate a selectorless JSON DTO."""
+
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+            selectorless=True,
+        )
+
+    def test_workbuddy_583_selectorless_dto_reuses_failed_delivery_automatically(self) -> None:
+        """The original supported WorkBuddy release keeps the automatic chain."""
+
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.8.3",
+            correction_client_version="5.8.3",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+            selectorless=True,
+        )
+
+    def test_workbuddy_automatic_version_and_actual_skill_drifts_issue_no_business_receipt(
+        self,
+    ) -> None:
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version="5.8.3",
+            correction_rejected_bash_version=None,
+            selectorless=True,
+        )
+
+    def test_workbuddy_automatic_scope_drift_issues_no_business_receipt(self) -> None:
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+            selectorless=True,
+            first_scope_drift=True,
+        )
+
+    def test_workbuddy_automatic_dto_drift_stops_before_business_receipt(self) -> None:
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+            selectorless=True,
+            first_skill_args_drift=True,
+        )
+
+    def test_workbuddy_automatic_goal_may_be_corrected_with_an_explicit_selector(self) -> None:
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+            selectorless=True,
+            correction_selectorless=False,
+        )
+
+    def test_workbuddy_explicit_goal_may_be_corrected_with_automatic_selection(self) -> None:
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+            selectorless=False,
+            correction_selectorless=True,
+        )
+
+    def test_workbuddy_automatic_source_without_goal_cannot_use_explicit_fallback(self) -> None:
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+            selectorless=True,
+            correction_selectorless=False,
+            source_goal_missing_before_correction=True,
+        )
+
+    def test_workbuddy_explicit_source_without_goal_cannot_use_automatic_fallback(self) -> None:
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+            selectorless=False,
+            correction_selectorless=True,
+            source_goal_missing_before_correction=True,
+        )
+
+    def test_workbuddy_legacy_explicit_source_without_goal_keeps_its_safe_fallback(self) -> None:
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+            selectorless=False,
+            correction_selectorless=False,
+            source_goal_missing_before_correction=True,
+            allow_legacy_explicit_fallback=True,
+        )
+
+    def test_automatic_first_activation_cannot_change_the_selected_skill(self) -> None:
+        """A stale first-selection snapshot cannot replace the committed skill."""
+
+        database = open_database(self.project)
+        business_digest = hashlib.sha256(b'{"objective":"summarize"}').hexdigest()
+        try:
+            database.execute(
+                """INSERT INTO managed_contexts(
+                context_key, suite_id, host, session_id, generation_id, request_id,
+                request_digest, input_skill, business_dto_digest, business_dto_rule_version,
+                root_event_id, root_valid, status, created_at)
+                VALUES ('automatic-first-selection', 'managed-reports', 'workbuddy',
+                'selection-session', 'selection-generation', 'selection-request',
+                'selection-request-digest', '', ?, ?, 'selection-root-event', 1,
+                'active', ?)""",
+                (
+                    business_digest,
+                    managed_runtime.BUSINESS_DTO_RULE_VERSION,
+                    records.utc_now(),
+                ),
+            )
+            database.commit()
+        finally:
+            database.close()
+
+        first_connection = open_database(self.project)
+        rival_connection = open_database(self.project)
+        try:
+            first_snapshot = first_connection.execute(
+                "SELECT * FROM managed_contexts WHERE context_key = 'automatic-first-selection'"
+            ).fetchone()
+            rival_snapshot = rival_connection.execute(
+                "SELECT * FROM managed_contexts WHERE context_key = 'automatic-first-selection'"
+            ).fetchone()
+            self.assertIsNone(first_snapshot["selected_skill"])
+            self.assertIsNone(rival_snapshot["selected_skill"])
+
+            self.assertEqual(
+                managed_runtime._confirm_context_selection(
+                    first_connection,
+                    first_snapshot,
+                    "text-report",
+                ),
+                "automatic",
+            )
+            first_connection.commit()
+
+            with self.assertRaisesRegex(SelcError, "another activation reserved"):
+                managed_runtime._confirm_context_selection(
+                    rival_connection,
+                    rival_snapshot,
+                    "other-report",
+                )
+            rival_connection.rollback()
+            selected_skill = first_connection.execute(
+                """SELECT selected_skill FROM managed_contexts
+                WHERE context_key = 'automatic-first-selection'"""
+            ).fetchone()[0]
+            business_counts = tuple(
+                first_connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("tasks", "calls", "managed_receipts")
+            )
+        finally:
+            rival_connection.close()
+            first_connection.close()
+
+        self.assertEqual(selected_skill, "text-report")
+        self.assertEqual(business_counts, (0, 0, 0))
+
+    def test_workbuddy_pathless_automatic_goal_stages_an_instruction_artifact(self) -> None:
+        """A pathless business goal may select, stage, and repair one delivery."""
+
+        self._assert_workbuddy_wrapper_correction_chain(
+            first_client_version="5.9.2",
+            correction_client_version="5.9.2",
+            first_rejected_bash_version=None,
+            correction_rejected_bash_version=None,
+            selectorless=True,
+            instruction_staging=True,
+            pathless_business_dto=True,
+        )
+
+    def _assert_workbuddy_wrapper_correction_chain(
+        self,
+        *,
+        first_client_version: str,
+        correction_client_version: str,
+        first_rejected_bash_version: str | None,
+        correction_rejected_bash_version: str | None,
+        selectorless: bool = False,
+        correction_selectorless: bool | None = None,
+        instruction_staging: bool = False,
+        pathless_business_dto: bool = False,
+        source_goal_missing_before_correction: bool = False,
+        allow_legacy_explicit_fallback: bool = False,
+        first_scope_drift: bool = False,
+        first_skill_args_drift: bool = False,
+        same_project_cd_action_prefix: bool = False,
+    ) -> None:
+        """Exercise the installed WorkBuddy failure and correction path end to end."""
+
+        if correction_selectorless is None:
+            correction_selectorless = selectorless
+        if pathless_business_dto and not selectorless:
+            raise AssertionError("a pathless business DTO requires automatic selection")
 
         manifest_path = self.suite / "suite.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        manifest["managed"]["native_hosts"] = {"workbuddy": ["5.8.3"]}
+        manifest["managed"]["native_hosts"] = {"workbuddy": ["5.8.3", "5.9.2"]}
+        if instruction_staging:
+            manifest["managed"]["actions"]["text-report"] = {
+                "skill": "text-report",
+                "kind": "instruction-staging-v1",
+                "input": {"fields": {}, "required": []},
+            }
+        else:
+            manifest["managed"]["actions"]["text-report"] = {
+                "skill": "text-report",
+                "kind": "python-script-v1",
+                "script": "bin/json-summary.py",
+                "input": {"fields": {"input": {"type": "path"}}, "required": ["input"]},
+            }
+            (self.suite / "bin" / "json-summary.py").write_text(
+                "import argparse\n"
+                "import json\n"
+                "from pathlib import Path\n"
+                "parser = argparse.ArgumentParser()\n"
+                "parser.add_argument('command')\n"
+                "parser.add_argument('--request', required=True)\n"
+                "parser.add_argument('--output', required=True)\n"
+                "arguments = parser.parse_args()\n"
+                "if arguments.command != 'managed-run':\n"
+                "    raise SystemExit(2)\n"
+                "request = json.loads(Path(arguments.request).read_text(encoding='utf-8'))\n"
+                "items = json.loads(Path(request['input']).read_text(encoding='utf-8'))['items']\n"
+                "expected_sum = sum(item['value'] for item in items)\n"
+                f"marker = Path({str(self.root / 'workbuddy-correction-pass')!r})\n"
+                "artifact = {'count': len(items), 'sum': expected_sum if marker.is_file() else expected_sum - 1}\n"
+                "Path(arguments.output).write_text(json.dumps(artifact), encoding='utf-8')\n",
+                encoding="utf-8",
+            )
+        if selectorless:
+            other_skill = self.suite / "skills" / "other-report"
+            other_skill.mkdir()
+            (other_skill / "SKILL.md").write_text(
+                "---\n"
+                "name: other-report\n"
+                "description: Synthetic alternative for selection rejection coverage.\n"
+                "---\n"
+                "# Other report\n"
+                "\n"
+                "This fixture exists only to prove the selected skill cannot change.\n",
+                encoding="utf-8",
+            )
+            manifest["skills"].append({"name": "other-report"})
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         seal_suite(self.suite)
         self.installation = install_suite(
@@ -951,10 +1963,20 @@ class ManagedRuntimeTests(unittest.TestCase):
         history.parent.mkdir(parents=True)
         metadata = [
             {"type": "session-meta", "sessionId": session_id},
-            {"type": "session-meta", "sessionId": session_id, "cwd": project_cwd},
+            {
+                "id": "workbuddy-initial-session-meta",
+                "type": "session-meta",
+                "sessionId": session_id,
+                "cwd": project_cwd,
+            },
         ]
         history.write_bytes(
             b"".join((json.dumps(record) + "\n").encode("utf-8") for record in metadata)
+        )
+        automatic_input = self.root / "workbuddy-items.json"
+        automatic_input.write_text(
+            json.dumps({"items": [{"id": "first", "value": 2}, {"id": "second", "value": 3}]}),
+            encoding="utf-8",
         )
 
         wrapper = (
@@ -969,7 +1991,6 @@ class ManagedRuntimeTests(unittest.TestCase):
         base_environment = {
             **os.environ,
             "CODEBUDDY_SESSION_ID": session_id,
-            "CODEBUDDY_CONVERSATION_MESSAGE_ID": "workbuddy-message",
         }
 
         def receive(payload: dict[str, object]) -> dict[str, object]:
@@ -989,18 +2010,19 @@ class ManagedRuntimeTests(unittest.TestCase):
             generation_id: str,
             message_id: str,
             tool_id: str | None = None,
-            command: list[str] | None = None,
+            command: list[str] | str | None = None,
+            skill_input: dict[str, object] | None = None,
             prompt: str | None = None,
+            client_version: str = "5.9.2",
         ) -> dict[str, object]:
             payload: dict[str, object] = {
                 "hook_event_name": event_name,
                 "client": "WorkBuddy",
-                "version": "5.8.3",
+                "version": client_version,
                 "cwd": project_cwd,
                 "session_id": session_id,
                 "generation_id": generation_id,
                 "conversation_request_id": request_id,
-                "conversation_message_id": message_id,
                 "transcript_path": str(history),
                 "prefix_length": history.stat().st_size,
             }
@@ -1008,9 +2030,14 @@ class ManagedRuntimeTests(unittest.TestCase):
                 payload["prompt"] = prompt
             if tool_id is not None:
                 payload["tool_call_id"] = tool_id
-            if command is not None:
+            if skill_input is not None:
+                payload["tool_name"] = "Skill"
+                payload["tool_input"] = skill_input
+            elif command is not None:
                 payload["tool_name"] = "Bash"
-                payload["tool_input"] = {"command": shlex.join(command)}
+                payload["tool_input"] = {
+                    "command": command if isinstance(command, str) else shlex.join(command)
+                }
             return payload
 
         def wrapper_command(
@@ -1041,6 +2068,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                 env={
                     **base_environment,
                     "CODEBUDDY_CONVERSATION_REQUEST_ID": request_id,
+                    "CODEBUDDY_CONVERSATION_MESSAGE_ID": "workbuddy-wrapper-message",
                     "CODEBUDDY_TOOL_CALL_ID": tool_id,
                 },
                 capture_output=True,
@@ -1054,11 +2082,22 @@ class ManagedRuntimeTests(unittest.TestCase):
             with history.open("ab") as stream:
                 stream.write((json.dumps(record) + "\n").encode("utf-8"))
 
+        def native_user_text(raw_prompt: str) -> str:
+            return (
+                '<system-reminder data-role="user-context">\n'
+                "synthetic host context\n"
+                "</system-reminder>\n"
+                '<system-reminder data-role="additional-data">\n'
+                "synthetic host metadata\n"
+                "</system-reminder>\n"
+                f"<user_query>{raw_prompt}</user_query>"
+            )
+
         def append_result(
             *,
             request_id: str,
             tool_id: str,
-            command: list[str],
+            command: list[str] | str,
             parent_id: str,
         ) -> str:
             call_id = f"native-{tool_id}"
@@ -1072,7 +2111,10 @@ class ManagedRuntimeTests(unittest.TestCase):
                     "cwd": project_cwd,
                     "providerData": {"conversationRequestId": request_id},
                     "arguments": json.dumps(
-                        {"command": shlex.join(command), "description": "managed publish"}
+                        {
+                            "command": command if isinstance(command, str) else shlex.join(command),
+                            "description": "managed publish",
+                        }
                     ),
                 }
             )
@@ -1091,6 +2133,18 @@ class ManagedRuntimeTests(unittest.TestCase):
             )
             return result_id
 
+        def business_fact_counts() -> tuple[int, int, int]:
+            database = open_database(self.project)
+            try:
+                return tuple(
+                    database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                    for table in ("tasks", "calls", "managed_receipts")
+                )
+            finally:
+                database.close()
+
+        prefixed_action_commands: dict[str, str] = {}
+
         def run_turn(
             *,
             request_id: str,
@@ -1098,8 +2152,17 @@ class ManagedRuntimeTests(unittest.TestCase):
             user_id: str,
             parent_id: str | None,
             prompt: str,
+            input_path: Path,
             target: str,
-        ) -> tuple[dict[str, object], str]:
+            use_skill_pre: bool,
+            include_title: bool,
+            include_assistant_text: bool,
+            client_version: str,
+            rejected_bash_version: str | None,
+            expected_correction_rejection: bool = False,
+            scope_drift: bool = False,
+            skill_args_drift: bool = False,
+        ) -> tuple[dict[str, object], str] | None:
             self.assertEqual(
                 receive(
                     callback(
@@ -1108,27 +2171,224 @@ class ManagedRuntimeTests(unittest.TestCase):
                         generation_id=generation_id,
                         message_id=user_id,
                         prompt=prompt,
+                        client_version=client_version,
                     )
                 )["status"],
                 "prompt_recorded",
             )
-            append(
-                {
-                    "id": user_id,
-                    "type": "message",
-                    "role": "user",
-                    "parentId": parent_id,
-                    "sessionId": session_id,
-                    "cwd": project_cwd,
-                    "providerData": {
-                        "startsNewUserRequest": True,
-                        "conversationRequestId": request_id,
-                    },
+            user_record = {
+                "id": user_id,
+                "type": "message",
+                "role": "user",
+                "sessionId": session_id,
+                "cwd": project_cwd,
+                "providerData": {
+                    "startsNewUserRequest": True,
+                    "conversationRequestId": request_id,
+                },
+                "content": [{"type": "input_text", "text": native_user_text(prompt)}],
+            }
+            if parent_id is not None:
+                user_record["parentId"] = parent_id
+            append(user_record)
+
+            if use_skill_pre:
+                skill_tool = f"{request_id}-skill"
+                skill_args = prompt.removeprefix("@//text-report/")
+                model_message_id = f"native-{skill_tool}-model"
+                skill_snapshot = {
+                    "messageId": user_id,
+                    "trackedFileBackups": {},
                 }
-            )
+                append(
+                    {
+                        "type": "file-history-snapshot",
+                        "messageId": user_id,
+                        "snapshot": skill_snapshot,
+                        "cwd": project_cwd,
+                        "timestamp": 1_769_000_000,
+                        "isSnapshotUpdate": True,
+                        "_meta": {
+                            "baggage": "synthetic-baggage",
+                            "traceparent": "synthetic-traceparent",
+                        },
+                    }
+                )
+                if include_title:
+                    append(
+                        {
+                            "id": f"native-{skill_tool}-title",
+                            "type": "ai-title",
+                            "aiTitle": "Synthetic managed summary",
+                            "timestamp": 1_769_000_000,
+                            "sessionId": session_id,
+                            "cwd": project_cwd,
+                            "_meta": {
+                                "baggage": "synthetic-baggage",
+                                "traceparent": "synthetic-traceparent",
+                            },
+                        }
+                    )
+                reasoning_id = f"native-{skill_tool}-reasoning"
+                append(
+                    {
+                        "id": reasoning_id,
+                        "type": "reasoning",
+                        "parentId": user_id,
+                        "sessionId": session_id,
+                        "cwd": project_cwd,
+                        "providerData": {
+                            "conversationRequestId": request_id,
+                            "messageId": model_message_id,
+                            "model": "workbuddy-model",
+                            "stepSeq": 1,
+                        },
+                    }
+                )
+                skill_parent_id = reasoning_id
+                if include_assistant_text:
+                    skill_parent_id = f"native-{skill_tool}-assistant"
+                    append(
+                        {
+                            "id": skill_parent_id,
+                            "type": "message",
+                            "role": "assistant",
+                            "status": "completed",
+                            "parentId": reasoning_id,
+                            "sessionId": session_id,
+                            "cwd": project_cwd,
+                            "timestamp": 1_769_000_000,
+                            "_meta": {
+                                "baggage": "synthetic-baggage",
+                                "traceparent": "synthetic-traceparent",
+                            },
+                            "providerData": {
+                                "agent": "synthetic-agent",
+                                "conversationRequestId": request_id,
+                                "messageId": model_message_id,
+                                "model": "workbuddy-model",
+                                "requestModelId": "synthetic-request-model",
+                                "requestModelName": "Synthetic WorkBuddy model",
+                                "stepSeq": 1,
+                                "traceId": "synthetic-trace",
+                            },
+                            "content": [
+                                {
+                                    "type": "output_text",
+                                    "text": "Synthetic completed assistant output.",
+                                    "providerData": {"annotations": []},
+                                }
+                            ],
+                        }
+                    )
+                append(
+                    {
+                        "id": f"native-{skill_tool}",
+                        "type": "function_call",
+                        "name": "Skill",
+                        "callId": skill_tool,
+                        "parentId": skill_parent_id,
+                        "sessionId": session_id,
+                        "cwd": project_cwd,
+                        "providerData": {
+                            "conversationRequestId": request_id,
+                            "messageId": model_message_id,
+                            "model": "workbuddy-model",
+                            "stepSeq": 1,
+                        },
+                        "arguments": json.dumps(
+                            {"skill": "text-report", "args": skill_args},
+                            separators=(",", ":"),
+                        ),
+                    }
+                )
+                skill_pre = callback(
+                    "PreToolUse",
+                    request_id=request_id,
+                    generation_id=generation_id,
+                    message_id=user_id,
+                    tool_id=skill_tool,
+                    skill_input={"skill": "text-report", "args": skill_args},
+                    client_version=client_version,
+                )
+                if scope_drift:
+                    before_scope_drift = business_fact_counts()
+                    scope_drift_payload = dict(skill_pre)
+                    scope_drift_payload["session_id"] = "foreign-workbuddy-session"
+                    scope_drift_result = receive(scope_drift_payload)
+                    self.assertIn(scope_drift_result["status"], {"ignored", "technical_unusable"})
+                    self.assertEqual(business_fact_counts(), before_scope_drift)
+                if skill_args_drift:
+                    before_args_drift = business_fact_counts()
+                    args_drift_payload = callback(
+                        "PreToolUse",
+                        request_id=request_id,
+                        generation_id=generation_id,
+                        message_id=user_id,
+                        tool_id=skill_tool,
+                        skill_input={
+                            "skill": "text-report",
+                            "args": json.dumps({"objective": "different"}),
+                        },
+                        client_version=client_version,
+                    )
+                    self.assertEqual(receive(args_drift_payload)["status"], "technical_unusable")
+                    self.assertEqual(business_fact_counts(), before_args_drift)
+                    return None
+                self.assertEqual(receive(skill_pre)["status"], "technical_recorded")
+                self.assertEqual(receive(skill_pre)["status"], "replayed")
+
+            if selectorless:
+                wrong_invoke = wrapper_command("invoke", ["--skill", "other-report"])
+                before_wrong_skill = business_fact_counts()
+                with self.assertRaises(SelcError) as captured:
+                    receive(
+                        callback(
+                            "PreToolUse",
+                            request_id=request_id,
+                            generation_id=generation_id,
+                            message_id=user_id,
+                            tool_id=f"{request_id}-wrong-invoke",
+                            command=wrong_invoke,
+                            client_version=client_version,
+                        )
+                    )
+                self.assertEqual(captured.exception.code, "NATIVE_REQUEST_UNAVAILABLE")
+                self.assertEqual(business_fact_counts(), before_wrong_skill)
 
             invoke_tool = f"{request_id}-invoke"
             invoke = wrapper_command("invoke", ["--skill", "text-report"])
+            if rejected_bash_version is not None:
+                before_wrong_version = business_fact_counts()
+                with self.assertRaises(SelcError) as captured:
+                    receive(
+                        callback(
+                            "PreToolUse",
+                            request_id=request_id,
+                            generation_id=generation_id,
+                            message_id=user_id,
+                            tool_id=f"{request_id}-mixed-version-invoke",
+                            command=invoke,
+                            client_version=rejected_bash_version,
+                        )
+                    )
+                self.assertEqual(captured.exception.code, "NATIVE_REQUEST_UNAVAILABLE")
+                self.assertEqual(business_fact_counts(), before_wrong_version)
+            if expected_correction_rejection:
+                with self.assertRaises(SelcError) as captured:
+                    receive(
+                        callback(
+                            "PreToolUse",
+                            request_id=request_id,
+                            generation_id=generation_id,
+                            message_id=user_id,
+                            tool_id=invoke_tool,
+                            command=invoke,
+                            client_version=client_version,
+                        )
+                    )
+                self.assertEqual(captured.exception.code, "NATIVE_REQUEST_UNAVAILABLE")
+                return None
             self.assertEqual(
                 receive(
                     callback(
@@ -1138,30 +2398,70 @@ class ManagedRuntimeTests(unittest.TestCase):
                         message_id=user_id,
                         tool_id=invoke_tool,
                         command=invoke,
+                        client_version=client_version,
                     )
                 )["status"],
                 "recorded",
             )
             activated = run(invoke, request_id=request_id, tool_id=invoke_tool)
 
-            request_path = self.root / f"{request_id}-action.json"
-            request_path.write_text(json.dumps({"input": str(self.input_path)}), encoding="utf-8")
             action_tool = f"{request_id}-action"
-            action_command = wrapper_command(
-                "action",
-                [
-                    "--skill",
-                    "text-report",
-                    "--task-id",
-                    str(activated["task_id"]),
-                    "--call-id",
-                    str(activated["call_id"]),
-                    "--action",
-                    "text-report",
-                    "--request",
-                    str(request_path),
-                ],
-            )
+            if instruction_staging:
+                checker_input_path = self.root / f"{request_id}-checker-input.json"
+                checker_input_path.write_bytes(input_path.read_bytes())
+                artifact_source_path = self.root / f"{request_id}-instruction-artifact.json"
+                items = json.loads(checker_input_path.read_text(encoding="utf-8"))["items"]
+                expected_sum = sum(item["value"] for item in items)
+                artifact_sum = (
+                    expected_sum
+                    if (self.root / "workbuddy-correction-pass").is_file()
+                    else expected_sum - 1
+                )
+                artifact_source_path.write_text(
+                    json.dumps({"count": len(items), "sum": artifact_sum}),
+                    encoding="utf-8",
+                )
+                action_command = wrapper_command(
+                    "stage",
+                    [
+                        "--skill",
+                        "text-report",
+                        "--task-id",
+                        str(activated["task_id"]),
+                        "--call-id",
+                        str(activated["call_id"]),
+                        "--action",
+                        "text-report",
+                        "--artifact-bytes",
+                        str(artifact_source_path),
+                        "--checker-input",
+                        str(checker_input_path),
+                    ],
+                )
+            else:
+                request_path = self.root / f"{request_id}-action.json"
+                request_path.write_text(json.dumps({"input": str(input_path)}), encoding="utf-8")
+                action_command = wrapper_command(
+                    "action",
+                    [
+                        "--skill",
+                        "text-report",
+                        "--task-id",
+                        str(activated["task_id"]),
+                        "--call-id",
+                        str(activated["call_id"]),
+                        "--action",
+                        "text-report",
+                        "--request",
+                        str(request_path),
+                    ],
+                )
+            native_action_command: list[str] | str = action_command
+            if same_project_cd_action_prefix:
+                native_action_command = (
+                    f"cd {self.project.resolve()} && {shlex.join(action_command)}"
+                )
+                prefixed_action_commands[request_id] = native_action_command
             self.assertEqual(
                 receive(
                     callback(
@@ -1170,7 +2470,8 @@ class ManagedRuntimeTests(unittest.TestCase):
                         generation_id=generation_id,
                         message_id=user_id,
                         tool_id=action_tool,
-                        command=action_command,
+                        command=native_action_command,
+                        client_version=client_version,
                     )
                 )["status"],
                 "recorded",
@@ -1202,6 +2503,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                         message_id=user_id,
                         tool_id=publish_tool,
                         command=publish_command,
+                        client_version=client_version,
                     )
                 )["status"],
                 "recorded",
@@ -1217,6 +2519,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                     message_id=user_id,
                     tool_id=publish_tool,
                     command=publish_command,
+                    client_version=client_version,
                 )
             )
             self.assertEqual(post["status"], "post_recorded")
@@ -1232,30 +2535,108 @@ class ManagedRuntimeTests(unittest.TestCase):
                     request_id=request_id,
                     generation_id=generation_id,
                     message_id=user_id,
+                    client_version=client_version,
                 )
             )
             self.assertEqual(stopped["status"], "stop_recorded")
             return activated, result_id
 
-        first, first_result_id = run_turn(
+        business_dto: dict[str, object]
+        if pathless_business_dto:
+            business_dto = {"objective": "summarize the current inventory"}
+        else:
+            business_dto = {"input": str(automatic_input)}
+        first_prompt = (
+            json.dumps(business_dto)
+            if selectorless
+            else "@//text-report/" + json.dumps(business_dto)
+        )
+        if pathless_business_dto:
+            self.assertNotIn(str(automatic_input), first_prompt)
+            self.assertNotIn("text-report", first_prompt)
+
+        first_result = run_turn(
             request_id="workbuddy-request-one",
             generation_id="workbuddy-generation-one",
             user_id="workbuddy-user-one",
             parent_id=None,
-            prompt="Create the requested report from the available input.",
+            prompt=first_prompt,
+            input_path=automatic_input,
             target="reports/workbuddy-one.md",
+            use_skill_pre=True,
+            include_title=True,
+            include_assistant_text=False,
+            client_version=first_client_version,
+            rejected_bash_version=first_rejected_bash_version,
+            scope_drift=first_scope_drift,
+            skill_args_drift=first_skill_args_drift,
         )
-        correction, _ = run_turn(
-            request_id="workbuddy-request-two",
-            generation_id="workbuddy-generation-two",
-            user_id="workbuddy-user-two",
+        if first_skill_args_drift:
+            self.assertIsNone(first_result)
+            return
+        assert first_result is not None
+        first, first_result_id = first_result
+        (self.root / "workbuddy-correction-pass").write_text("pass", encoding="utf-8")
+        if source_goal_missing_before_correction:
+            database = open_database(self.project)
+            try:
+                database.execute(
+                    """UPDATE managed_contexts
+                    SET business_dto_digest = NULL, business_dto_rule_version = NULL
+                    WHERE request_id = 'workbuddy-request-one'"""
+                )
+                database.commit()
+            finally:
+                database.close()
+        correction_dto = {
+            **business_dto,
+            "selc": {
+                "intent": "correct_delivery",
+                "target": "reports/workbuddy-one.md",
+                "preserve_goal": True,
+            },
+        }
+        correction_result = run_turn(
+            request_id="workbuddy-request-correction",
+            generation_id="workbuddy-generation-correction",
+            user_id="workbuddy-user-correction",
             parent_id=first_result_id,
-            prompt="纠正上一份报告",
-            target="reports/workbuddy-two.md",
+            prompt=("" if correction_selectorless else "@//text-report/")
+            + json.dumps(correction_dto),
+            input_path=automatic_input,
+            target="reports/workbuddy-one.md",
+            use_skill_pre=True,
+            include_title=False,
+            include_assistant_text=True,
+            client_version=correction_client_version,
+            rejected_bash_version=correction_rejected_bash_version,
+            expected_correction_rejection=(
+                source_goal_missing_before_correction and not allow_legacy_explicit_fallback
+            ),
         )
+        if source_goal_missing_before_correction and not allow_legacy_explicit_fallback:
+            self.assertIsNone(correction_result)
+            database = open_database(self.project)
+            try:
+                call_count = database.execute("SELECT COUNT(*) FROM calls").fetchone()[0]
+                correction_context = database.execute(
+                    """SELECT root_valid, unknown_change FROM managed_contexts
+                    WHERE request_id = 'workbuddy-request-correction'"""
+                ).fetchone()
+                correction_receipts = database.execute(
+                    """SELECT COUNT(*) FROM managed_receipts
+                    WHERE request_id = 'workbuddy-request-correction'"""
+                ).fetchone()[0]
+            finally:
+                database.close()
+            self.assertEqual(call_count, 1)
+            self.assertEqual(tuple(correction_context), (0, 1))
+            self.assertEqual(correction_receipts, 0)
+            return
+        self.assertIsNotNone(correction_result)
+        correction, _ = correction_result
         self.assertEqual(correction["task_id"], first["task_id"])
         self.assertNotEqual(correction["call_id"], first["call_id"])
-
         database = open_database(self.project)
         try:
             windows_closed = database.execute(
@@ -1268,15 +2649,1146 @@ class ManagedRuntimeTests(unittest.TestCase):
                 )
             ]
             statuses = {
-                row["status"]
+                (row["status"], row["trigger_kind"])
                 for row in database.execute(
-                    "SELECT status FROM calls WHERE task_id = ?", (first["task_id"],)
+                    "SELECT status, trigger_kind FROM calls WHERE task_id = ?", (first["task_id"],)
                 )
             }
+            correction_context = database.execute(
+                "SELECT context_key, root_valid FROM managed_contexts WHERE request_id = ?",
+                ("workbuddy-request-correction",),
+            ).fetchone()
+            binding = database.execute(
+                """SELECT status, anchor_event_id, anchor_rule_version
+                FROM managed_correction_bindings WHERE task_id = ?""",
+                (first["task_id"],),
+            ).fetchone()
+            anchor = database.execute(
+                """SELECT pre_event_id, rule_version FROM managed_request_anchors
+                WHERE context_key = ?""",
+                (correction_context["context_key"],),
+            ).fetchone()
+            technical_receipts = database.execute(
+                """SELECT COUNT(*) FROM managed_native_events AS events
+                JOIN managed_receipts AS receipts ON receipts.native_event_id = events.event_id
+                WHERE events.tool_use_id IN (?, ?)""",
+                (
+                    "workbuddy-request-one-skill",
+                    "workbuddy-request-correction-skill",
+                ),
+            ).fetchone()[0]
+            mixed_version_receipts = database.execute(
+                """SELECT COUNT(*) FROM managed_native_events AS events
+                JOIN managed_receipts AS receipts ON receipts.native_event_id = events.event_id
+                WHERE events.tool_use_id IN (?, ?)""",
+                (
+                    "workbuddy-request-one-mixed-version-invoke",
+                    "workbuddy-request-correction-mixed-version-invoke",
+                ),
+            ).fetchone()[0]
+            call_count = database.execute(
+                "SELECT COUNT(*) FROM calls WHERE task_id = ?", (first["task_id"],)
+            ).fetchone()[0]
+            first_action_payload = None
+            if same_project_cd_action_prefix:
+                first_action_event = database.execute(
+                    "SELECT payload_json FROM managed_native_events WHERE tool_use_id = ?",
+                    ("workbuddy-request-one-action",),
+                ).fetchone()
+                self.assertIsNotNone(first_action_event)
+                first_action_payload = first_action_event["payload_json"]
         finally:
             database.close()
         self.assertEqual(windows_closed, 2, windows)
-        self.assertEqual(statuses, {"closed"})
+        first_trigger = "automatic" if selectorless else "explicit"
+        correction_trigger = "automatic" if correction_selectorless else "explicit"
+        self.assertEqual(statuses, {("closed", first_trigger), ("closed", correction_trigger)})
+        self.assertEqual(correction_context["root_valid"], 0)
+        self.assertEqual(binding["status"], "closed")
+        expected_anchor_rule = (
+            "current-request-v4-workbuddy-auto-skill-pre"
+            if correction_selectorless
+            else "current-request-v3-workbuddy-skill-pre"
+        )
+        self.assertEqual(anchor["rule_version"], expected_anchor_rule)
+        self.assertEqual(binding["anchor_event_id"], anchor["pre_event_id"])
+        self.assertEqual(binding["anchor_rule_version"], anchor["rule_version"])
+        self.assertEqual(technical_receipts, 0)
+        self.assertEqual(mixed_version_receipts, 0)
+        self.assertEqual(call_count, 2)
+        if same_project_cd_action_prefix:
+            self.assertIsNotNone(first_action_payload)
+            action_payload = json.loads(first_action_payload)
+            expected_digest = hashlib.sha256(
+                prefixed_action_commands["workbuddy-request-one"].encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(action_payload["tool_command_digest"], expected_digest)
+        health = managed_runtime.health(self.project, "managed-reports", str(first["task_id"]))
+        self.assertEqual((health["first_result"], health["final_result"]), ("fail", "pass"))
+
+    def test_workbuddy_skill_pre_requires_exact_pending_current_request(self) -> None:
+        """The WorkBuddy technical anchor accepts only its finite pending-call shape."""
+
+        cwd = self.project.resolve()
+        session_id = "workbuddy-skill-session"
+        request_id = "workbuddy-skill-request"
+        message_id = "workbuddy-skill-user"
+        tool_id = "workbuddy-skill-call"
+        prompt = '@//text-report/{"input":"resources/input.json","selc":'
+        prompt += '{"intent":"correct_delivery","target":"reports/item.json","preserve_goal":true}}'
+        request = _managed_prompt_request(
+            "workbuddy",
+            {"version": "5.8.3", "prompt": prompt},
+            declared_skills=frozenset({"text-report"}),
+        )
+        args = json.dumps(
+            {
+                "input": "resources/input.json",
+                "selc": {
+                    "intent": "correct_delivery",
+                    "target": "reports/item.json",
+                    "preserve_goal": True,
+                },
+            },
+            separators=(",", ":"),
+        )
+        prompt_payload = {
+            "surface": "WorkBuddy",
+            "client_version": "5.8.3",
+            "skill": "text-report",
+            "request_digest": managed_runtime._native_request_digest(
+                {"request": request}, "text-report"
+            ),
+            "raw_request_digest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "correction": request["correction"],
+        }
+        event = {
+            "host": "workbuddy",
+            "surface": "WorkBuddy",
+            "client_version": "5.8.3",
+            "technical_skill_event": True,
+            "technical_skill_pre": True,
+            "technical_skill_valid": True,
+            "skill": "text-report",
+            "request_digest": prompt_payload["request_digest"],
+            "correction": prompt_payload["correction"],
+            "technical_skill_args_digest": hashlib.sha256(args.encode("utf-8")).hexdigest(),
+            "tool_use_id": tool_id,
+            "session_id": session_id,
+            "request_id": request_id,
+            "cwd": str(cwd),
+        }
+        p0 = [
+            {"type": "session-meta", "sessionId": session_id},
+            {
+                "id": "workbuddy-skill-prior-result",
+                "type": "function_call_result",
+                "callId": "workbuddy-skill-prior-call",
+                "sessionId": session_id,
+                "cwd": str(cwd),
+            },
+        ]
+        native_user_text = (
+            '<system-reminder data-role="user-context">\n'
+            "synthetic prior context\n"
+            "</system-reminder>\n"
+            '<system-reminder data-role="additional-data">\n'
+            "synthetic additional data\n"
+            f"</system-reminder>\n<user_query>{prompt}</user_query>"
+        )
+        appended = [
+            {
+                "id": message_id,
+                "type": "message",
+                "role": "user",
+                "parentId": "workbuddy-skill-prior-result",
+                "sessionId": session_id,
+                "cwd": str(cwd),
+                "providerData": {
+                    "startsNewUserRequest": True,
+                    "conversationRequestId": request_id,
+                },
+                "content": [{"type": "input_text", "text": native_user_text}],
+            },
+            {
+                "type": "file-history-snapshot",
+                "messageId": message_id,
+                "cwd": str(cwd),
+                "timestamp": 1_769_000_000,
+                "isSnapshotUpdate": True,
+                "_meta": {
+                    "baggage": "synthetic-baggage",
+                    "traceparent": "synthetic-traceparent",
+                },
+                "snapshot": {"messageId": message_id, "trackedFileBackups": {}},
+            },
+            {
+                "id": "workbuddy-skill-reasoning",
+                "type": "reasoning",
+                "parentId": message_id,
+                "sessionId": session_id,
+                "cwd": str(cwd),
+                "providerData": {
+                    "conversationRequestId": request_id,
+                    "messageId": "workbuddy-skill-model",
+                    "model": "workbuddy-model",
+                    "stepSeq": 1,
+                },
+            },
+            {
+                "id": "workbuddy-skill-native-call",
+                "type": "function_call",
+                "name": "Skill",
+                "callId": tool_id,
+                "parentId": "workbuddy-skill-reasoning",
+                "sessionId": session_id,
+                "cwd": str(cwd),
+                "providerData": {
+                    "conversationRequestId": request_id,
+                    "messageId": "workbuddy-skill-model",
+                    "model": "workbuddy-model",
+                    "stepSeq": 1,
+                },
+                "arguments": json.dumps(
+                    {"skill": "text-report", "args": args}, separators=(",", ":")
+                ),
+            },
+        ]
+
+        def verified(
+            candidate_event: dict[str, object] | None = None,
+            candidate_appended: list[dict[str, object]] | None = None,
+            candidate_p0: list[dict[str, object]] | None = None,
+            candidate_prompt_payload: dict[str, object] | None = None,
+        ) -> bool:
+            return managed_runtime._workbuddy_skill_pre_request_is_verified(
+                p0 if candidate_p0 is None else candidate_p0,
+                appended if candidate_appended is None else candidate_appended,
+                session_id=session_id,
+                cwd=cwd,
+                request_id=request_id,
+                raw_prompt_digest=prompt_payload["raw_request_digest"],
+                prompt_payload=(
+                    prompt_payload if candidate_prompt_payload is None else candidate_prompt_payload
+                ),
+                event=event if candidate_event is None else candidate_event,
+            )
+
+        self.assertTrue(verified())
+        prompt_592 = {**prompt_payload, "client_version": "5.9.2"}
+        event_592 = {**event, "client_version": "5.9.2"}
+        self.assertTrue(
+            verified(
+                candidate_event=event_592,
+                candidate_prompt_payload=prompt_592,
+            )
+        )
+        self.assertFalse(
+            verified(
+                candidate_event=event_592,
+                candidate_prompt_payload=prompt_payload,
+            )
+        )
+        self.assertFalse(
+            verified(
+                candidate_event=event,
+                candidate_prompt_payload=prompt_592,
+            )
+        )
+        for invalid_version in ("5.8.2", "5.9.1", "5.9.3", "", None, 592):
+            self.assertFalse(verified(candidate_event={**event, "client_version": invalid_version}))
+            self.assertFalse(
+                verified(
+                    candidate_prompt_payload={
+                        **prompt_payload,
+                        "client_version": invalid_version,
+                    }
+                )
+            )
+        self.assertFalse(verified(candidate_event={**event, "surface": "Other"}))
+        self.assertFalse(verified(candidate_prompt_payload={**prompt_payload, "surface": "Other"}))
+        self.assertFalse(verified(candidate_appended=appended[:3]))
+
+        pathless_prompt = json.dumps({"objective": "summarize current inventory"})
+        pathless_request = _managed_prompt_request(
+            "workbuddy",
+            {"version": "5.8.3", "prompt": pathless_prompt},
+            declared_skills=frozenset({"text-report"}),
+        )
+        pathless_args = pathless_prompt
+        pathless_business_digest = managed_runtime._business_dto_goal_digest(
+            pathless_request["input"]
+        )
+        self.assertIsNotNone(pathless_business_digest)
+        pathless_prompt_payload = {
+            "surface": "WorkBuddy",
+            "client_version": "5.8.3",
+            "skill": "",
+            "request_digest": managed_runtime._native_request_digest(
+                {
+                    "request": {
+                        "skill": "text-report",
+                        "input": pathless_request["input"],
+                    }
+                },
+                "text-report",
+            ),
+            "raw_request_digest": hashlib.sha256(pathless_prompt.encode("utf-8")).hexdigest(),
+            "business_dto_digest": pathless_business_digest,
+            "business_dto_rule_version": "business-dto-v1",
+            "correction": None,
+        }
+        pathless_event = {
+            **event,
+            "request_digest": pathless_prompt_payload["request_digest"],
+            "correction": None,
+            "technical_skill_args_digest": hashlib.sha256(
+                pathless_args.encode("utf-8")
+            ).hexdigest(),
+        }
+        pathless_appended = json.loads(json.dumps(appended))
+        pathless_appended[0]["content"][0]["text"] = native_user_text.replace(
+            prompt, pathless_prompt
+        )
+        pathless_appended[-1]["arguments"] = json.dumps(
+            {"skill": "text-report", "args": pathless_args}, separators=(",", ":")
+        )
+        self.assertTrue(
+            managed_runtime._workbuddy_skill_pre_request_is_verified(
+                p0,
+                pathless_appended,
+                session_id=session_id,
+                cwd=cwd,
+                request_id=request_id,
+                raw_prompt_digest=pathless_prompt_payload["raw_request_digest"],
+                prompt_payload=pathless_prompt_payload,
+                event=pathless_event,
+            )
+        )
+
+        assistant_record = {
+            "id": "workbuddy-skill-assistant",
+            "type": "message",
+            "role": "assistant",
+            "status": "completed",
+            "parentId": "workbuddy-skill-reasoning",
+            "sessionId": session_id,
+            "cwd": str(cwd),
+            "timestamp": 1_769_000_000,
+            "_meta": {
+                "baggage": "synthetic-baggage",
+                "traceparent": "synthetic-traceparent",
+            },
+            "providerData": {
+                "agent": "synthetic-agent",
+                "conversationRequestId": request_id,
+                "messageId": "workbuddy-skill-model",
+                "model": "workbuddy-model",
+                "requestModelId": "synthetic-request-model",
+                "requestModelName": "Synthetic WorkBuddy model",
+                "stepSeq": 1,
+                "traceId": "synthetic-trace",
+            },
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "Synthetic completed assistant output.",
+                    "providerData": {"annotations": []},
+                }
+            ],
+        }
+        assistant_appended = json.loads(json.dumps(appended))
+        assistant_appended.insert(3, assistant_record)
+        assistant_appended[4]["parentId"] = assistant_record["id"]
+        self.assertTrue(verified(candidate_appended=assistant_appended))
+
+        title_and_assistant = json.loads(json.dumps(assistant_appended))
+        title_and_assistant.insert(
+            2,
+            {
+                "id": "workbuddy-skill-title-and-assistant",
+                "type": "ai-title",
+                "aiTitle": "Synthetic title",
+                "timestamp": 1_769_000_000,
+                "sessionId": session_id,
+                "cwd": str(cwd),
+                "_meta": {
+                    "baggage": "synthetic-baggage",
+                    "traceparent": "synthetic-traceparent",
+                },
+            },
+        )
+        self.assertTrue(verified(candidate_appended=title_and_assistant))
+
+        assistant_with_extra_field = json.loads(json.dumps(assistant_appended))
+        assistant_with_extra_field[3]["message"] = "unobserved"
+        self.assertFalse(verified(candidate_appended=assistant_with_extra_field))
+        assistant_with_tool_result = json.loads(json.dumps(assistant_appended))
+        assistant_with_tool_result[3]["providerData"]["toolResult"] = {"status": "completed"}
+        self.assertFalse(verified(candidate_appended=assistant_with_tool_result))
+        for provider_field in (
+            "agent",
+            "conversationRequestId",
+            "messageId",
+            "model",
+            "requestModelId",
+            "requestModelName",
+            "stepSeq",
+            "traceId",
+        ):
+            assistant_with_missing_provider_field = json.loads(json.dumps(assistant_appended))
+            assistant_with_missing_provider_field[3]["providerData"].pop(provider_field)
+            self.assertFalse(
+                verified(candidate_appended=assistant_with_missing_provider_field),
+                provider_field,
+            )
+        for provider_field in (
+            "agent",
+            "conversationRequestId",
+            "messageId",
+            "model",
+            "requestModelId",
+            "requestModelName",
+            "traceId",
+        ):
+            assistant_with_invalid_provider_type = json.loads(json.dumps(assistant_appended))
+            assistant_with_invalid_provider_type[3]["providerData"][provider_field] = 1
+            self.assertFalse(
+                verified(candidate_appended=assistant_with_invalid_provider_type),
+                provider_field,
+            )
+        assistant_with_empty_agent = json.loads(json.dumps(assistant_appended))
+        assistant_with_empty_agent[3]["providerData"]["agent"] = ""
+        self.assertFalse(verified(candidate_appended=assistant_with_empty_agent))
+        assistant_with_boolean_step = json.loads(json.dumps(assistant_appended))
+        assistant_with_boolean_step[3]["providerData"]["stepSeq"] = True
+        self.assertFalse(verified(candidate_appended=assistant_with_boolean_step))
+        assistant_with_wrong_parent = json.loads(json.dumps(assistant_appended))
+        assistant_with_wrong_parent[3]["parentId"] = "wrong-reasoning"
+        self.assertFalse(verified(candidate_appended=assistant_with_wrong_parent))
+        assistant_with_wrong_scope = json.loads(json.dumps(assistant_appended))
+        assistant_with_wrong_scope[3]["cwd"] = str(self.root / "other-project")
+        self.assertFalse(verified(candidate_appended=assistant_with_wrong_scope))
+        assistant_with_tool_content = json.loads(json.dumps(assistant_appended))
+        assistant_with_tool_content[3]["content"][0]["type"] = "tool_use"
+        self.assertFalse(verified(candidate_appended=assistant_with_tool_content))
+        assistant_with_multiple_content = json.loads(json.dumps(assistant_appended))
+        assistant_with_multiple_content[3]["content"].append(
+            {
+                "type": "output_text",
+                "text": "Another output.",
+                "providerData": {"annotations": []},
+            }
+        )
+        self.assertFalse(verified(candidate_appended=assistant_with_multiple_content))
+        assistant_with_annotations = json.loads(json.dumps(assistant_appended))
+        assistant_with_annotations[3]["content"][0]["providerData"]["annotations"] = ["x"]
+        self.assertFalse(verified(candidate_appended=assistant_with_annotations))
+        assistant_with_other_model = json.loads(json.dumps(assistant_appended))
+        assistant_with_other_model[3]["providerData"]["model"] = "other-model"
+        self.assertFalse(verified(candidate_appended=assistant_with_other_model))
+        skill_with_other_step = json.loads(json.dumps(assistant_appended))
+        skill_with_other_step[4]["providerData"]["stepSeq"] = 2
+        self.assertFalse(verified(candidate_appended=skill_with_other_step))
+        duplicate_assistant = json.loads(json.dumps(assistant_appended))
+        duplicate_assistant.insert(4, json.loads(json.dumps(assistant_record)))
+        duplicate_assistant[4]["id"] = "workbuddy-skill-second-assistant"
+        self.assertFalse(verified(candidate_appended=duplicate_assistant))
+        assistant_position_tool_result = json.loads(json.dumps(assistant_appended))
+        assistant_position_tool_result[3] = {
+            "id": "workbuddy-skill-unexpected-result",
+            "type": "function_call_result",
+            "callId": "other-tool",
+            "parentId": "workbuddy-skill-reasoning",
+            "sessionId": session_id,
+            "cwd": str(cwd),
+        }
+        self.assertFalse(verified(candidate_appended=assistant_position_tool_result))
+        assistant_position_user = json.loads(json.dumps(assistant_appended))
+        assistant_position_user[3]["role"] = "user"
+        self.assertFalse(verified(candidate_appended=assistant_position_user))
+
+        initial_p0 = [
+            {
+                "id": "workbuddy-skill-initial-meta",
+                "type": "session-meta",
+                "sessionId": session_id,
+                "cwd": str(cwd),
+            }
+        ]
+        initial_appended = json.loads(json.dumps(appended))
+        initial_appended[0].pop("parentId")
+        initial_appended.insert(
+            2,
+            {
+                "id": "workbuddy-skill-initial-title",
+                "type": "ai-title",
+                "aiTitle": "Synthetic title",
+                "timestamp": 1_769_000_000,
+                "sessionId": session_id,
+                "cwd": str(cwd),
+                "_meta": {
+                    "baggage": "synthetic-baggage",
+                    "traceparent": "synthetic-traceparent",
+                },
+            },
+        )
+        self.assertTrue(verified(candidate_appended=initial_appended, candidate_p0=initial_p0))
+        explicit_null_initial_parent = json.loads(json.dumps(initial_appended))
+        explicit_null_initial_parent[0]["parentId"] = None
+        self.assertFalse(
+            verified(candidate_appended=explicit_null_initial_parent, candidate_p0=initial_p0)
+        )
+        wrong_initial_parent = json.loads(json.dumps(initial_appended))
+        wrong_initial_parent[0]["parentId"] = "workbuddy-skill-initial-meta"
+        self.assertFalse(verified(candidate_appended=wrong_initial_parent, candidate_p0=initial_p0))
+        for mutate in (
+            lambda value: value.replace("user-context", "wrong-role", 1),
+            lambda value: value.replace("\n", "\r\n", 1),
+            lambda value: value.replace(
+                "synthetic prior context",
+                "synthetic prior context<user_query>nested</user_query>",
+            ),
+            lambda value: value.replace(
+                "synthetic additional data",
+                'synthetic additional data<system-reminder data-role="nested">x</system-reminder>',
+            ),
+            lambda value: value + "trailing",
+            lambda value: value.replace(prompt, prompt + " altered", 1),
+        ):
+            malformed_envelope = json.loads(json.dumps(appended))
+            original_text = malformed_envelope[0]["content"][0]["text"]
+            malformed_envelope[0]["content"][0]["text"] = mutate(original_text)
+            self.assertFalse(verified(candidate_appended=malformed_envelope))
+        title_with_extra_key = json.loads(json.dumps(initial_appended))
+        title_with_extra_key[2]["parentId"] = message_id
+        self.assertFalse(verified(candidate_appended=title_with_extra_key, candidate_p0=initial_p0))
+        title_with_boolean_timestamp = json.loads(json.dumps(initial_appended))
+        title_with_boolean_timestamp[2]["timestamp"] = True
+        self.assertFalse(
+            verified(candidate_appended=title_with_boolean_timestamp, candidate_p0=initial_p0)
+        )
+        title_with_wrong_scope = json.loads(json.dumps(initial_appended))
+        title_with_wrong_scope[2]["cwd"] = str(self.root / "other-project")
+        self.assertFalse(
+            verified(candidate_appended=title_with_wrong_scope, candidate_p0=initial_p0)
+        )
+        p0_identifier_collision = json.loads(json.dumps(p0))
+        p0_identifier_collision[0]["id"] = message_id
+        self.assertFalse(verified(candidate_p0=p0_identifier_collision))
+        duplicate_p0_identifier = json.loads(json.dumps(p0))
+        duplicate_p0_identifier[0]["id"] = "workbuddy-skill-prior-result"
+        self.assertFalse(verified(candidate_p0=duplicate_p0_identifier))
+        reused_call_identifier = json.loads(json.dumps(p0))
+        reused_call_identifier[1]["callId"] = tool_id
+        self.assertFalse(verified(candidate_p0=reused_call_identifier))
+        shared_historic_call_identifier = json.loads(json.dumps(p0))
+        shared_historic_call_identifier.insert(
+            1,
+            {
+                "id": "workbuddy-skill-prior-call",
+                "type": "function_call",
+                "callId": "workbuddy-skill-prior-call",
+                "sessionId": session_id,
+                "cwd": str(cwd),
+            },
+        )
+        self.assertTrue(verified(candidate_p0=shared_historic_call_identifier))
+        for changed_event in (
+            {**event, "client_version": "5.8.2"},
+            {**event, "tool_use_id": "other-call"},
+            {**event, "request_id": "other-request"},
+            {**event, "session_id": "other-session"},
+            {**event, "cwd": str(self.root / "other-project")},
+            {**event, "technical_skill_valid": False},
+            {**event, "technical_skill_args_digest": "0" * 64},
+        ):
+            self.assertFalse(verified(candidate_event=changed_event))
+
+        wrong_parent = json.loads(json.dumps(appended))
+        wrong_parent[2]["parentId"] = "wrong-parent"
+        self.assertFalse(verified(candidate_appended=wrong_parent))
+        missing_user_parent = json.loads(json.dumps(appended))
+        missing_user_parent[0].pop("parentId")
+        self.assertFalse(verified(candidate_appended=missing_user_parent))
+        wrong_snapshot = json.loads(json.dumps(appended))
+        wrong_snapshot[1]["snapshot"]["trackedFileBackups"] = ["unexpected"]
+        self.assertFalse(verified(candidate_appended=wrong_snapshot))
+        missing_snapshot_timestamp = json.loads(json.dumps(appended))
+        missing_snapshot_timestamp[1].pop("timestamp")
+        self.assertFalse(verified(candidate_appended=missing_snapshot_timestamp))
+        unknown_snapshot_field = json.loads(json.dumps(appended))
+        unknown_snapshot_field[1]["sessionId"] = session_id
+        self.assertFalse(verified(candidate_appended=unknown_snapshot_field))
+        wrong_snapshot_metadata = json.loads(json.dumps(appended))
+        wrong_snapshot_metadata[1]["_meta"]["baggage"] = False
+        self.assertFalse(verified(candidate_appended=wrong_snapshot_metadata))
+        wrong_callback_identity = {**event, "message_id": "different-native-user"}
+        self.assertFalse(verified(candidate_event=wrong_callback_identity))
+        for field in ("id", "sessionId", "cwd"):
+            missing_identity = json.loads(json.dumps(appended))
+            missing_identity[3].pop(field)
+            self.assertFalse(verified(candidate_appended=missing_identity))
+        for field in ("sessionId", "cwd"):
+            missing_scope = json.loads(json.dumps(appended))
+            missing_scope[2].pop(field)
+            self.assertFalse(verified(candidate_appended=missing_scope))
+        duplicate_reasoning_identity = json.loads(json.dumps(appended))
+        duplicate_reasoning_identity[2]["id"] = message_id
+        self.assertFalse(verified(candidate_appended=duplicate_reasoning_identity))
+        completed_call = json.loads(json.dumps(appended))
+        completed_call[3]["status"] = "completed"
+        self.assertFalse(verified(candidate_appended=completed_call))
+        unknown_call_status = json.loads(json.dumps(appended))
+        unknown_call_status[3]["status"] = "pending"
+        self.assertFalse(verified(candidate_appended=unknown_call_status))
+        different_model = json.loads(json.dumps(appended))
+        different_model[3]["providerData"]["model"] = "other-workbuddy-model"
+        self.assertFalse(verified(candidate_appended=different_model))
+        wrong_args = json.loads(json.dumps(appended))
+        wrong_args[3]["arguments"] = json.dumps(
+            {"skill": "text-report", "args": '{"input":"resources/other.json"}'},
+            separators=(",", ":"),
+        )
+        self.assertFalse(verified(candidate_appended=wrong_args))
+        wrong_name = json.loads(json.dumps(appended))
+        wrong_name[3]["arguments"] = json.dumps(
+            {"skill": "other-skill", "args": args}, separators=(",", ":")
+        )
+        self.assertFalse(verified(candidate_appended=wrong_name))
+        completed = json.loads(json.dumps(appended))
+        completed.append(
+            {
+                "type": "function_call_result",
+                "callId": tool_id,
+                "parentId": "workbuddy-skill-native-call",
+                "sessionId": session_id,
+                "cwd": str(cwd),
+            }
+        )
+        self.assertFalse(verified(candidate_appended=completed))
+        wrong_scope = json.loads(json.dumps(p0))
+        wrong_scope[1]["cwd"] = str(self.root / "other-project")
+        self.assertFalse(verified(candidate_p0=wrong_scope))
+
+    def test_workbuddy_skill_input_accepts_only_one_declared_json_object(self) -> None:
+        """Skill hook input cannot fall back to a command or a permissive serializer."""
+
+        args = '{"input":"resources/input.json"}'
+        request, skill, args_digest, valid = _workbuddy_skill_request(
+            {"skill": "text-report", "args": args},
+            declared_skills=frozenset({"text-report"}),
+        )
+        self.assertEqual(
+            request, {"skill": "text-report", "input": {"input": "resources/input.json"}}
+        )
+        self.assertEqual(skill, "text-report")
+        self.assertEqual(args_digest, hashlib.sha256(args.encode("utf-8")).hexdigest())
+        self.assertTrue(valid)
+
+        invalid_inputs = (
+            {"skill": "text-report", "args": args, "command": "ignored"},
+            {"skill": "text-report", "args": args + " trailing"},
+            {"skill": "text-report", "args": "[]"},
+            {"skill": "other-skill", "args": args},
+            {"skill": "text-report", "args": None},
+            {"command": "managed invoke"},
+        )
+        for tool_input in invalid_inputs:
+            _, _, _, is_valid = _workbuddy_skill_request(
+                tool_input,
+                declared_skills=frozenset({"text-report"}),
+            )
+            self.assertFalse(is_valid)
+
+    def test_legacy_nontechnical_workbuddy_event_replays_without_a_digest_conflict(self) -> None:
+        """A pre-Skill native row retains its original digest formula on replay."""
+
+        session_id = "legacy-workbuddy-session"
+        history = self.root / ".codebuddy" / "legacy-workbuddy.jsonl"
+        history.parent.mkdir(parents=True)
+        history.write_text(
+            json.dumps({"type": "session-meta", "sessionId": session_id}) + "\n",
+            encoding="utf-8",
+        )
+        prompt = '@//text-report/{"input":"resources/input.json"}'
+        payload = {
+            "hook_event_name": "UserPromptSubmit",
+            "client": "WorkBuddy",
+            "version": "5.8.3",
+            "cwd": str(self.project.resolve()),
+            "session_id": session_id,
+            "generation_id": "legacy-workbuddy-generation",
+            "conversation_request_id": "legacy-workbuddy-request",
+            "prompt": prompt,
+            "transcript_path": str(history),
+            "prefix_length": history.stat().st_size,
+        }
+        environment = {"CODEBUDDY_SESSION_ID": session_id}
+        first = receive_native_hook(
+            project_root=self.project,
+            suite_id="managed-reports",
+            host="workbuddy",
+            payload=payload,
+            environment=environment,
+        )
+        self.assertEqual(first["status"], "prompt_recorded")
+
+        database = open_database(self.project)
+        try:
+            row = database.execute("SELECT * FROM managed_native_events").fetchone()
+            legacy_payload = json.loads(row["payload_json"])
+            for key in (
+                "technical_skill_event",
+                "technical_skill_pre",
+                "technical_skill_valid",
+                "technical_skill_args_digest",
+            ):
+                legacy_payload.pop(key)
+            legacy_digest = managed_runtime._digest(
+                {
+                    "identity": row["stable_identity"],
+                    "command": None,
+                    "raw_request": legacy_payload["raw_request_digest"],
+                    "source": "native-collector",
+                }
+            )
+            database.execute(
+                """UPDATE managed_native_events
+                SET payload_digest = ?, payload_json = ? WHERE event_id = ?""",
+                (legacy_digest, json.dumps(legacy_payload, sort_keys=True), row["event_id"]),
+            )
+            database.commit()
+        finally:
+            database.close()
+
+        replay = receive_native_hook(
+            project_root=self.project,
+            suite_id="managed-reports",
+            host="workbuddy",
+            payload=payload,
+            environment=environment,
+        )
+        self.assertEqual(replay["status"], "replayed")
+        database = open_database(self.project)
+        try:
+            self.assertEqual(
+                database.execute("SELECT COUNT(*) FROM managed_native_events").fetchone()[0], 1
+            )
+            self.assertEqual(
+                database.execute("SELECT COUNT(*) FROM managed_native_conflicts").fetchone()[0], 0
+            )
+        finally:
+            database.close()
+
+    def test_workbuddy_skill_pre_cannot_replace_invalid_or_terminated_request_facts(self) -> None:
+        """A later Skill callback cannot repair a frozen failed or terminal boundary."""
+
+        manifest_path = self.suite / "suite.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["managed"]["native_hosts"] = {"workbuddy": ["5.8.3"]}
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        seal_suite(self.suite)
+        installation = install_suite(
+            source=self.suite,
+            project_root=self.project,
+            harness="workbuddy",
+            ref=None,
+        )
+
+        session_id = "workbuddy-skill-fence-session"
+        project_cwd = str(self.project.resolve())
+        compressed_cwd = project_cwd.lstrip("/").replace("/", "-")
+        history = self.root / ".codebuddy" / "projects" / compressed_cwd / f"{session_id}.jsonl"
+        history.parent.mkdir(parents=True)
+        history.write_text(
+            "\n".join(
+                (
+                    json.dumps({"type": "session-meta", "sessionId": session_id}),
+                    json.dumps(
+                        {
+                            "type": "session-meta",
+                            "sessionId": session_id,
+                            "cwd": project_cwd,
+                        }
+                    ),
+                )
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        base_environment = {**os.environ, "CODEBUDDY_SESSION_ID": session_id}
+
+        def receive(payload: dict[str, object]) -> dict[str, object]:
+            with mock.patch("selc.managed_runtime.Path.home", return_value=self.root):
+                return receive_native_hook(
+                    project_root=self.project,
+                    suite_id="managed-reports",
+                    host="workbuddy",
+                    payload=payload,
+                    environment=base_environment,
+                )
+
+        def callback(
+            event_name: str,
+            *,
+            request_id: str,
+            message_id: str,
+            tool_id: str | None = None,
+            tool_input: dict[str, object] | None = None,
+            tool_name: str = "Skill",
+            prompt: str | None = None,
+        ) -> dict[str, object]:
+            payload: dict[str, object] = {
+                "hook_event_name": event_name,
+                "client": "WorkBuddy",
+                "version": "5.8.3",
+                "cwd": project_cwd,
+                "session_id": session_id,
+                "generation_id": f"generation-{request_id}",
+                "conversation_request_id": request_id,
+                "conversation_message_id": message_id,
+                "transcript_path": str(history),
+                "prefix_length": history.stat().st_size,
+            }
+            if prompt is not None:
+                payload["prompt"] = prompt
+            if tool_id is not None:
+                payload["tool_call_id"] = tool_id
+            if tool_input is not None:
+                payload["tool_name"] = tool_name
+                payload["tool_input"] = tool_input
+            return payload
+
+        def append(record: dict[str, object]) -> None:
+            with history.open("ab") as stream:
+                stream.write((json.dumps(record) + "\n").encode("utf-8"))
+
+        def begin_pending_skill(
+            *,
+            request_id: str,
+            message_id: str,
+            tool_id: str,
+            args: str,
+            parent_id: str | None = None,
+        ) -> str:
+            prompt = "@//text-report/" + args
+            self.assertEqual(
+                receive(
+                    callback(
+                        "UserPromptSubmit",
+                        request_id=request_id,
+                        message_id=message_id,
+                        prompt=prompt,
+                    )
+                )["status"],
+                "prompt_recorded",
+            )
+            append(
+                {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "user",
+                    "parentId": parent_id,
+                    "sessionId": session_id,
+                    "cwd": project_cwd,
+                    "providerData": {
+                        "startsNewUserRequest": True,
+                        "conversationRequestId": request_id,
+                    },
+                    "content": [{"type": "input_text", "text": prompt}],
+                }
+            )
+            append(
+                {
+                    "type": "file-history-snapshot",
+                    "messageId": message_id,
+                    "cwd": project_cwd,
+                    "snapshot": {"messageId": message_id, "trackedFileBackups": {}},
+                }
+            )
+            reasoning_id = f"{tool_id}-reasoning"
+            append(
+                {
+                    "id": reasoning_id,
+                    "type": "reasoning",
+                    "parentId": message_id,
+                    "sessionId": session_id,
+                    "cwd": project_cwd,
+                    "providerData": {
+                        "conversationRequestId": request_id,
+                        "messageId": f"{tool_id}-model",
+                        "model": "workbuddy-model",
+                    },
+                }
+            )
+            append(
+                {
+                    "id": f"{tool_id}-call",
+                    "type": "function_call",
+                    "name": "Skill",
+                    "callId": tool_id,
+                    "parentId": reasoning_id,
+                    "sessionId": session_id,
+                    "cwd": project_cwd,
+                    "providerData": {
+                        "conversationRequestId": request_id,
+                        "messageId": f"{tool_id}-model",
+                        "model": "workbuddy-model",
+                    },
+                    "arguments": json.dumps(
+                        {"skill": "text-report", "args": args}, separators=(",", ":")
+                    ),
+                }
+            )
+            return prompt
+
+        invalid_args = '{"input":"resources/input.json"} trailing'
+        begin_pending_skill(
+            request_id="invalid-request",
+            message_id="invalid-user",
+            tool_id="invalid-skill",
+            args=invalid_args,
+        )
+        self.assertEqual(
+            receive(
+                callback(
+                    "PreToolUse",
+                    request_id="invalid-request",
+                    message_id="invalid-user",
+                    tool_id="invalid-skill",
+                    tool_input={"skill": "text-report", "args": invalid_args},
+                )
+            )["status"],
+            "technical_unusable",
+        )
+        wrapper = (
+            self.project
+            / ".selc"
+            / "installs"
+            / "managed-reports"
+            / "current"
+            / "bin"
+            / "selc-suite.py"
+        )
+        blocked_invoke = [
+            sys.executable,
+            str(wrapper),
+            "managed",
+            "invoke",
+            "--project-root",
+            str(self.project),
+            "--suite",
+            "managed-reports",
+            "--skill",
+            "text-report",
+            "--host",
+            "workbuddy",
+            "--expected-version",
+            str(installation["version"]),
+            "--expected-composite",
+            str(installation["digest"]),
+        ]
+        with self.assertRaises(SelcError) as blocked:
+            receive(
+                callback(
+                    "PreToolUse",
+                    request_id="invalid-request",
+                    message_id="invalid-user",
+                    tool_id="invalid-bash-invoke",
+                    tool_name="Bash",
+                    tool_input={"command": shlex.join(blocked_invoke)},
+                )
+            )
+        self.assertEqual(blocked.exception.code, "NATIVE_REQUEST_UNAVAILABLE")
+        database = open_database(self.project)
+        try:
+            invalid_context = database.execute(
+                """SELECT root_valid, unknown_change FROM managed_contexts
+                WHERE request_id = 'invalid-request'"""
+            ).fetchone()
+            invalid_receipts = database.execute(
+                """SELECT COUNT(*) FROM managed_receipts
+                WHERE request_id = 'invalid-request'"""
+            ).fetchone()[0]
+        finally:
+            database.close()
+        self.assertIsNotNone(invalid_context)
+        self.assertEqual(invalid_context["root_valid"], 1)
+        self.assertEqual(invalid_context["unknown_change"], 1)
+        self.assertEqual(invalid_receipts, 0)
+        valid_args = '{"input":"resources/input.json"}'
+        append(
+            {
+                "id": "invalid-later-call",
+                "type": "function_call",
+                "name": "Skill",
+                "callId": "invalid-later-skill",
+                "parentId": "invalid-skill-reasoning",
+                "sessionId": session_id,
+                "cwd": project_cwd,
+                "providerData": {
+                    "conversationRequestId": "invalid-request",
+                    "messageId": "invalid-user",
+                },
+                "arguments": json.dumps(
+                    {"skill": "text-report", "args": valid_args}, separators=(",", ":")
+                ),
+            }
+        )
+        self.assertEqual(
+            receive(
+                callback(
+                    "PreToolUse",
+                    request_id="invalid-request",
+                    message_id="invalid-user",
+                    tool_id="invalid-later-skill",
+                    tool_input={"skill": "text-report", "args": valid_args},
+                )
+            )["status"],
+            "technical_unusable",
+        )
+
+        begin_pending_skill(
+            request_id="post-first-request",
+            message_id="post-first-user",
+            tool_id="post-first-skill",
+            args=valid_args,
+            parent_id="invalid-later-call",
+        )
+        post_first = callback(
+            "PostToolUse",
+            request_id="post-first-request",
+            message_id="post-first-user",
+            tool_id="post-first-different-tool",
+            tool_input={"skill": "text-report", "args": valid_args},
+        )
+        self.assertEqual(receive(post_first)["status"], "post_recorded")
+        self.assertEqual(
+            receive(
+                callback(
+                    "PreToolUse",
+                    request_id="post-first-request",
+                    message_id="post-first-user",
+                    tool_id="post-first-skill",
+                    tool_input={"skill": "text-report", "args": valid_args},
+                )
+            )["status"],
+            "technical_unusable",
+        )
+
+        begin_pending_skill(
+            request_id="non-skill-pre-first-request",
+            message_id="non-skill-pre-first-user",
+            tool_id="non-skill-pre-first-skill",
+            args=valid_args,
+            parent_id="post-first-skill-call",
+        )
+        self.assertEqual(
+            receive(
+                callback(
+                    "PreToolUse",
+                    request_id="non-skill-pre-first-request",
+                    message_id="non-skill-pre-first-user",
+                    tool_id="non-skill-pre-first-bash",
+                    tool_name="Bash",
+                    tool_input={"command": "echo untrusted"},
+                )
+            )["status"],
+            "recorded_unusable",
+        )
+        self.assertEqual(
+            receive(
+                callback(
+                    "PreToolUse",
+                    request_id="non-skill-pre-first-request",
+                    message_id="non-skill-pre-first-user",
+                    tool_id="non-skill-pre-first-skill",
+                    tool_input={"skill": "text-report", "args": valid_args},
+                )
+            )["status"],
+            "technical_unusable",
+        )
+
+        begin_pending_skill(
+            request_id="stop-first-request",
+            message_id="stop-first-user",
+            tool_id="stop-first-skill",
+            args=valid_args,
+            parent_id="non-skill-pre-first-skill-call",
+        )
+        self.assertEqual(
+            receive(
+                callback(
+                    "Stop",
+                    request_id="stop-first-request",
+                    message_id="stop-first-user",
+                )
+            )["status"],
+            "stop_recorded",
+        )
+        self.assertEqual(
+            receive(
+                callback(
+                    "PreToolUse",
+                    request_id="stop-first-request",
+                    message_id="stop-first-user",
+                    tool_id="stop-first-skill",
+                    tool_input={"skill": "text-report", "args": valid_args},
+                )
+            )["status"],
+            "technical_unusable",
+        )
+
+        database = open_database(self.project)
+        try:
+            anchors = database.execute("SELECT COUNT(*) FROM managed_request_anchors").fetchone()[0]
+            receipts = database.execute("SELECT COUNT(*) FROM managed_receipts").fetchone()[0]
+            tasks = database.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            calls = database.execute("SELECT COUNT(*) FROM calls").fetchone()[0]
+        finally:
+            database.close()
+        self.assertEqual((anchors, receipts, tasks, calls), (0, 0, 0, 0))
+
+    def test_run_action_executes_a_frozen_path_snapshot(self) -> None:
+        """Mutating a source after validation cannot change the child process input."""
+
+        activated = self._activate()
+        action_receipt = self._observe("text-report", "tool-frozen-action")
+        original_input = self.input_path.read_text(encoding="utf-8")
+        mutated_input = "changed\nsource\n"
+        verify_frozen_input = managed_runtime._assert_correction_request_input
+        mutation_count = 0
+
+        def mutate_source_after_frozen_check(*args: object, **kwargs: object) -> None:
+            nonlocal mutation_count
+            verify_frozen_input(*args, **kwargs)
+            mutation_count += 1
+            self.input_path.write_text(mutated_input, encoding="utf-8")
+
+        with mock.patch(
+            "selc.managed_runtime._assert_correction_request_input",
+            side_effect=mutate_source_after_frozen_check,
+        ):
+            action = managed_runtime.run_action(
+                project_root=self.project,
+                suite_id="managed-reports",
+                skill="text-report",
+                task_id=str(activated["task_id"]),
+                call_id=str(activated["call_id"]),
+                action_id="text-report",
+                receipt=action_receipt,
+                request={"input": str(self.input_path)},
+            )
+
+        self.assertEqual(mutation_count, 1)
+        self.assertEqual(self.input_path.read_text(encoding="utf-8"), mutated_input)
+        self.assertEqual(original_input, "first\nsecond\n")
+        self.assertEqual(
+            Path(str(action["artifact_path"])).read_text(encoding="utf-8"),
+            "# Text report\n\n- first\n- second\n",
+        )
 
     def test_synthetic_journey_records_automatically_and_requires_post_closure(self) -> None:
         activated = self._activate()
@@ -2776,56 +5288,6 @@ class ManagedRuntimeTests(unittest.TestCase):
             )
         self.assertEqual(captured.exception.code, "MANAGED_CONTEXT_CLOSED")
 
-        correction_payload = self._payload("activate", "tool-stopped-correction-activate")
-        correction_payload.update(
-            {
-                "generation_id": "generation-stopped-correction",
-                "request_id": "request-stopped-correction",
-                "root_request_id": "root-a",
-                "causation": "business_correction",
-            }
-        )
-        correction_receipt = managed_runtime.observe_request_boundary(
-            project_root=self.project,
-            suite_id="managed-reports",
-            payload=correction_payload,
-            fixture=True,
-        )["receipt"]
-        correction = managed_runtime.activate(
-            project_root=self.project,
-            suite_id="managed-reports",
-            skill="text-report",
-            receipt=str(correction_receipt),
-        )
-        self.assertEqual(correction["task_id"], activated["task_id"])
-
-        correction_action_payload = self._payload("text-report", "tool-stopped-correction-action")
-        correction_action_payload.update(
-            {
-                "generation_id": "generation-stopped-correction",
-                "request_id": "request-stopped-correction",
-                "root_request_id": "root-a",
-                "causation": "business_correction",
-            }
-        )
-        correction_action_receipt = managed_runtime.observe_request_boundary(
-            project_root=self.project,
-            suite_id="managed-reports",
-            payload=correction_action_payload,
-            fixture=True,
-        )["receipt"]
-        corrected_action = managed_runtime.run_action(
-            project_root=self.project,
-            suite_id="managed-reports",
-            skill="text-report",
-            task_id=str(correction["task_id"]),
-            call_id=str(correction["call_id"]),
-            action_id="text-report",
-            receipt=str(correction_action_receipt),
-            request={"input": str(self.input_path)},
-        )
-        self.assertTrue(Path(str(corrected_action["artifact_path"])).is_file())
-
     def test_recover_fences_a_stopped_unpublished_action_after_execution_ends(self) -> None:
         """A stored Stop closes only after recovery proves the group quiescent."""
 
@@ -3096,8 +5558,8 @@ class ManagedRuntimeTests(unittest.TestCase):
             )
         self.assertEqual(captured.exception.code, "RECEIPT_SUBJECT_MISMATCH")
 
-    def test_action_receipt_cannot_cross_calls_in_one_business_task(self) -> None:
-        first = self._activate()
+    def test_natural_correction_does_not_reuse_a_business_task(self) -> None:
+        self._activate()
         second_payload = self._payload("activate", "tool-second-activate")
         second_payload.update(
             {
@@ -3107,47 +5569,56 @@ class ManagedRuntimeTests(unittest.TestCase):
                 "causation": "business_correction",
             }
         )
-        second_receipt = managed_runtime.observe_request_boundary(
+        observed = managed_runtime.observe_request_boundary(
             project_root=self.project,
             suite_id="managed-reports",
             payload=second_payload,
             fixture=True,
-        )["receipt"]
-        second = managed_runtime.activate(
-            project_root=self.project,
-            suite_id="managed-reports",
-            skill="text-report",
-            receipt=str(second_receipt),
         )
-        self.assertEqual(second["task_id"], first["task_id"])
+        self.assertEqual(observed["status"], "recorded_unusable")
+        self.assertNotIn("receipt", observed)
+        database = open_database(self.project)
+        try:
+            task_count = database.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            context = database.execute(
+                "SELECT task_id, intervention, unknown_change FROM managed_contexts "
+                "WHERE request_id = 'request-correction'"
+            ).fetchone()
+        finally:
+            database.close()
+        self.assertEqual(task_count, 1)
+        self.assertEqual(tuple(context), (None, 0, 1))
 
-        action_payload = self._payload("text-report", "tool-second-action")
-        action_payload.update(
+    def test_audit_context_is_paused_without_reusing_a_business_task(self) -> None:
+        self._activate()
+        audit = self._payload("activate", "tool-audit")
+        audit.update(
             {
-                "generation_id": "generation-correction",
-                "request_id": "request-correction",
-                "root_request_id": "root-a",
-                "causation": "business_correction",
+                "generation_id": "generation-audit",
+                "request_id": "request-audit",
+                "causation": "audit",
             }
         )
-        action_receipt = managed_runtime.observe_request_boundary(
+        observed = managed_runtime.observe_request_boundary(
             project_root=self.project,
             suite_id="managed-reports",
-            payload=action_payload,
+            payload=audit,
             fixture=True,
-        )["receipt"]
-        with self.assertRaises(SelcError) as captured:
-            managed_runtime.run_action(
-                project_root=self.project,
-                suite_id="managed-reports",
-                skill="text-report",
-                task_id=str(first["task_id"]),
-                call_id=str(first["call_id"]),
-                action_id="text-report",
-                receipt=str(action_receipt),
-                request={"input": str(self.input_path)},
-            )
-        self.assertEqual(captured.exception.code, "RECEIPT_SUBJECT_MISMATCH")
+        )
+        self.assertEqual(observed["status"], "recorded_unusable")
+        self.assertNotIn("receipt", observed)
+
+        database = open_database(self.project)
+        try:
+            task_count = database.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+            context = database.execute(
+                "SELECT task_id, intervention, unknown_change FROM managed_contexts "
+                "WHERE request_id = 'request-audit'"
+            ).fetchone()
+        finally:
+            database.close()
+        self.assertEqual(task_count, 1)
+        self.assertEqual(tuple(context), (None, 0, 1))
 
     def test_native_replay_keeps_the_original_prefix_after_history_growth(self) -> None:
         payload = self._payload("activate", "tool-growth")
@@ -3245,6 +5716,25 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertTrue(
             managed_runtime._workbuddy_history_contains_publication_result(
                 [user, call, result], event, "wb-tool"
+            )
+        )
+        prefixed_command = f"cd {self.project.resolve()} && {command}"
+        prefixed_event = dict(event)
+        prefixed_event["tool_command_digest"] = hashlib.sha256(
+            prefixed_command.encode()
+        ).hexdigest()
+        self.assertFalse(
+            managed_runtime._workbuddy_history_contains_publication_result(
+                [user, call, result], prefixed_event, "wb-tool"
+            )
+        )
+        prefixed_call = dict(call)
+        prefixed_call["arguments"] = json.dumps(
+            {"command": prefixed_command, "description": "publish"}
+        )
+        self.assertTrue(
+            managed_runtime._workbuddy_history_contains_publication_result(
+                [user, prefixed_call, result], prefixed_event, "wb-tool"
             )
         )
         orphan = dict(result)
@@ -3417,101 +5907,6 @@ class ManagedRuntimeTests(unittest.TestCase):
             "closed",
         )
 
-    def test_workbuddy_correction_candidate_links_only_through_native_message_ancestors(
-        self,
-    ) -> None:
-        """A callback without parent-request fields can reuse one proven task."""
-
-        original = self._activate()
-        original_user = {
-            "id": "original-user",
-            "type": "message",
-            "role": "user",
-            "sessionId": "wb-session",
-            "cwd": str(self.project.resolve()),
-            "providerData": {
-                "startsNewUserRequest": True,
-                "conversationRequestId": "wb-original-request",
-            },
-        }
-        correction_user = {
-            "id": "correction-user",
-            "type": "message",
-            "role": "user",
-            "parentId": "original-user",
-            "sessionId": "wb-session",
-            "cwd": str(self.project.resolve()),
-            "providerData": {
-                "startsNewUserRequest": True,
-                "conversationRequestId": "wb-correction-request",
-            },
-        }
-        history_path = self.root / "workbuddy-correction.jsonl"
-        history_path.write_text(
-            json.dumps(original_user) + "\n" + json.dumps(correction_user) + "\n",
-            encoding="utf-8",
-        )
-        event = {
-            "host": "workbuddy",
-            "suite_id": "managed-reports",
-            "session_id": "wb-session",
-            "cwd": str(self.project.resolve()),
-            "request_id": "wb-correction-request",
-            "transcript_path": str(history_path),
-            "prefix": {"length": history_path.stat().st_size},
-        }
-        database = open_database(self.project)
-        try:
-            database.execute(
-                """INSERT INTO managed_contexts(
-                context_key, suite_id, host, session_id, generation_id, request_id,
-                root_request_id, request_digest, input_skill, root_event_id, root_valid,
-                task_id, status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, '', '', '', ?, 0, ?, 'active', ?)""",
-                (
-                    "workbuddy-original-context",
-                    "managed-reports",
-                    "workbuddy",
-                    "wb-session",
-                    "wb-original-generation",
-                    "wb-original-request",
-                    "event-original",
-                    original["task_id"],
-                    records.utc_now(),
-                ),
-            )
-            database.execute(
-                """INSERT INTO managed_contexts(
-                context_key, suite_id, host, session_id, generation_id, request_id,
-                root_request_id, request_digest, input_skill, root_event_id, root_valid,
-                status, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, '', '', '', ?, 0, 'active', ?)""",
-                (
-                    "workbuddy-correction-context",
-                    "managed-reports",
-                    "workbuddy",
-                    "wb-session",
-                    "wb-correction-generation",
-                    "wb-correction-request",
-                    "event-correction",
-                    records.utc_now(),
-                ),
-            )
-            self.assertTrue(
-                managed_runtime._link_history_followup_context(
-                    database,
-                    "workbuddy-correction-context",
-                    event,
-                )
-            )
-            linked = database.execute(
-                "SELECT task_id FROM managed_contexts WHERE context_key = ?",
-                ("workbuddy-correction-context",),
-            ).fetchone()[0]
-        finally:
-            database.close()
-        self.assertEqual(linked, original["task_id"])
-
     def test_stop_closes_every_call_for_its_native_request(self) -> None:
         first = self._activate()
         second_receipt = self._observe("activate", "tool-activate-second")
@@ -3536,7 +5931,7 @@ class ManagedRuntimeTests(unittest.TestCase):
             database.close()
         self.assertEqual(statuses, {"closed"})
 
-    def test_stop_does_not_close_an_independent_active_correction_call(self) -> None:
+    def test_stop_closes_the_original_task_when_natural_correction_is_paused(self) -> None:
         first = self._activate()
         correction = self._payload("activate", "tool-stop-correction")
         correction.update(
@@ -3547,19 +5942,14 @@ class ManagedRuntimeTests(unittest.TestCase):
                 "causation": "business_correction",
             }
         )
-        correction_receipt = managed_runtime.observe_request_boundary(
+        observed = managed_runtime.observe_request_boundary(
             project_root=self.project,
             suite_id="managed-reports",
             payload=correction,
             fixture=True,
-        )["receipt"]
-        correction_call = managed_runtime.activate(
-            project_root=self.project,
-            suite_id="managed-reports",
-            skill="text-report",
-            receipt=str(correction_receipt),
         )
-        self.assertEqual(correction_call["task_id"], first["task_id"])
+        self.assertEqual(observed["status"], "recorded_unusable")
+        self.assertNotIn("receipt", observed)
 
         self._stop("tool-activate")
 
@@ -3568,17 +5958,15 @@ class ManagedRuntimeTests(unittest.TestCase):
             first_status = database.execute(
                 "SELECT status FROM calls WHERE call_id = ?", (first["call_id"],)
             ).fetchone()["status"]
-            correction_status = database.execute(
-                "SELECT status FROM calls WHERE call_id = ?", (correction_call["call_id"],)
-            ).fetchone()["status"]
             task_status = database.execute(
                 "SELECT status FROM tasks WHERE task_id = ?", (first["task_id"],)
             ).fetchone()["status"]
+            task_count = database.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
         finally:
             database.close()
         self.assertEqual(first_status, "closed")
-        self.assertEqual(correction_status, "active")
-        self.assertEqual(task_status, "active")
+        self.assertEqual(task_status, "closed")
+        self.assertEqual(task_count, 1)
 
     def test_conflicting_native_replay_invalidates_the_original_receipt(self) -> None:
         receipt = self._observe("activate", "tool-conflict")
@@ -3605,8 +5993,8 @@ class ManagedRuntimeTests(unittest.TestCase):
             )
         self.assertEqual(captured.exception.code, "RECEIPT_INVALID")
 
-    def test_receipt_is_one_use_and_cannot_select_a_new_task_for_correction(self) -> None:
-        activated = self._activate()
+    def test_receipt_is_one_use_and_natural_correction_stays_unbound(self) -> None:
+        self._activate()
         with self.assertRaises(SelcError) as captured:
             managed_runtime.activate(
                 project_root=self.project,
@@ -3620,23 +6008,24 @@ class ManagedRuntimeTests(unittest.TestCase):
         correction["causation"] = "business_correction"
         correction["request_id"] = "correction-request"
         correction["request"] = {"skill": "text-report", "input": {"input": str(self.input_path)}}
-        receipt = managed_runtime.observe_request_boundary(
+        observed = managed_runtime.observe_request_boundary(
             project_root=self.project,
             suite_id="managed-reports",
             payload=correction,
             fixture=True,
-        )["receipt"]
-        corrected = managed_runtime.activate(
-            project_root=self.project,
-            suite_id="managed-reports",
-            skill="text-report",
-            receipt=receipt,
         )
-        self.assertEqual(corrected["task_id"], activated["task_id"])
-        self.assertNotEqual(corrected["call_id"], activated["call_id"])
+        self.assertEqual(observed["status"], "recorded_unusable")
+        self.assertNotIn("receipt", observed)
 
-    def test_parent_request_links_a_correction_without_a_root_identifier(self) -> None:
-        original = self._activate()
+        database = open_database(self.project)
+        try:
+            task_count = database.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        finally:
+            database.close()
+        self.assertEqual(task_count, 1)
+
+    def test_parent_request_does_not_bind_a_natural_correction(self) -> None:
+        self._activate()
         correction = self._payload("activate", "tool-parent-correction")
         correction.update(
             {
@@ -3647,21 +6036,21 @@ class ManagedRuntimeTests(unittest.TestCase):
             }
         )
         correction.pop("root_request_id")
-        receipt = managed_runtime.observe_request_boundary(
+        observed = managed_runtime.observe_request_boundary(
             project_root=self.project,
             suite_id="managed-reports",
             payload=correction,
             fixture=True,
-        )["receipt"]
-        corrected = managed_runtime.activate(
-            project_root=self.project,
-            suite_id="managed-reports",
-            skill="text-report",
-            receipt=str(receipt),
         )
-        self.assertEqual(corrected["task_id"], original["task_id"])
-        health = managed_runtime.health(self.project, "managed-reports", str(original["task_id"]))
-        self.assertEqual(health["first_result"], "fail")
+        self.assertEqual(observed["status"], "recorded_unusable")
+        self.assertNotIn("receipt", observed)
+
+        database = open_database(self.project)
+        try:
+            task_count = database.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        finally:
+            database.close()
+        self.assertEqual(task_count, 1)
 
     def test_native_adapter_only_classifies_explicit_correction_prompt_forms(self) -> None:
         self.assertEqual(
@@ -3693,6 +6082,193 @@ class ManagedRuntimeTests(unittest.TestCase):
             ),
             "unknown",
         )
+
+    def test_workbuddy_skill_chip_accepts_only_its_exact_declared_json_transport(self) -> None:
+        prompt = (
+            '@//item-summary/{"input":".selc/installs/item-summary-fixture/current/'
+            'resources/items.json","mode":"controlled-fail"}'
+        )
+        expected_digest = "9b00af373f37613b4b88d986d280d44f9425f9dcd053f7ebd54228ba1cf89722"
+        self.assertEqual(hashlib.sha256(prompt.encode("utf-8")).hexdigest(), expected_digest)
+        expected_request = {
+            "skill": "item-summary",
+            "input": {
+                "input": ".selc/installs/item-summary-fixture/current/resources/items.json",
+                "mode": "controlled-fail",
+            },
+            "raw_prompt_digest": expected_digest,
+        }
+        for version in ("5.8.3", "5.9.2"):
+            request = _managed_prompt_request(
+                "workbuddy",
+                {"version": version, "prompt": prompt},
+                declared_skills=frozenset({"item-summary"}),
+            )
+            self.assertEqual(request, expected_request)
+
+        correction_prompt = (
+            '@//item-summary/{"input":"resources/items.json","selc":'
+            '{"intent":"correct_delivery","target":"reports/item.json","preserve_goal":true}}'
+        )
+        correction = _managed_prompt_request(
+            "workbuddy",
+            {"version": "5.8.3", "prompt": correction_prompt},
+            declared_skills=frozenset({"item-summary"}),
+        )
+        self.assertEqual(correction["input"], {"input": "resources/items.json"})
+        self.assertEqual(
+            correction["correction"],
+            {
+                "intent": "correct_delivery",
+                "target": "reports/item.json",
+                "preserve_goal": True,
+                "valid": True,
+            },
+        )
+
+        ordinary_codex = _managed_prompt_request(
+            "codex",
+            {
+                "version": "0.163.0-alpha.10.2",
+                "prompt": '@item-summary {"input":"resources/items.json"}',
+            },
+            declared_skills=frozenset({"item-summary"}),
+        )
+        self.assertEqual(ordinary_codex["input"], {"input": "resources/items.json"})
+        self.assertNotIn("correction", ordinary_codex)
+
+        for host, payload in (
+            (
+                "codex",
+                {
+                    "version": "0.163.0-alpha.10.2",
+                    "prompt": "@item-summary ",
+                },
+            ),
+            (
+                "workbuddy",
+                {
+                    "version": "5.8.3",
+                    "prompt": "@//item-summary/",
+                },
+            ),
+        ):
+            for invalid_control in (None, False, [], "correct_delivery"):
+                input_value = {
+                    "input": "resources/items.json",
+                    "selc": invalid_control,
+                }
+                parsed = _managed_prompt_request(
+                    host,
+                    {
+                        **payload,
+                        "prompt": str(payload["prompt"])
+                        + json.dumps(input_value, separators=(",", ":")),
+                    },
+                    declared_skills=frozenset({"item-summary"}),
+                )
+                self.assertEqual(parsed["input"], {"input": "resources/items.json"})
+                self.assertEqual(parsed["correction"], {"valid": False})
+
+        invalid_prompts = (
+            '@//unknown/{"input":"resources/items.json"}',
+            '@//item-summary {"input":"resources/items.json"}',
+            '@//item-summary/["not-an-object"]',
+            '@//item-summary/{"input":"resources/items.json"} trailing',
+            '@//item-summary/%7B"input":"resources/items.json"%7D',
+        )
+        for invalid in invalid_prompts:
+            self.assertEqual(
+                _managed_prompt_request(
+                    "workbuddy",
+                    {"version": "5.8.3", "prompt": invalid},
+                    declared_skills=frozenset({"item-summary"}),
+                )["input"],
+                {"classification": "unknown"},
+            )
+        invalid_workbuddy_versions: tuple[object, ...] = (
+            "5.8.2",
+            "5.9.1",
+            "5.9.3",
+            "",
+            None,
+            592,
+        )
+        invalid_host_versions = [("codex", "0.163.0-alpha.10.2")]
+        invalid_host_versions.extend(
+            ("workbuddy", version) for version in invalid_workbuddy_versions
+        )
+        for host, version in invalid_host_versions:
+            self.assertEqual(
+                _managed_prompt_request(
+                    host,
+                    {"version": version, "prompt": prompt},
+                    declared_skills=frozenset({"item-summary"}),
+                )["input"],
+                {"classification": "unknown"},
+            )
+
+    def test_invalid_structured_correction_never_issues_a_receipt(self) -> None:
+        for index, invalid_control in enumerate((None, False, [], "correct_delivery")):
+            request_id = f"invalid-correction-request-{index}"
+            generation_id = f"invalid-correction-generation-{index}"
+            request = _managed_prompt_request(
+                "codex",
+                {
+                    "version": "0.163.0-alpha.10.2",
+                    "prompt": "@text-report "
+                    + json.dumps(
+                        {"input": str(self.input_path), "selc": invalid_control},
+                        separators=(",", ":"),
+                    ),
+                },
+                declared_skills=frozenset({"text-report"}),
+            )
+            prompt = self._payload(
+                "activate",
+                f"invalid-correction-prompt-{index}",
+                phase="UserPromptSubmit",
+            )
+            prompt.update(
+                {
+                    "generation_id": generation_id,
+                    "request_id": request_id,
+                    "request": request,
+                }
+            )
+            prompt_observed = managed_runtime.observe_request_boundary(
+                project_root=self.project,
+                suite_id="managed-reports",
+                payload=prompt,
+                fixture=True,
+            )
+            self.assertEqual(prompt_observed["status"], "prompt_recorded")
+
+            pre = self._payload("activate", f"invalid-correction-pre-{index}")
+            pre.update(
+                {
+                    "generation_id": generation_id,
+                    "request_id": request_id,
+                    "request": request,
+                }
+            )
+            observed = managed_runtime.observe_request_boundary(
+                project_root=self.project,
+                suite_id="managed-reports",
+                payload=pre,
+                fixture=True,
+            )
+            self.assertEqual(observed["status"], "recorded_unusable")
+            self.assertNotIn("receipt", observed)
+
+        database = open_database(self.project)
+        try:
+            self.assertEqual(database.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+            self.assertEqual(
+                database.execute("SELECT COUNT(*) FROM managed_receipts").fetchone()[0], 0
+            )
+        finally:
+            database.close()
 
     def test_caller_claimed_native_payload_never_starts_a_managed_task(self) -> None:
         payload = self._payload("activate", "forged-tool")
@@ -3731,16 +6307,21 @@ class ManagedRuntimeTests(unittest.TestCase):
             )
         self.assertEqual(captured.exception.code, "RECEIPT_ARGUMENT_MISMATCH")
 
-    def test_raw_native_event_survives_a_receipt_projection_failure_and_replay(self) -> None:
-        payload = self._payload("activate", "tool-raw-first")
+    def test_pending_native_projection_recovers_prompt_and_stop_on_replay(self) -> None:
+        """A committed raw callback retries only its missing projection."""
+
+        prompt = self._payload("activate", "", phase="UserPromptSubmit")
         with (
-            mock.patch("selc.managed_runtime._issue_receipt", side_effect=RuntimeError("receipt")),
+            mock.patch(
+                "selc.managed_runtime._record_prompt_context",
+                side_effect=RuntimeError("prompt projection"),
+            ),
             self.assertRaises(RuntimeError),
         ):
             managed_runtime.observe_request_boundary(
                 project_root=self.project,
                 suite_id="managed-reports",
-                payload=payload,
+                payload=prompt,
                 fixture=True,
             )
         database = open_database(self.project)
@@ -3749,18 +6330,133 @@ class ManagedRuntimeTests(unittest.TestCase):
                 database.execute("SELECT COUNT(*) FROM managed_native_events").fetchone()[0], 1
             )
             self.assertEqual(
-                database.execute("SELECT COUNT(*) FROM managed_receipts").fetchone()[0], 0
+                database.execute("SELECT COUNT(*) FROM managed_contexts").fetchone()[0], 0
+            )
+            self.assertEqual(
+                database.execute("SELECT projection_status FROM managed_native_events").fetchone()[
+                    0
+                ],
+                "pending",
             )
         finally:
             database.close()
-        replayed = managed_runtime.observe_request_boundary(
+        recovered_prompt = managed_runtime.observe_request_boundary(
             project_root=self.project,
             suite_id="managed-reports",
-            payload=payload,
+            payload=prompt,
             fixture=True,
         )
-        self.assertEqual(replayed["status"], "recorded")
-        self.assertTrue(replayed["receipt"])
+        self.assertEqual(recovered_prompt["status"], "prompt_recorded")
+
+        stop = self._stop("tool-pending-stop")
+        self.assertEqual(stop["status"], "stop_recorded")
+        database = open_database(self.project)
+        try:
+            self.assertEqual(
+                database.execute("SELECT COUNT(*) FROM managed_native_events").fetchone()[0], 2
+            )
+        finally:
+            database.close()
+
+    def test_pending_stop_projection_recovers_without_reclassifying_the_callback(self) -> None:
+        """A Stop replay completes its durable closure after a projection fault."""
+
+        self._observe("activate", "tool-pending-stop")
+        stop = self._payload("publish", "tool-pending-stop", phase="Stop")
+        stop.pop("tool_name")
+        stop.pop("tool_input")
+        stop["request"] = {"source": "user-prompt"}
+        with (
+            mock.patch(
+                "selc.managed_runtime._close_pending_windows_on_stop",
+                side_effect=RuntimeError("stop projection"),
+            ),
+            self.assertRaises(RuntimeError),
+        ):
+            managed_runtime.observe_request_boundary(
+                project_root=self.project,
+                suite_id="managed-reports",
+                payload=stop,
+                fixture=True,
+            )
+        database = open_database(self.project)
+        try:
+            self.assertEqual(
+                database.execute(
+                    "SELECT projection_status FROM managed_native_events WHERE phase = 'Stop'"
+                ).fetchone()[0],
+                "pending",
+            )
+        finally:
+            database.close()
+
+        recovered_stop = managed_runtime.observe_request_boundary(
+            project_root=self.project,
+            suite_id="managed-reports",
+            payload=stop,
+            fixture=True,
+        )
+        self.assertEqual(recovered_stop["status"], "stop_recorded")
+
+        replayed_stop = managed_runtime.observe_request_boundary(
+            project_root=self.project,
+            suite_id="managed-reports",
+            payload=stop,
+            fixture=True,
+        )
+        self.assertEqual(replayed_stop["status"], "replayed")
+
+    def test_post_before_pre_and_stopped_receipt_cannot_start_business_work(self) -> None:
+        """Late callbacks cannot issue or consume a receipt after native termination."""
+
+        self._observe("activate", "tool-post-before-pre", phase="PostToolUse")
+        late_pre = managed_runtime.observe_request_boundary(
+            project_root=self.project,
+            suite_id="managed-reports",
+            payload=self._payload("activate", "tool-post-before-pre"),
+            fixture=True,
+        )
+        self.assertEqual(late_pre["status"], "recorded_unusable")
+        self.assertNotIn("receipt", late_pre)
+
+        stopped_pre = self._payload("activate", "tool-stopped-receipt")
+        stopped_pre["generation_id"] = "generation-stopped-receipt"
+        stopped_pre["request_id"] = "request-stopped-receipt"
+        stopped_observed = managed_runtime.observe_request_boundary(
+            project_root=self.project,
+            suite_id="managed-reports",
+            payload=stopped_pre,
+            fixture=True,
+        )
+        receipt = str(stopped_observed["receipt"])
+        stopped_event = dict(stopped_pre)
+        stopped_event["phase"] = "Stop"
+        stopped_event.pop("tool_name")
+        stopped_event.pop("tool_input")
+        stopped_event["request"] = {"source": "user-prompt"}
+        self.assertEqual(
+            managed_runtime.observe_request_boundary(
+                project_root=self.project,
+                suite_id="managed-reports",
+                payload=stopped_event,
+                fixture=True,
+            )["status"],
+            "stop_recorded",
+        )
+        with self.assertRaises(SelcError) as captured:
+            managed_runtime.activate(
+                project_root=self.project,
+                suite_id="managed-reports",
+                skill="text-report",
+                receipt=receipt,
+            )
+        self.assertEqual(captured.exception.code, "RECEIPT_INVALID")
+
+        database = open_database(self.project)
+        try:
+            self.assertEqual(database.execute("SELECT COUNT(*) FROM tasks").fetchone()[0], 0)
+        finally:
+            database.close()
 
     def test_unverified_native_version_pre_without_a_prompt_anchor_is_unusable(self) -> None:
         payload = self._payload("activate", "tool-no-root")
@@ -3924,7 +6620,8 @@ class ManagedRuntimeTests(unittest.TestCase):
             )
         self.assertEqual(captured.exception.code, "NATIVE_CONTEXT_UNAVAILABLE")
 
-    def test_workbuddy_hook_uses_payload_identity_without_hook_environment(self) -> None:
+    def test_workbuddy_skill_chip_hook_uses_payload_identity_without_hook_environment(self) -> None:
+        prompt = '@//text-report/{"objective":"summarize"}'
         payload = {
             "hook_event_name": "UserPromptSubmit",
             "client": "WorkBuddy",
@@ -3935,7 +6632,7 @@ class ManagedRuntimeTests(unittest.TestCase):
             "conversation_request_id": "wb-request",
             "conversation_message_id": "wb-message",
             "root_request_id": "wb-root",
-            "prompt": '{"objective":"summarize"}',
+            "prompt": prompt,
             "transcript_path": str(self.transcript),
         }
         result = receive_native_hook(
@@ -3959,6 +6656,11 @@ class ManagedRuntimeTests(unittest.TestCase):
             ("wb-session", "wb-generation", "wb-request", "wb-root"),
         )
         self.assertIn('"message_id":"wb-message"', event["payload_json"])
+        stored = json.loads(event["payload_json"])
+        self.assertEqual(
+            stored["raw_request_digest"],
+            hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        )
 
     def test_native_hook_rejects_a_codex_pre_without_a_persisted_prompt_anchor(self) -> None:
         manifest_path = self.suite / "suite.json"
@@ -4363,7 +7065,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                 payload=prompt,
                 environment=environment,
             )
-        self.assertEqual(replayed_prompt["status"], "prompt_recorded")
+        self.assertEqual(replayed_prompt["status"], "replayed")
 
         database = open_database(self.project)
         try:
@@ -4371,12 +7073,11 @@ class ManagedRuntimeTests(unittest.TestCase):
                 "SELECT root_valid, request_digest, input_skill, unknown_change "
                 "FROM managed_contexts"
             ).fetchone()
+            trigger_kind = database.execute("SELECT trigger_kind FROM calls").fetchone()[0]
         finally:
             database.close()
-        self.assertEqual(
-            tuple(replayed_context),
-            (1, "", "text-report", 0),
-        )
+        self.assertEqual(tuple(replayed_context), (1, "", "", 0))
+        self.assertEqual(trigger_kind, "unknown")
 
         conflicting_prompt = dict(prompt)
         conflicting_prompt["prompt"] = '@text-report {"input":"changed"}'
@@ -4405,7 +7106,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         self.assertNotIn("fixture", serialized)
         self.assertEqual(
             (context["root_valid"], context["input_skill"], context["unknown_change"]),
-            (1, "text-report", 1),
+            (1, "", 1),
         )
 
     def test_native_tool_without_a_prompt_boundary_fails_closed(self) -> None:
@@ -4862,7 +7563,13 @@ class ManagedRuntimeTests(unittest.TestCase):
         manifest["skills"][0]["artifact_check"] = "json-summary"
         manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
         seal_suite(suite)
-        install_suite(source=suite, project_root=project, harness="codex", ref=None)
+        install_suite(
+            source=suite,
+            project_root=project,
+            harness="codex",
+            ref=None,
+            mode="observed",
+        )
 
         input_path = self.root / "items.json"
         input_path.write_text(
@@ -5008,53 +7715,210 @@ class ManagedRuntimeTests(unittest.TestCase):
         finally:
             database.close()
 
-    def test_protocol_two_writer_cannot_mutate_managed_protocol_three_tables(self) -> None:
+    def test_business_dto_goal_digest_strips_only_top_level_selc(self) -> None:
+        business = {
+            "objective": "summarize the current inventory",
+            "nested": {"selc": "ordinary business data"},
+        }
+        corrected = {
+            **business,
+            "selc": {
+                "intent": "correct_delivery",
+                "target": "reports/inventory.md",
+                "preserve_goal": True,
+            },
+        }
+
+        original_digest = managed_runtime._business_dto_goal_digest(business)
+        corrected_digest = managed_runtime._business_dto_goal_digest(corrected)
+
+        self.assertIsNotNone(original_digest)
+        self.assertEqual(original_digest, corrected_digest)
+        self.assertIsNone(managed_runtime._business_dto_goal_digest({"classification": "unknown"}))
+        self.assertIsNone(managed_runtime._business_dto_goal_digest({"selc": None}))
+
+        request = {"skill": "", "input": business}
+        self.assertEqual(
+            managed_runtime._business_dto_goal_digest_from_request(request), original_digest
+        )
+        valid_request = {
+            **request,
+            "correction": {
+                "intent": "correct_delivery",
+                "target": "reports/inventory.md",
+                "preserve_goal": True,
+                "valid": True,
+            },
+        }
+        self.assertEqual(
+            managed_runtime._business_dto_goal_digest_from_request(valid_request), original_digest
+        )
+        invalid_controls: list[object] = [
+            None,
+            False,
+            "correct_delivery",
+            [],
+            {"valid": True},
+            {"classification": "unknown"},
+        ]
+        for invalid_control in invalid_controls:
+            with self.subTest(invalid_control=invalid_control):
+                self.assertIsNone(
+                    managed_runtime._business_dto_goal_digest_from_request(
+                        {**request, "correction": invalid_control}
+                    )
+                )
+
+    def test_automatic_selection_rejects_a_later_different_actual_skill(self) -> None:
         database = open_database(self.project)
-        database.close()
-        legacy = sqlite3.connect(self.project / ".selc" / "records.sqlite3")
-        legacy.create_function("selc_writer_protocol", 0, lambda: 2)
-        with self.assertRaises(sqlite3.DatabaseError):
-            legacy.execute(
-                "INSERT INTO managed_native_events("
-                "event_id, stable_identity, payload_digest, payload_json, host, suite_id, "
-                "session_id, generation_id, tool_use_id, phase, received_at, status) "
-                "VALUES ('legacy', 'legacy', 'x', '{}', 'codex', 'managed-reports', "
-                "'s', 'g', 't', 'PreToolUse', '2026-01-01T00:00:00Z', 'recorded')"
+        try:
+            context = {
+                "input_skill": "",
+                "business_dto_digest": managed_runtime._business_dto_goal_digest(
+                    {"objective": "summarize current inventory"}
+                ),
+                "business_dto_rule_version": "business-dto-v1",
+                "selected_skill": "text-report",
+            }
+            event = {"skill": "other-report", "host": "workbuddy", "action": "activate"}
+            self.assertFalse(
+                managed_runtime._context_accepts_receipt_skill(database, context, event)
             )
-        legacy.close()
+        finally:
+            database.close()
 
-    def test_real_protocol_two_database_migrates_feedback_before_protocol_three_guards(
-        self,
-    ) -> None:
-        legacy_source = self.root / "legacy-source"
-        archive = subprocess.run(
-            ["git", "archive", "d17d7bd", "src/selc"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            check=True,
-        ).stdout
-        with tarfile.open(fileobj=io.BytesIO(archive)) as extracted:
-            extracted.extractall(legacy_source)
-        old_project = self.root / "old-project"
-        initializer = """
+    def _create_protocol_five_database(self, name: str) -> Path:
+        """Create a records database with the frozen c20 protocol-5 writer."""
+
+        metadata = json.loads(PROTOCOL_FIVE_RUNTIME_METADATA.read_text(encoding="utf-8"))
+        self.assertEqual(metadata["writer_protocol_version"], 5)
+        self.assertEqual(
+            hashlib.sha256(PROTOCOL_FIVE_RUNTIME_ARCHIVE.read_bytes()).hexdigest(),
+            metadata["archive_sha256"],
+        )
+        with zipfile.ZipFile(PROTOCOL_FIVE_RUNTIME_ARCHIVE) as archive:
+            archived_names = sorted(archive.namelist())
+        self.assertEqual(archived_names, sorted(metadata["files"]))
+        self.assertEqual(
+            metadata["files"]["selc/records.py"],
+            "e4ea95c6a1bdb3eee2b341403dbb913d2bd8b9fd1621c6c7550dd3c71d5de860",
+        )
+
+        project = self.root / name
+        initializer = '''
+import hashlib
+import json
+import sys
 from pathlib import Path
-from selc.records import open_database
 
-database = open_database(Path(__import__('sys').argv[1]))
-database.execute("INSERT INTO tasks(task_id, suite_id, suite_version, harness, initiator, evidence, is_test, status, created_at, owner_origin) VALUES ('task', 'suite', '1', 'codex', 'user', 'old', 0, 'closed', '2026-01-01T00:00:00Z', 'origin')")
-database.execute("INSERT INTO deliveries(delivery_id, task_id, artifact_hash, rule_version, declared_result, effective_result, complete_fixture, sequence, created_at) VALUES ('delivery', 'task', 'hash', 'rule', 'pass', 'pass', 1, 1, '2026-01-01T00:00:00Z')")
-database.execute("INSERT INTO feedback(feedback_id, task_id, delivery_id, revision, scope, result, created_at) VALUES ('feedback', 'task', 'delivery', 1, 'final', 'fail', '2026-01-01T00:00:00Z')")
+from selc import managed_runtime
+from selc.records import WRITER_PROTOCOL_VERSION, open_database
+
+assert WRITER_PROTOCOL_VERSION == 5
+project = Path(sys.argv[1])
+project.mkdir(parents=True, exist_ok=True)
+database = open_database(project)
+database.execute(
+    """INSERT INTO tasks(
+    task_id, suite_id, suite_version, harness, initiator, evidence, is_test, status,
+    created_at, owner_origin, assessment_owner)
+    VALUES ('task-old', 'managed-reports', '1.0.0', 'workbuddy', 'unknown', 'native', 0,
+    'closed', '2026-10-25T00:00:00Z', 'origin-old', 'legacy')"""
+)
+database.execute(
+    """INSERT INTO calls(
+    call_id, task_id, skill, executor, actual_harness, evidence, expected_version,
+    expected_hash, trigger_kind, status, created_at, assessment_owner)
+    VALUES ('call-old', 'task-old', 'text-report', 'workbuddy', 'workbuddy', 'native',
+    '1.0.0', 'install-old', 'explicit', 'closed', '2026-10-25T00:00:00Z', 'legacy')"""
+)
+history = project / "legacy-history.jsonl"
+history.write_bytes(b"{}" + bytes([10]))
+
+
+def store_old_prompt(event_id, request_id, status, skill):
+    raw_prompt_digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+    payload = {
+        "host": "workbuddy",
+        "surface": "WorkBuddy",
+        "client_version": "5.8.3",
+        "cwd": str(project),
+        "session_id": "session-old",
+        "generation_id": "generation-old",
+        "request_id": request_id,
+        "phase": "UserPromptSubmit",
+        "request": {
+            **({"skill": skill} if skill else {}),
+            "input": {"objective": "legacy " + request_id},
+            "raw_prompt_digest": raw_prompt_digest,
+        },
+        "transcript_path": str(history),
+        "prefix_length": history.stat().st_size,
+    }
+    event = managed_runtime._normalize_native_payload(
+        project,
+        "managed-reports",
+        payload,
+        trusted_producer=False,
+        fixture=True,
+    )
+    event["event_id"] = event_id
+    stored = managed_runtime._store_native_event(database, event)
+    assert stored["status"] == "recorded"
+    database.execute(
+        """UPDATE managed_native_events
+        SET status = ?, projection_status = 'applied' WHERE event_id = ?""",
+        (status, event_id),
+    )
+
+
+store_old_prompt("event-applied", "request-old", "applied", "text-report")
+store_old_prompt("event-invalid", "request-invalid", "invalid", "text-report")
+store_old_prompt("event-terminated", "request-terminated", "terminated", "text-report")
+store_old_prompt("event-backfilled", "request-backfilled", "recorded", "")
+
+database.execute(
+    """INSERT INTO managed_contexts(
+    context_key, suite_id, host, session_id, generation_id, request_id, root_request_id,
+    request_digest, input_skill, root_event_id, root_valid, task_id, status, created_at)
+    VALUES ('context-old', 'managed-reports', 'workbuddy', 'session-old', 'generation-old',
+    'request-old', '', 'request-old-digest', 'text-report', 'event-applied', 1,
+    'task-old', 'closed', '2026-10-25T00:00:00Z')"""
+)
+database.execute(
+    """INSERT INTO managed_contexts(
+    context_key, suite_id, host, session_id, generation_id, request_id, root_request_id,
+    request_digest, input_skill, root_event_id, root_valid, status, created_at)
+    VALUES ('context-backfilled', 'managed-reports', 'workbuddy', 'session-old', 'generation-old',
+    'request-backfilled', '', 'request-backfilled-digest', 'text-report',
+    'event-backfilled', 1, 'active', '2026-10-25T00:00:00Z')"""
+)
 database.commit()
 database.close()
-"""
+'''
         completed = subprocess.run(
-            [sys.executable, "-c", initializer, str(old_project)],
-            env={**os.environ, "PYTHONPATH": str(legacy_source / "src")},
+            [sys.executable, "-c", initializer, str(project)],
+            env={**os.environ, "PYTHONPATH": str(PROTOCOL_FIVE_RUNTIME_ARCHIVE)},
             capture_output=True,
             check=False,
             text=True,
         )
         self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        return project
+
+    def test_protocol_five_database_migrates_without_reclassifying_old_facts(self) -> None:
+        old_project = self._create_protocol_five_database("protocol-five-project")
+        old_path = old_project / ".selc" / "records.sqlite3"
+        stale_writer = sqlite3.connect(old_path)
+        stale_writer.create_function("selc_writer_protocol", 0, lambda: 5)
+        legacy_events = (
+            sqlite3.connect(old_path)
+            .execute(
+                """SELECT event_id, payload_digest, payload_json, status, projection_status
+            FROM managed_native_events ORDER BY event_id"""
+            )
+            .fetchall()
+        )
 
         database = open_database(old_project)
         try:
@@ -5062,57 +7926,231 @@ database.close()
                 database.execute("SELECT value FROM meta WHERE key = 'writer_protocol'").fetchone()[
                     0
                 ],
-                "3",
+                "6",
             )
+            migrated_events = [
+                tuple(row)
+                for row in database.execute(
+                    """SELECT event_id, payload_digest, payload_json, status, projection_status
+                    FROM managed_native_events ORDER BY event_id"""
+                ).fetchall()
+            ]
+            context = database.execute(
+                """SELECT business_dto_digest, business_dto_rule_version, selected_skill
+                FROM managed_contexts WHERE context_key = 'context-old'"""
+            ).fetchone()
+            call_trigger = database.execute(
+                "SELECT trigger_kind FROM calls WHERE call_id = 'call-old'"
+            ).fetchone()[0]
+            receipt_count = database.execute("SELECT COUNT(*) FROM managed_receipts").fetchone()[0]
+            backfilled_context = database.execute(
+                "SELECT * FROM managed_contexts WHERE context_key = 'context-backfilled'"
+            ).fetchone()
+            self.assertIsNotNone(backfilled_context)
             self.assertEqual(
-                database.execute(
-                    "SELECT result FROM feedback_revisions WHERE feedback_id = 'feedback'"
-                ).fetchone()[0],
-                "fail",
+                managed_runtime._confirm_context_selection(
+                    database, backfilled_context, "text-report"
+                ),
+                "unknown",
             )
+            database.commit()
         finally:
             database.close()
+        self.assertEqual(migrated_events, legacy_events)
+        self.assertEqual(tuple(context), (None, None, None))
+        self.assertEqual(call_trigger, "explicit")
+        self.assertEqual(receipt_count, 0)
 
-    def test_failed_protocol_three_migration_rolls_back_to_protocol_two_guards(self) -> None:
-        legacy_source = self.root / "legacy-source"
-        archive = subprocess.run(
-            ["git", "archive", "d17d7bd", "src/selc"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            check=True,
-        ).stdout
-        with tarfile.open(fileobj=io.BytesIO(archive)) as extracted:
-            extracted.extractall(legacy_source)
-        old_project = self.root / "old-project"
-        initializer = "from pathlib import Path; from selc.records import open_database; open_database(Path(__import__('sys').argv[1])).close()"
+        reopen_old_writer = """
+import sys
+from pathlib import Path
+from selc.errors import SelcError
+from selc.records import open_database
+
+try:
+    open_database(Path(sys.argv[1]))
+except SelcError as error:
+    print(error.code)
+    raise SystemExit(7)
+raise SystemExit(0)
+"""
         completed = subprocess.run(
-            [sys.executable, "-c", initializer, str(old_project)],
-            env={**os.environ, "PYTHONPATH": str(legacy_source / "src")},
+            [sys.executable, "-c", reopen_old_writer, str(old_project)],
+            env={**os.environ, "PYTHONPATH": str(PROTOCOL_FIVE_RUNTIME_ARCHIVE)},
             capture_output=True,
             check=False,
             text=True,
         )
-        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+        self.assertEqual(completed.returncode, 7, completed.stdout + completed.stderr)
+        self.assertEqual(completed.stdout.strip(), "UNSUPPORTED_DATABASE_PROTOCOL")
+
+        insert = """INSERT INTO managed_native_events(
+        event_id, stable_identity, payload_digest, payload_json, host, suite_id,
+        session_id, generation_id, request_id, tool_use_id, phase, received_at,
+        status, projection_status)
+        VALUES ('event-stale', 'stable-stale', 'stale-digest', '{}', 'workbuddy',
+        'suite-old', 'session-old', 'generation-old', 'request-old', 'tool-stale',
+        'PreToolUse', '2026-10-25T00:00:00Z', 'recorded', 'pending')"""
+        with self.assertRaisesRegex(sqlite3.DatabaseError, "SELC_WRITER_PROTOCOL_REQUIRED"):
+            stale_writer.execute(insert)
+        stale_writer.rollback()
+        with self.assertRaisesRegex(sqlite3.DatabaseError, "SELC_WRITER_PROTOCOL_REQUIRED"):
+            stale_writer.execute(
+                "UPDATE managed_native_events SET status = 'recorded' WHERE event_id = 'event-invalid'"
+            )
+        stale_writer.close()
+
+    def test_protocol_five_replays_keep_legacy_native_facts_unclassified(self) -> None:
+        """Current callbacks replay frozen protocol-5 rows without adding goal evidence."""
+
+        old_project = self._create_protocol_five_database("protocol-five-replay")
+        database = open_database(old_project)
+        database.close()
+        install_suite(
+            source=self.suite,
+            project_root=old_project,
+            harness="workbuddy",
+            ref=None,
+            mode="observed",
+        )
+        history = old_project / "legacy-history.jsonl"
+
+        def legacy_callback(request_id: str) -> dict[str, object]:
+            raw_prompt_digest = hashlib.sha256(request_id.encode("utf-8")).hexdigest()
+            return {
+                "host": "workbuddy",
+                "surface": "WorkBuddy",
+                "client_version": "5.8.3",
+                "cwd": str(old_project),
+                "session_id": "session-old",
+                "generation_id": "generation-old",
+                "request_id": request_id,
+                "phase": "UserPromptSubmit",
+                "request": {
+                    "skill": "text-report",
+                    "input": {"objective": "legacy " + request_id},
+                    "raw_prompt_digest": raw_prompt_digest,
+                },
+                "transcript_path": str(history),
+                "prefix_length": history.stat().st_size,
+            }
+
+        database = open_database(old_project)
+        try:
+            before_events = [
+                tuple(row)
+                for row in database.execute(
+                    """SELECT event_id, payload_digest, payload_json, status, projection_status
+                    FROM managed_native_events
+                    WHERE event_id IN ('event-applied', 'event-invalid', 'event-terminated')
+                    ORDER BY event_id"""
+                ).fetchall()
+            ]
+            before_context = database.execute(
+                """SELECT business_dto_digest, business_dto_rule_version, selected_skill
+                FROM managed_contexts WHERE context_key = 'context-old'"""
+            ).fetchone()
+            before_counts = tuple(
+                database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("managed_request_anchors", "managed_receipts", "calls")
+            )
+        finally:
+            database.close()
+
+        for request_id in ("request-old", "request-invalid", "request-terminated"):
+            replayed = managed_runtime.observe_request_boundary(
+                project_root=old_project,
+                suite_id="managed-reports",
+                payload=legacy_callback(request_id),
+                fixture=True,
+            )
+            self.assertEqual(replayed, {"status": "replayed"})
+
+        history.write_bytes(history.read_bytes() + b'{"late":true}' + bytes([10]))
+        self.assertEqual(
+            managed_runtime.observe_request_boundary(
+                project_root=old_project,
+                suite_id="managed-reports",
+                payload=legacy_callback("request-old"),
+                fixture=True,
+            ),
+            {"status": "replayed"},
+        )
+
+        database = open_database(old_project)
+        try:
+            after_events = [
+                tuple(row)
+                for row in database.execute(
+                    """SELECT event_id, payload_digest, payload_json, status, projection_status
+                    FROM managed_native_events
+                    WHERE event_id IN ('event-applied', 'event-invalid', 'event-terminated')
+                    ORDER BY event_id"""
+                ).fetchall()
+            ]
+            after_context = database.execute(
+                """SELECT business_dto_digest, business_dto_rule_version, selected_skill
+                FROM managed_contexts WHERE context_key = 'context-old'"""
+            ).fetchone()
+            after_counts = tuple(
+                database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("managed_request_anchors", "managed_receipts", "calls")
+            )
+        finally:
+            database.close()
+
+        self.assertEqual(after_events, before_events)
+        self.assertEqual(tuple(after_context), (None, None, None))
+        self.assertEqual(tuple(after_context), tuple(before_context))
+        self.assertEqual(after_counts, before_counts)
+
+    def test_failed_protocol_six_migration_rolls_back_to_protocol_five_guards(self) -> None:
+        old_project = self._create_protocol_five_database("protocol-five-rollback")
+        old_path = old_project / ".selc" / "records.sqlite3"
+        before = (
+            sqlite3.connect(old_path)
+            .execute(
+                "SELECT event_id, payload_digest, payload_json, status FROM managed_native_events ORDER BY event_id"
+            )
+            .fetchall()
+        )
         with (
             mock.patch(
                 "selc.records._create_managed_runtime_tables", side_effect=RuntimeError("stop")
             ),
-            self.assertRaises(RuntimeError),
+            self.assertRaisesRegex(RuntimeError, "stop"),
         ):
             open_database(old_project)
-        legacy = sqlite3.connect(old_project / ".selc" / "records.sqlite3")
+        legacy = sqlite3.connect(old_path)
         try:
-            legacy.create_function("selc_writer_protocol", 0, lambda: 2)
             protocol = legacy.execute(
                 "SELECT value FROM meta WHERE key = 'writer_protocol'"
             ).fetchone()[0]
-            trigger = legacy.execute(
-                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'writer_protocol_feedback_insert'"
-            ).fetchone()[0]
+            triggers = legacy.execute(
+                """SELECT sql FROM sqlite_master
+                WHERE type = 'trigger' AND name GLOB 'writer_protocol_managed_*'"""
+            ).fetchall()
+            after = legacy.execute(
+                """SELECT event_id, payload_digest, payload_json, status
+                FROM managed_native_events ORDER BY event_id"""
+            ).fetchall()
         finally:
             legacy.close()
-        self.assertEqual(protocol, "2")
-        self.assertIn("!= 2", trigger)
+        self.assertEqual(protocol, "5")
+        self.assertTrue(triggers)
+        self.assertTrue(all("!= 5" in row[0] for row in triggers))
+        self.assertEqual(after, before)
+
+        reopened = open_database(old_project)
+        try:
+            self.assertEqual(
+                reopened.execute("SELECT value FROM meta WHERE key = 'writer_protocol'").fetchone()[
+                    0
+                ],
+                "6",
+            )
+        finally:
+            reopened.close()
 
     def test_installed_wrapper_rejects_manual_receipts_for_normal_operations(self) -> None:
         request_path = self.root / "request.json"

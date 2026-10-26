@@ -27,6 +27,7 @@ NAME = re.compile(r"^[a-z][a-z0-9-]{1,62}$")
 FRONTMATTER_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 RUNTIME_PROTOCOL = 1
 SOURCE_BASELINE_NAME = "source-baseline.json"
+RUNTIME_LICENSE_NAME = "SELC-LICENSE"
 ASCII_SPACE = " "
 MAX_ARTIFACT_CHECKS = 64
 MAX_ARTIFACT_CHECK_CONFIGURATION_BYTES = 16_384
@@ -320,7 +321,9 @@ def managed_configuration(manifest: dict[str, Any], suite_root: Path) -> dict[st
             "managed actions must be a non-empty object",
             "declare one fixed managed action",
         )
-    declared_skills = {str(skill["name"]) for skill in manifest["skills"] if isinstance(skill, dict)}
+    declared_skills = {
+        str(skill["name"]) for skill in manifest["skills"] if isinstance(skill, dict)
+    }
     normalized: dict[str, dict[str, Any]] = {}
     for action_id, raw_action in actions.items():
         if not isinstance(action_id, str) or not NAME.fullmatch(action_id):
@@ -429,15 +432,10 @@ def managed_host_versions(manifest: dict[str, Any]) -> dict[str, frozenset[str]]
                 f"managed native host {host} needs one or more versions",
                 "declare a bounded version allowlist",
             )
-        if (
-            any(
-                not isinstance(version, str)
-                or not version
-                or len(version.encode("utf-8")) > 128
-                for version in versions
-            )
-            or len(set(versions)) != len(versions)
-        ):
+        if any(
+            not isinstance(version, str) or not version or len(version.encode("utf-8")) > 128
+            for version in versions
+        ) or len(set(versions)) != len(versions):
             raise SelcError(
                 "INVALID_MANAGED_HOST",
                 f"managed native host {host} has invalid versions",
@@ -461,11 +459,7 @@ def _normalize_managed_input_schema(
         )
     fields = value.get("fields")
     required = value.get("required")
-    if (
-        not isinstance(fields, dict)
-        or (not fields and not allow_empty)
-        or len(fields) > 16
-    ):
+    if not isinstance(fields, dict) or (not fields and not allow_empty) or len(fields) > 16:
         raise SelcError(
             "INVALID_MANAGED_ACTION",
             f"managed action {action_id} input fields are invalid",
@@ -505,13 +499,12 @@ def _normalize_managed_input_schema(
                 "use a protocol-1 scalar or path type",
             )
         enum = descriptor.get("enum")
-        if enum is not None:
-            if not isinstance(enum, list) or not enum or len(enum) > 64:
-                raise SelcError(
-                    "INVALID_MANAGED_ACTION",
-                    f"managed action {action_id} field {name} enum is invalid",
-                    "use a non-empty bounded enum",
-                )
+        if enum is not None and (not isinstance(enum, list) or not enum or len(enum) > 64):
+            raise SelcError(
+                "INVALID_MANAGED_ACTION",
+                f"managed action {action_id} field {name} enum is invalid",
+                "use a non-empty bounded enum",
+            )
         normalized_fields[name] = {"type": field_type, **({"enum": list(enum)} if enum else {})}
     return {"fields": normalized_fields, "required": list(required)}
 
@@ -722,7 +715,24 @@ def normalize_declared_skills(skills: list[Any]) -> list[dict[str, str]]:
                 "repair the declared skill path",
             )
         relative = require_relative_path(relative_value)
-        normalized.append({"name": name, "path": relative.as_posix()})
+        declaration = {"name": name, "path": relative.as_posix()}
+        basic_path_value = skill.get("basic_path")
+        if basic_path_value is not None:
+            if not isinstance(basic_path_value, str):
+                raise SelcError(
+                    "INVALID_MANIFEST",
+                    f"skill basic_path must be a string: {name}",
+                    "declare a safe relative ordinary skill directory",
+                )
+            basic_path = require_relative_path(basic_path_value)
+            if basic_path.parts[0] != "skills":
+                raise SelcError(
+                    "INVALID_MANIFEST",
+                    f"skill basic_path must stay below skills/: {name}",
+                    "declare the ordinary body below the portable skills directory",
+                )
+            declaration["basic_path"] = basic_path.as_posix()
+        normalized.append(declaration)
     return normalized
 
 
@@ -740,6 +750,41 @@ def validate_declared_skills(suite_root: Path, skills: list[Any]) -> None:
                 "create the declared skill",
             )
         validate_skill_structure(skill_file, name)
+        basic_path = skill.get("basic_path")
+        if basic_path is not None:
+            basic_skill_file = suite_root / str(basic_path) / "SKILL.md"
+            if not basic_skill_file.is_file():
+                raise SelcError(
+                    "INVALID_MANIFEST",
+                    f"missing ordinary skill file: {basic_path}/SKILL.md",
+                    "create the declared basic_path skill body",
+                )
+            validate_skill_structure(basic_skill_file, name)
+
+
+def basic_registration_paths(manifest: dict[str, Any], suite_root: Path) -> dict[str, str]:
+    """Return ordinary skill directories or reject managed-only declarations.
+
+    A managed action may keep a distinct observed body, but ordinary installation
+    must never expose that body as though it were independently executable.
+    """
+
+    declared_skills = normalize_declared_skills(manifest["skills"])
+    managed_skills = {
+        action["skill"] for action in managed_configuration(manifest, suite_root).values()
+    }
+    paths: dict[str, str] = {}
+    for skill in declared_skills:
+        name = skill["name"]
+        basic_path = skill.get("basic_path")
+        if basic_path is None and name in managed_skills:
+            raise SelcError(
+                "BASIC_ENTRY_UNAVAILABLE",
+                f"managed skill {name} has no ordinary basic_path body",
+                "add an independently usable basic_path body or install with --mode observed",
+            )
+        paths[name] = basic_path or skill["path"]
+    return paths
 
 
 def validate_skill_structure(skill_file: Path, declared_name: str) -> None:
@@ -1113,7 +1158,14 @@ def seal_suite(suite_root: Path) -> dict[str, Any]:
     return sealed_manifest
 
 
-def create_suite(suite_id: str, version: str, output: Path, skills: list[str]) -> dict[str, Any]:
+def create_suite(
+    suite_id: str,
+    version: str,
+    output: Path,
+    skills: list[str],
+    *,
+    managed: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     if output.exists():
         raise SelcError(
             "PATH_CONFLICT", f"output already exists: {output}", "choose an empty output path"
@@ -1135,25 +1187,36 @@ def create_suite(suite_id: str, version: str, output: Path, skills: list[str]) -
             "INVALID_INPUT", "provide unique kebab-case --skill values", "repair the skill list"
         )
 
+    managed_configuration_input, skill_artifact_checks, artifact_checks = _create_declaration_parts(
+        managed, skills
+    )
+    if managed_configuration_input is None and managed is None and "text-report" in skills:
+        managed_configuration_input = _default_text_report_managed_configuration()
+    managed_actions = _managed_actions_by_skill(managed_configuration_input)
+    basic_paths = _created_basic_paths(skills, managed_actions)
     output.mkdir(parents=True)
-    skill_entries: list[dict[str, str]] = []
+    skill_entries: list[dict[str, Any]] = []
     for skill in skills:
         skill_directory = output / "skills" / skill
         skill_directory.mkdir(parents=True)
         (skill_directory / "SKILL.md").write_text(
-            "---\n"
-            f"name: {json.dumps(skill)}\n"
-            f"description: {skill} from the {suite_id} suite.\n"
-            "---\n\n"
-            f"# {skill}\n\n"
-            "This original skill body is supplied only after the installed managed runtime verifies "
-            "the current native activation. Discovery or scanning creates no lifecycle record. "
-            "Use the managed action declared by this suite; it automatically records the task, "
-            "invocation, checked publication, and timeline without task, call, event, or delivery "
-            "commands. Read `../../MAINTENANCE.md` before changing a skill or declared resource.\n",
+            _created_skill_body(skill, suite_id, managed_actions.get(skill)),
             encoding="utf-8",
         )
-        skill_entries.append({"name": skill, "path": f"skills/{skill}"})
+        entry: dict[str, Any] = {"name": skill, "path": f"skills/{skill}"}
+        action = managed_actions.get(skill)
+        if action is not None:
+            basic_path = basic_paths[skill]
+            basic_directory = output / basic_path
+            basic_directory.mkdir(parents=True)
+            (basic_directory / "SKILL.md").write_text(
+                _created_basic_skill_body(skill, suite_id, action), encoding="utf-8"
+            )
+            entry["basic_path"] = basic_path
+        artifact_check = skill_artifact_checks.get(skill)
+        if artifact_check is not None:
+            entry["artifact_check"] = artifact_check
+        skill_entries.append(entry)
 
     resources = output / "resources"
     resources.mkdir()
@@ -1168,24 +1231,14 @@ def create_suite(suite_id: str, version: str, output: Path, skills: list[str]) -
         "skills": skill_entries,
         "source": {"kind": "created", "repo": None, "subdir": ".", "commit": None, "base": None},
     }
-    if "text-report" in skills:
-        manifest["managed"] = {
-            "protocol": MANAGED_PROTOCOL,
-            "actions": {
-                "text-report": {
-                    "skill": "text-report",
-                    "kind": "text-report-v1",
-                    "script": "bin/selc-suite.py",
-                    "input": {
-                        "fields": {"input": {"type": "path"}},
-                        "required": ["input"],
-                    },
-                }
-            },
-        }
+    if managed_configuration_input is not None:
+        manifest["managed"] = managed_configuration_input
+    if artifact_checks:
+        manifest["artifact_checks"] = artifact_checks
     write_json(manifest_path(output), manifest)
     _copy_portable_runtime(output)
     _write_portable_files(output)
+    _create_declared_resource_scripts(output, managed_configuration_input)
     write_json(
         framework_path(output),
         {
@@ -1197,7 +1250,184 @@ def create_suite(suite_id: str, version: str, output: Path, skills: list[str]) -
     )
     manifest["content_hash"] = suite_content_hash(output)
     write_json(manifest_path(output), manifest)
-    return manifest
+    return load_manifest(output)
+
+
+def _default_text_report_managed_configuration() -> dict[str, Any]:
+    return {
+        "protocol": MANAGED_PROTOCOL,
+        "actions": {
+            "text-report": {
+                "skill": "text-report",
+                "kind": "text-report-v1",
+                "script": "bin/selc-suite.py",
+                "input": {
+                    "fields": {"input": {"type": "path"}},
+                    "required": ["input"],
+                },
+            }
+        },
+    }
+
+
+def _managed_actions_by_skill(managed: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    if not isinstance(managed, dict):
+        return {}
+    actions = managed.get("actions")
+    if not isinstance(actions, dict):
+        return {}
+    by_skill: dict[str, dict[str, Any]] = {}
+    for action in actions.values():
+        if not isinstance(action, dict):
+            continue
+        skill = action.get("skill")
+        if isinstance(skill, str) and skill not in by_skill:
+            by_skill[skill] = action
+    return by_skill
+
+
+def _created_basic_paths(
+    skills: list[str], managed_actions: dict[str, dict[str, Any]]
+) -> dict[str, str]:
+    """Allocate ordinary-body directories without colliding with declared skills."""
+
+    reserved_names = set(skills)
+    paths: dict[str, str] = {}
+    for skill in skills:
+        if skill not in managed_actions:
+            continue
+        base_name = f"{skill}-basic"
+        directory_name = base_name
+        suffix = 2
+        while directory_name in reserved_names:
+            directory_name = f"{base_name}-{suffix}"
+            suffix += 1
+        reserved_names.add(directory_name)
+        paths[skill] = f"skills/{directory_name}"
+    return paths
+
+
+def _created_skill_body(
+    skill: str,
+    suite_id: str,
+    managed_action: dict[str, Any] | None,
+) -> str:
+    frontmatter = (
+        "---\n"
+        f"name: {json.dumps(skill)}\n"
+        f"description: {skill} from the {suite_id} suite.\n"
+        "---\n\n"
+        f"# {skill}\n\n"
+    )
+    if managed_action is None:
+        return (
+            frontmatter
+            + "Follow this skill's ordinary task instructions and write its requested output. "
+            "Read `../../MAINTENANCE.md` before changing a skill or declared resource.\n"
+        )
+    return (
+        frontmatter
+        + "This observed skill body is supplied only after the installed managed runtime verifies "
+        "the current native activation. Discovery or scanning creates no lifecycle record. "
+        "Use the declared managed action to record the task, invocation, checked publication, "
+        "and timeline. Read `../../MAINTENANCE.md` before changing a skill or declared resource.\n"
+    )
+
+
+def _created_basic_skill_body(skill: str, suite_id: str, action: dict[str, Any]) -> str:
+    frontmatter = (
+        "---\n"
+        f"name: {json.dumps(skill)}\n"
+        f"description: {skill} ordinary-use entry from the {suite_id} suite.\n"
+        "---\n\n"
+        f"# {skill}\n\n"
+    )
+    kind = action.get("kind")
+    if kind == "text-report-v1":
+        return (
+            frontmatter
+            + "Set `SELC_SKILL_FILE` to the absolute path of this loaded `SKILL.md`. Resolve its "
+            "physical directory before using its grandparent as `SELC_SUITE`; keep the project working directory unchanged "
+            "so project-relative inputs keep working. This path does not require native hooks "
+            "or create observation records.\n\n"
+            "```sh\n"
+            'SELC_SKILL_FILE="<absolute path to this loaded SKILL.md>"\n'
+            'SELC_SKILL_DIR="$(cd -P "$(dirname "$SELC_SKILL_FILE")" && pwd)"\n'
+            'SELC_SUITE="$(cd "$SELC_SKILL_DIR/../.." && pwd)"\n'
+            "```\n\n"
+            "```sh\n"
+            '$SELC_PYTHON "$SELC_SUITE/bin/selc-suite.py" run text-report --input <input.txt> --output <report.md>\n'
+            "```\n"
+        )
+    if kind == "python-script-v1":
+        script = action.get("script")
+        if isinstance(script, str):
+            return (
+                frontmatter
+                + "Set `SELC_SKILL_FILE` to the absolute path of this loaded `SKILL.md`. Resolve its "
+                "physical directory before using its grandparent as `SELC_SUITE`; keep the project working directory unchanged "
+                "so project-relative inputs keep working. This path does not require a runtime receipt.\n\n"
+                "```sh\n"
+                'SELC_SKILL_FILE="<absolute path to this loaded SKILL.md>"\n'
+                'SELC_SKILL_DIR="$(cd -P "$(dirname "$SELC_SKILL_FILE")" && pwd)"\n'
+                'SELC_SUITE="$(cd "$SELC_SKILL_DIR/../.." && pwd)"\n'
+                "```\n\n"
+                "```sh\n"
+                f'$SELC_PYTHON "$SELC_SUITE/{script}" managed-run --request <request.json> --output <artifact>\n'
+                "```\n"
+            )
+    return (
+        frontmatter + "Write the ordinary task steps and output contract for this skill here. "
+        "This basic entry intentionally does not require managed activation or a native receipt.\n"
+    )
+
+
+def _create_declaration_parts(
+    declaration: dict[str, Any] | None,
+    skills: list[str],
+) -> tuple[dict[str, Any] | None, dict[str, str], dict[str, Any]]:
+    """Separate managed actions from public top-level checker declarations.
+
+    Older callers can pass the protocol-1 managed object directly. New generic
+    authoring declarations must use the explicit envelope so artifact checks
+    remain ordinary manifest fields rather than undocumented managed metadata.
+    """
+
+    if declaration is None:
+        return None, {}, {}
+    if "managed" not in declaration:
+        return declaration, {}, {}
+    allowed = {"managed", "artifact_checks", "skill_artifact_checks"}
+    unknown = set(declaration).difference(allowed)
+    if unknown:
+        raise SelcError(
+            "INVALID_MANAGED_DECLARATION",
+            "managed authoring declaration has unsupported top-level fields",
+            "use managed, artifact_checks, and skill_artifact_checks only",
+        )
+    managed = declaration.get("managed")
+    checks = declaration.get("artifact_checks", {})
+    bindings = declaration.get("skill_artifact_checks", {})
+    if (
+        not isinstance(managed, dict)
+        or not isinstance(checks, dict)
+        or not isinstance(bindings, dict)
+    ):
+        raise SelcError(
+            "INVALID_MANAGED_DECLARATION",
+            "managed authoring declaration sections must be JSON objects",
+            "declare managed actions, artifact_checks, and skill_artifact_checks as objects",
+        )
+    if set(bindings).difference(skills) or any(
+        not isinstance(skill, str) or not isinstance(check_id, str)
+        for skill, check_id in bindings.items()
+    ):
+        raise SelcError(
+            "INVALID_MANAGED_DECLARATION",
+            "skill_artifact_checks must map declared skill names to check ids",
+            "bind each check only to a --skill declared for this suite",
+        )
+    return managed, dict(bindings), checks
 
 
 def _copy_portable_runtime(output: Path) -> None:
@@ -1206,6 +1436,52 @@ def _copy_portable_runtime(output: Path) -> None:
     source_root = Path(__file__).resolve().parent
     for source in source_root.glob("*.py"):
         shutil.copy2(source, runtime_root / source.name)
+    framework_license = source_root / RUNTIME_LICENSE_NAME
+    if not framework_license.is_file() or framework_license.is_symlink():
+        raise SelcError(
+            "FRAMEWORK_LICENSE_UNAVAILABLE",
+            "the embedded SELC framework license is unavailable",
+            "restore src/selc/SELC-LICENSE before creating a suite",
+        )
+    # A generated suite is itself a framework source when its bundled
+    # ``bin/selc-suite.py`` creates another suite.  Keep the exact MIT text at
+    # both the packaged runtime root (the external package contract) and next
+    # to the copied ``selc`` modules (the portable source contract).
+    shutil.copy2(framework_license, runtime_root / RUNTIME_LICENSE_NAME)
+    shutil.copy2(framework_license, output / "runtime" / RUNTIME_LICENSE_NAME)
+
+
+def _create_declared_resource_scripts(output: Path, managed: dict[str, Any] | None) -> None:
+    """Materialize editable resource-script placeholders for generic creation.
+
+    A generated suite can declare arbitrarily named ``python-script-v1``
+    actions without placing editable business code in the protected runtime or
+    wrapper.  The creator replaces the bounded resource script before sealing.
+    """
+
+    if not isinstance(managed, dict):
+        return
+    actions = managed.get("actions")
+    if not isinstance(actions, dict):
+        return
+    for action in actions.values():
+        if not isinstance(action, dict) or action.get("kind") != "python-script-v1":
+            continue
+        script = action.get("script")
+        if not isinstance(script, str):
+            continue
+        relative = require_relative_path(script)
+        if relative.parts[0] != "resources":
+            continue
+        destination = output / relative
+        if destination.exists():
+            continue
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(
+            "#!/usr/bin/env python3\n"
+            "raise SystemExit('Replace this generated managed action resource before use.')\n",
+            encoding="utf-8",
+        )
 
 
 def _write_portable_files(output: Path) -> None:
@@ -1243,6 +1519,16 @@ def _write_portable_files(output: Path) -> None:
     )
     (output / "MAINTENANCE.md").write_text(
         "# Maintaining this suite\n\n"
+        "Install normal use with `install.py --project-root <project> --harness <codex|workbuddy>`; "
+        "the omitted mode is `basic`. Basic registration points directly to the declared ordinary body, "
+        "adds no hooks, needs no receipt, and does not create automatic statistics or evaluation evidence. "
+        "A managed skill needs an independently usable `basic_path`; legacy observed-only packages must use "
+        "`--mode observed` instead of rewriting their managed body. Select `--mode observed` only when "
+        "automatic observation is required. Existing installations, updates, and recovery preserve the saved "
+        "mode; old registrations without one remain observed for compatibility. The observed hook, native "
+        "receipt, automatic-statistics, one-shot, creator/evaluation, contribution, and release path is "
+        "EXPERIMENTAL. It can return `RECEIPT_UNAVAILABLE` and does not establish desktop or new-host/model "
+        "support, nor does it qualify a managed business candidate.\n\n"
         "Keep the installed suite immutable. For an uninstalled authoring source, run the available "
         "skill-creator validation after editing a declared skill or resource, then explicitly run "
         "`$SELC_PYTHON bin/selc-suite.py seal --suite <authoring-source>` before `validate` and "
@@ -1250,11 +1536,26 @@ def _write_portable_files(output: Path) -> None:
         "does not adopt installed local edits or update an installation registry. Set `SELC_PYTHON` "
         "to a Python 3.11+ interpreter, then prepare an isolated candidate with "
         "`$SELC_PYTHON bin/selc-suite.py evolve prepare --suite . --output <candidate-parent>`, then edit "
-        "only the resulting candidate `skills/` and declared `resources/` files. Evaluate it before "
-        "contribution, and use `contribute prepare` with the project root and suite id so the saved "
-        "source baseline is restored. Keep `runtime/` intact. Installed managed actions record selected "
-        "executions automatically; discovery never creates lifecycle evidence. Legacy record commands "
-        "remain diagnostics for legacy subjects and cannot modify managed-v2 tasks. This suite works "
+        "only the resulting candidate `skills/` and declared `resources/` files. `evolve evaluate` is a "
+        "fixture diagnostic only. Before a supported Codex plan, generate a complete private alpha.11 "
+        "`evolve policy-template` with its narrow Python readonly root and copy it into the matrix; raw "
+        "policy-digest-only plans remain unverified. The template freezes approval, network, tools, CLI "
+        "configuration, and filesystem roots, allowing only the isolated project and the account-bound "
+        "Codex arg0 bootstrap path to vary. A production contribution or release needs a frozen `evolve plan` that "
+        "declares each version scope and actual manifest version, an isolated creator request with a bound "
+        "maintainer regression brief, native session/turn/tool policy evidence, explicit protected-path denies, "
+        "and only trusted skill-creator/Python readonly dependencies, a bound full candidate snapshot, "
+        "one durable attempt per required matrix unit, and "
+        "`evolve finalize`; unknown, cancelled, and timed-out attempts are never retried. A candidate pass "
+        "never authorizes a different snapshot. Use `evolve attempt native-evidence-template` to identify "
+        "the original host-store session cutoff SHA-256, path hash, device, and inode required for reconstruction. "
+        "Codex qualification recomputes root/pre/Post prefixes and binds a hook tool through its matching "
+        "CommandExecution result; outer exec IDs are a separate namespace. WorkBuddy preparation is supported "
+        "but its qualification remains unverified until it has a bounded native attribution parser. "
+        "`contribute` and `release` independently reconstruct this real evidence before each prepare and "
+        "execute step. Keep `runtime/`, including `runtime/SELC-LICENSE`, intact. Installed managed actions "
+        "record selected executions automatically; discovery never creates lifecycle evidence. Legacy record "
+        "commands remain diagnostics for legacy subjects and cannot modify managed-v2 tasks. This suite works "
         "from Codex and WorkBuddy installation directories without a full SELC checkout.\n",
         encoding="utf-8",
     )
@@ -1311,6 +1612,35 @@ def _git_source_baseline(suite_root: Path) -> dict[str, Any] | None:
         branch = run_argv(["git", "branch", "--show-current"], cwd=repository_root)
     except SelcError:
         return None
+    try:
+        relative_root = suite_root.resolve().relative_to(repository_root.resolve())
+    except ValueError:
+        return None
+    portable_paths = [
+        path.relative_to(repository_root).as_posix() for path in _suite_files(suite_root)
+    ]
+    if not portable_paths:
+        return None
+    try:
+        run_argv(["git", "ls-files", "--error-unmatch", "--", *portable_paths], cwd=repository_root)
+        status_code, status_output, _ = run_argv_result(
+            [
+                "git",
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--",
+                relative_root.as_posix(),
+            ],
+            cwd=repository_root,
+        )
+        diff_code, _diff_output, _diff_error = run_argv_result(
+            ["git", "diff", "--quiet", "HEAD", "--", relative_root.as_posix()], cwd=repository_root
+        )
+    except SelcError:
+        return None
+    if status_code != 0 or status_output or diff_code != 0:
+        return None
     remote_code: str | None = None
     with suppress(SelcError):
         remote_code = run_argv(["git", "config", "--get", "remote.origin.url"], cwd=repository_root)
@@ -1319,7 +1649,7 @@ def _git_source_baseline(suite_root: Path) -> dict[str, Any] | None:
         "schema_version": SCHEMA_VERSION,
         "kind": "git",
         "repo": remote_code or str(repository_root.resolve()),
-        "subdir": suite_root.resolve().relative_to(repository_root.resolve()).as_posix(),
+        "subdir": relative_root.as_posix(),
         "commit": commit,
         "base": branch or commit,
         "contribution_base": contribution_base,

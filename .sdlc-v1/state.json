@@ -128,18 +128,18 @@
             "T009"
           ],
           "id": "T010",
-          "status": "in_progress",
+          "status": "done",
           "title": "Codex与WorkBuddy自动受管调用及时间线",
-          "updated_at": "2026-10-20T11:12:31Z"
+          "updated_at": "2026-10-25T12:30:08Z"
         },
         "T011": {
           "depends_on": [
             "T010"
           ],
           "id": "T011",
-          "status": "todo",
+          "status": "in_progress",
           "title": "真实评估、GitHub贡献和发布升级闭环",
-          "updated_at": "2026-10-20T08:35:24Z"
+          "updated_at": "2026-10-25T12:33:59Z"
         },
         "T012": {
           "depends_on": [],
@@ -166,9 +166,52 @@
           "status": "done",
           "title": "核正WorkBuddy完整原生环境命名的探针遗漏",
           "updated_at": "2026-10-21T06:41:47Z"
+        },
+        "T015": {
+          "depends_on": [
+            "T010"
+          ],
+          "id": "T015",
+          "status": "done",
+          "title": "分离基础安装使用与显式自动统计模式",
+          "updated_at": "2026-10-26T02:46:28Z"
         }
       },
-      "updated_at": "2026-10-21T06:41:47Z",
+      "updated_at": "2026-10-26T02:46:28Z",
+      "validation": {
+        "at": null,
+        "command": null,
+        "commit": null,
+        "result": "pending"
+      }
+    },
+    "F-003": {
+      "branch": "codex/auto-observation",
+      "created_at": "2026-10-26T04:06:29Z",
+      "engineering_context_ref": ".sdlc-v1/context/F-003.engineering.md",
+      "id": "F-003",
+      "release": {
+        "at": null,
+        "commit": null,
+        "status": "pending"
+      },
+      "requirement_id": "REQ-003",
+      "review": {
+        "at": null,
+        "by": null,
+        "decision": "pending"
+      },
+      "status": "in_progress",
+      "tasks": {
+        "T016": {
+          "depends_on": [],
+          "id": "T016",
+          "status": "done",
+          "title": "基础版说明与普通示例分发准备",
+          "updated_at": "2026-10-26T04:13:33Z"
+        }
+      },
+      "updated_at": "2026-10-26T04:13:33Z",
       "validation": {
         "at": null,
         "command": null,
@@ -202,7 +245,20 @@
       "product_context_ref": ".sdlc-v1/context/REQ-002.product.md",
       "status": "in_delivery",
       "title": "补齐 Codex 与 WorkBuddy 自动统计及业务验证扩展",
-      "updated_at": "2026-10-21T06:41:47Z"
+      "updated_at": "2026-10-26T02:46:28Z"
+    },
+    "REQ-003": {
+      "created_at": "2026-10-26T04:06:29Z",
+      "depends_on": [],
+      "description": "发布basic能力v0.1.0，自动统计实验化，GitHub/Gitee同步，不运行模型测试",
+      "domain": "skill-distribution",
+      "feature_id": "F-003",
+      "id": "REQ-003",
+      "priority": "P0",
+      "product_context_ref": ".sdlc-v1/context/REQ-003.product.md",
+      "status": "in_delivery",
+      "title": "SELC基础可用版首发与双端同步",
+      "updated_at": "2026-10-26T04:13:33Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

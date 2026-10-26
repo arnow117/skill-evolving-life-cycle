@@ -19,7 +19,20 @@ from .checker_integration import (
     run_installed_check,
 )
 from .checkers import SubjectIdentity
+from .creator import prepare_creator_request, verify_creator_result
 from .errors import SelcError
+from .evaluation import (
+    bind_real_evaluation_candidate,
+    collect_evaluation_attempt,
+    desktop_request,
+    finalize_real_evaluation,
+    launch_codex_cli_attempt,
+    native_evidence_template,
+    prepare_evaluation_attempt,
+    prepare_real_evaluation_plan,
+    public_evaluation_summary,
+    write_codex_policy_template,
+)
 from .evolve import (
     confirm_release,
     evaluate_candidate,
@@ -118,6 +131,14 @@ def _parser() -> argparse.ArgumentParser:
     create.add_argument("--version", required=True)
     create.add_argument("--output", type=_path, required=True)
     create.add_argument("--skill", action="append", required=True)
+    create.add_argument(
+        "--managed-declaration",
+        type=_path,
+        help=(
+            "a protocol-1 declaration JSON file: managed actions/native_hosts plus optional "
+            "top-level artifact_checks and skill_artifact_checks"
+        ),
+    )
 
     validate = subcommands.add_parser("validate", help="validate a suite manifest and skill files")
     validate.add_argument("--suite", type=_path, required=True)
@@ -141,10 +162,12 @@ def _parser() -> argparse.ArgumentParser:
     install.add_argument("--framework-source")
     install.add_argument("--framework-ref")
     install.add_argument("--framework-subdir")
+    install.add_argument("--mode", choices=["basic", "observed"])
 
     install_local = subcommands.add_parser("install-local", help="portable package installer")
     install_local.add_argument("--project-root", type=_path, required=True)
     install_local.add_argument("--harness", choices=["codex", "workbuddy"], required=True)
+    install_local.add_argument("--mode", choices=["basic", "observed"])
 
     task = subcommands.add_parser("task", help="record a stable business task")
     task_commands = task.add_subparsers(dest="task_command", required=True)
@@ -316,6 +339,126 @@ def _parser() -> argparse.ArgumentParser:
     evolve_evaluate.add_argument("--candidate-limit", type=int, default=2)
     evolve_evaluate.add_argument("--run-timeout-seconds", type=int, default=10)
     evolve_evaluate.add_argument("--total-timeout-seconds", type=int, default=60)
+    evolve_plan = evolve_commands.add_parser(
+        "plan", help="freeze a real-harness evaluation plan without launching a provider"
+    )
+    evolve_plan.add_argument("--suite", type=_path, required=True)
+    evolve_plan.add_argument("--cases", type=_path, required=True)
+    evolve_plan.add_argument("--output", type=_path, required=True)
+    evolve_policy_template = evolve_commands.add_parser(
+        "policy-template",
+        help=(
+            "write the frozen Codex policy and normal hook-trust inheritance template "
+            "before creating a plan"
+        ),
+    )
+    evolve_policy_template.add_argument(
+        "--host-version",
+        required=True,
+        help="the exact Codex version whose native policy shape was observed",
+    )
+    evolve_policy_template.add_argument(
+        "--python-read-root",
+        type=_path,
+        required=True,
+        help="the narrow readonly Python dependency root required by the fixed evaluator",
+    )
+    evolve_policy_template.add_argument("--output", type=_path, required=True)
+    evolve_bind = evolve_commands.add_parser(
+        "bind", help="bind one editable candidate to a frozen real evaluation plan"
+    )
+    evolve_bind.add_argument("--plan", type=_path, required=True)
+    evolve_bind.add_argument("--candidate", type=_path, required=True)
+    evolve_bind.add_argument("--output", type=_path, required=True)
+    evolve_bind.add_argument(
+        "--variant",
+        help="a declared candidate version variant; required when the plan has more than one candidate variant",
+    )
+    evolve_attempt = evolve_commands.add_parser(
+        "attempt", help="prepare, launch, or collect one frozen real-evaluation attempt"
+    )
+    evolve_attempt_commands = evolve_attempt.add_subparsers(dest="attempt_command", required=True)
+    evolve_attempt_prepare = evolve_attempt_commands.add_parser("prepare")
+    evolve_attempt_prepare.add_argument("--plan", type=_path, required=True)
+    evolve_attempt_prepare.add_argument("--binding", type=_path, required=True)
+    evolve_attempt_prepare.add_argument("--case", required=True)
+    evolve_attempt_prepare.add_argument("--matrix", required=True)
+    evolve_attempt_prepare.add_argument("--attempt", dest="attempt_number", type=int, required=True)
+    evolve_attempt_prepare.add_argument("--output", type=_path, required=True)
+    evolve_attempt_launch = evolve_attempt_commands.add_parser("launch")
+    evolve_attempt_launch.add_argument("--attempt-path", type=_path, required=True)
+    evolve_attempt_desktop = evolve_attempt_commands.add_parser("desktop-request")
+    evolve_attempt_desktop.add_argument("--attempt-path", type=_path, required=True)
+    evolve_attempt_evidence = evolve_attempt_commands.add_parser(
+        "native-evidence-template",
+        help="show the bounded raw native-session evidence required by collect",
+    )
+    evolve_attempt_evidence.add_argument("--attempt-path", type=_path, required=True)
+    evolve_attempt_collect = evolve_attempt_commands.add_parser("collect")
+    evolve_attempt_collect.add_argument("--attempt-path", type=_path, required=True)
+    evolve_finalize = evolve_commands.add_parser(
+        "finalize", help="reconstruct a real evaluation report from collected attempts"
+    )
+    evolve_finalize.add_argument("--plan", type=_path, required=True)
+    evolve_finalize.add_argument(
+        "--binding",
+        type=_path,
+        action="append",
+        required=True,
+        help="one immutable binding for each version variant included in the report",
+    )
+    evolve_finalize.add_argument("--attempt-path", type=_path, action="append", required=True)
+    evolve_finalize.add_argument("--output", type=_path, required=True)
+    evolve_summary = evolve_commands.add_parser(
+        "summary", help="emit a pathless public summary of an evaluation report"
+    )
+    evolve_summary.add_argument("--report", type=_path, required=True)
+    evolve_creator = evolve_commands.add_parser(
+        "creator", help="prepare or verify an isolated creator-only candidate edit"
+    )
+    evolve_creator_commands = evolve_creator.add_subparsers(dest="creator_command", required=True)
+    evolve_creator_prepare = evolve_creator_commands.add_parser("prepare")
+    evolve_creator_prepare.add_argument("--plan", type=_path, required=True)
+    evolve_creator_prepare.add_argument("--candidate", type=_path, required=True)
+    evolve_creator_prepare.add_argument("--output", type=_path, required=True)
+    evolve_creator_prepare.add_argument(
+        "--brief",
+        type=_path,
+        required=True,
+        help="maintainer-owned UTF-8 regression objective; never supply holdout or oracle material",
+    )
+    evolve_creator_prepare.add_argument(
+        "--skill-creator-root",
+        type=_path,
+        required=True,
+        help="trusted readonly skill-creator directory containing SKILL.md and scripts/quick_validate.py",
+    )
+    evolve_creator_prepare.add_argument(
+        "--creator-python-root",
+        type=_path,
+        required=True,
+        help="trusted readonly Python runtime dependency directory used by skill-creator",
+    )
+    evolve_creator_prepare.add_argument(
+        "--binary",
+        type=_path,
+        required=True,
+        help="the exact supported Codex CLI executable to hash into the fixed creator profile",
+    )
+    evolve_creator_prepare.add_argument(
+        "--binary-version",
+        required=True,
+        help="the exact supported Codex CLI version recorded by the native creator session",
+    )
+    evolve_creator_verify = evolve_creator_commands.add_parser("verify")
+    evolve_creator_verify.add_argument("--request", type=_path, required=True)
+    evolve_creator_verify.add_argument("--candidate", type=_path, required=True)
+    evolve_creator_verify.add_argument(
+        "--native-evidence",
+        type=_path,
+        required=True,
+        help="bounded raw native creator-session policy evidence for the prepared request",
+    )
 
     contribute = subcommands.add_parser("contribute", help="prepare a branch-oriented contribution")
     contribute_commands = contribute.add_subparsers(dest="contribute_command", required=True)
@@ -478,6 +621,26 @@ def _render_text_report(
     }
 
 
+def _managed_declaration(path: Path | None) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise SelcError(
+            "INVALID_MANAGED_DECLARATION",
+            "managed declaration must be a readable JSON object",
+            "provide a protocol-1 managed declaration file",
+        ) from error
+    if not isinstance(value, dict):
+        raise SelcError(
+            "INVALID_MANAGED_DECLARATION",
+            "managed declaration must be a JSON object",
+            "provide a protocol-1 managed declaration file",
+        )
+    return value
+
+
 def _verify_delivery_checker(
     arguments: argparse.Namespace,
 ) -> tuple[bool, str | None, dict[str, str] | None]:
@@ -530,7 +693,11 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
     if command == "create":
         return {
             "suite": create_suite(
-                arguments.suite_id, arguments.version, arguments.output, arguments.skill
+                arguments.suite_id,
+                arguments.version,
+                arguments.output,
+                arguments.skill,
+                managed=_managed_declaration(arguments.managed_declaration),
             )
         }
     if command == "managed":
@@ -725,6 +892,7 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
                 framework_source=arguments.framework_source,
                 framework_ref=arguments.framework_ref,
                 framework_subdir=arguments.framework_subdir,
+                mode=arguments.mode,
             )
         }
     if command == "install-local":
@@ -738,6 +906,7 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
                 project_root=arguments.project_root,
                 harness=arguments.harness,
                 ref=None,
+                mode=arguments.mode,
             )
         }
     if command == "task":
@@ -1030,16 +1199,67 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
     if command == "evolve":
         if arguments.evolve_command == "prepare":
             return prepare_candidate(arguments.suite, arguments.output)
-        return evaluate_candidate(
-            arguments.candidate,
-            arguments.output,
-            max_runs=arguments.max_runs,
-            model_calls=arguments.model_calls,
-            candidate_number=arguments.candidate_number,
-            candidate_limit=arguments.candidate_limit,
-            run_timeout_seconds=arguments.run_timeout_seconds,
-            total_timeout_seconds=arguments.total_timeout_seconds,
-        )
+        if arguments.evolve_command == "evaluate":
+            return evaluate_candidate(
+                arguments.candidate,
+                arguments.output,
+                max_runs=arguments.max_runs,
+                model_calls=arguments.model_calls,
+                candidate_number=arguments.candidate_number,
+                candidate_limit=arguments.candidate_limit,
+                run_timeout_seconds=arguments.run_timeout_seconds,
+                total_timeout_seconds=arguments.total_timeout_seconds,
+            )
+        if arguments.evolve_command == "plan":
+            return prepare_real_evaluation_plan(arguments.suite, arguments.cases, arguments.output)
+        if arguments.evolve_command == "policy-template":
+            return write_codex_policy_template(
+                arguments.host_version, arguments.python_read_root, arguments.output
+            )
+        if arguments.evolve_command == "bind":
+            return bind_real_evaluation_candidate(
+                arguments.plan, arguments.candidate, arguments.output, arguments.variant
+            )
+        if arguments.evolve_command == "attempt":
+            if arguments.attempt_command == "prepare":
+                return prepare_evaluation_attempt(
+                    arguments.plan,
+                    arguments.binding,
+                    arguments.case,
+                    arguments.matrix,
+                    arguments.attempt_number,
+                    arguments.output,
+                )
+            if arguments.attempt_command == "launch":
+                return launch_codex_cli_attempt(arguments.attempt_path)
+            if arguments.attempt_command == "desktop-request":
+                return desktop_request(arguments.attempt_path)
+            if arguments.attempt_command == "native-evidence-template":
+                return native_evidence_template(arguments.attempt_path)
+            return collect_evaluation_attempt(arguments.attempt_path)
+        if arguments.evolve_command == "finalize":
+            return finalize_real_evaluation(
+                arguments.plan,
+                arguments.binding,
+                arguments.attempt_path,
+                arguments.output,
+            )
+        if arguments.evolve_command == "creator":
+            if arguments.creator_command == "prepare":
+                return prepare_creator_request(
+                    arguments.plan,
+                    arguments.candidate,
+                    arguments.output,
+                    executor_binary=arguments.binary,
+                    executor_version=arguments.binary_version,
+                    brief_path=arguments.brief,
+                    skill_creator_root=arguments.skill_creator_root,
+                    creator_python_root=arguments.creator_python_root,
+                )
+            return verify_creator_result(
+                arguments.request, arguments.candidate, arguments.native_evidence
+            )
+        return public_evaluation_summary(arguments.report)
     if command == "contribute":
         if arguments.contribute_command == "prepare":
             return prepare_contribution(

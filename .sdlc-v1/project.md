@@ -1,8 +1,14 @@
 # SELC 项目上下文
 
-更新：2026-10-20。项目根为本文件上两级的独立 Git 仓库；F-002分支 `codex/auto-observation`，初始实现 commit `7cab4b8`，当前业务版本以 Git HEAD/正式 validation 绑定为准。origin 为公开 GitHub 仓库 https://github.com/arnow117/skill-evolving-life-cycle；基线及用户选择的MIT许可证`8d8328c`已推到`codex/design`，该分支为当前PR基线。
+更新：2026-10-26。项目根为本文件上两级的独立 Git 仓库；F-002分支 `codex/auto-observation`，初始实现 commit `7cab4b8`，当前业务版本以 Git HEAD/正式 validation 绑定为准。origin 为公开 GitHub 仓库 https://github.com/arnow117/skill-evolving-life-cycle；基线及用户选择的MIT许可证`8d8328c`已推到`codex/design`，该分支为当前PR基线。
+
+当前安装接口按 SRC-212 分为 basic/observed：新安装默认 basic，普通正文直接注册到 `.codebuddy/skills` 或 `.agents/skills`，不安装采集 hooks、不要求 receipt；已有安装省略模式保留原选择，旧无模式登记按 observed。显式 `--mode observed` 才启用自动统计/受管执行。manifest 可选 `basic_path` 为 skills/ 下独立普通正文；受管旧包没有该正文时需作者补齐或继续 observed。README 是唯一 usage 入口，CLI 参数为权威。T011 真实评估仍未完成，不由基础模式的离线检查替代。
+
+2026-10-25按用户当次确认创建公开Gitee源码镜像 https://gitee.com/arnow117/skill-evolving-life-cycle，从现有公开GitHub仓库完成一次导入。匿名Git读取核对`codex/design`为`8d8328c0313a231f194191d6e12e89f10b4cc128`、`codex/auto-observation`为`4df9b7e3d5be79713028eab48fb0afcc339fdaa7`，默认分支仍为`codex/design`，保留MIT。仅同步GitHub已推送源码；本地未提交候选未包含，也未创建Release或自动同步任务。证据位于同级工作区`20261025-selc-gitee-mirror/`。
 
 ## 定位与事实
+
+REQ-003/F-003 按用户当次指示独立发布基础版 v0.1.0 至 GitHub/Gitee，自动统计、observed、真实 creator/评估和自动贡献/发布流水线标实验。此源码/框架/普通示例分发不要求实验业务候选的真实资格，也不修改其强制校验；F-002/T011 未完成状态继续保留。目标制品为源码 tar.gz、framework ZIP、标准普通 skill ZIP、basic suite ZIP 与 SHA256SUMS，使用已验证/评审源码 commit；发布事实以 F-003 工程上下文及 state 为准。
 
 SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成物面向 Codex 与 WorkBuddy；初版产品/工程记录为`context/REQ-001.product.md`和`context/F-001.engineering.md`，当前自动统计交付的权威为`context/REQ-002.product.md`与`context/F-002.engineering.md`。AiTaxs 为延后试点，不是当前实现依赖。进度仅由 `state.json` 表示。
 
@@ -25,11 +31,11 @@ SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成�
 | 作者 skill/CLI | `.claude/skills/selc/`、`scripts/selc.py`、`src/selc/cli.py` | 创建/creator 改写/seal/打包本地流程通过 |
 | 本机记录 | `src/selc/records.py`，项目 `.selc/records.sqlite3` | task/call 双轴结果、反馈修订、导入去重与删除回归通过，见工程 Validation |
 | 自动观测与业务检查基础 | `observation.py`、`checkers.py`、`checker_integration.py`；manifest可选检查声明 | F-002 T004/T008/T009增量验收通过，131项本地测试；真实宿主正式接入及one-shot完整区间仍未验收 |
-| 安装与宿主适配 | `manifest.py` / `install.py`；实验 `experiments/host_observation/` | F-001 为本地结构与 portable CLI 测试；REQ-002 另有 CLI Codex / WorkBuddy 桌面有限接入证据，未集成生产 runtime |
+| 安装与宿主适配 | `manifest.py` / `install.py` / `native_adapter.py` / `managed_runtime.py` | 正式native receipt、显式/自动托管激活、action/stage/publish与Stop对账；WorkBuddy5.9.2/GLM-5.3通过实际矩阵，Codex CLI证据单独保留。Codex桌面未验证，已按用户本轮指示取消追加实测；准确范围见F-002工程上下文 |
 | 更新/评估/贡献/发布 | `install.py` / `evolve.py`，portable suite runtime | 框架来源复用、目录恢复、缺省保留与选择并发复核已有返修证据；既有回归仅 public GitHub/GitLab 和 local fixture；本轮已授权真实 GitHub贡献验证，结果待执行 |
 | 验证 | `tests/` 和 README 的 US-001 至 US-005 | aa079e2 正式 Validate PASS，76项测试及 SC001–007 本地范围证据，见工程 Validation |
 
-F-002源码增量已推送`d17d7bd`；[Draft PR #1](https://github.com/arnow117/skill-evolving-life-cycle/pull/1)仍为开发中。native context工具准备通过11项、updatedInput工具准备通过25项本地检查；真实WorkBuddy请求3已证明无allow的回执传入并精确消费，请求4未被旧project deny阻止，不能认定权限保留通过。T010条件式生产集成正在实现；正常发现、完整one-shot窗口及Codex桌面实际业务仍未验收。具体预算、原件和权限差异以F-002工程上下文为准。
+已有源码增量见[Draft PR #1](https://github.com/arnow117/skill-evolving-life-cycle/pull/1)，仍为开发中；当前实现和准确证据以F-002工程上下文为准，进度以state.json为准。早期updatedInput与权限失败探针仅保留其历史范围，当前生产采用直接身份绑定。Codex桌面未验证，不从CLI证据扩推桌面支持；用户已取消本轮追加桌面实测。
 
 ## 检查入口
 
@@ -41,6 +47,6 @@ F-002发布目标为公开GitHub源码、SELC框架及简单合成套件的版�
 UV_CACHE_DIR=/private/tmp/selc-uv-cache uv run --no-project --python 3.12 python -m unittest discover -s tests -v
 ```
 
-README 是面向使用者的唯一全局使用指南，CLI help 为参数权威。F-002已实际执行compileall/py_compile和`git diff --check`；Ruff 0.15.6现可通过专用uv缓存离线运行，候选4实现者报告受影响文件format/check通过，具体适用快照及验证范围见F-002工程记录。该作者工具不是portable运行依赖。官方 skill 格式校验使用当前creator工具环境，不能把其PyYAML当作portable运行依赖。
+README 是面向使用者的唯一全局使用指南，CLI help 为参数权威。F-002已实际执行compileall/py_compile和`git diff --check`；本机uv缓存中的Ruff0.15.6可离线调用，已实际验证版本和四项受影响文件的lint/format检查。具体结果仅适用于工程记录所列快照，不能沿用旧候选的通过结果。该作者工具不是portable运行依赖。官方 skill 格式校验使用当前creator工具环境，不能把其PyYAML当作portable运行依赖。
 
 2026-10-21增量：T014完整前缀工具33项本地检查通过；实际请求5在WorkBuddy5.8.3、自定义GLM-5.3:glm-5.3中精确匹配原生PreToolUse与执行进程身份。生产方案采用无命令改写的直接绑定，T010仍在实现，完整业务及one-shot验收尚未通过；以F-002实施层决定13和私有证据摘要为准。

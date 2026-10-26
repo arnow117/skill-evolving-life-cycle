@@ -13,6 +13,12 @@ import ctypes
 import hashlib
 import json
 import os
+
+try:
+    import pwd
+except ImportError:  # pragma: no cover - Windows has no POSIX account database.
+    pwd = None
+import re
 import secrets
 import shlex
 import signal
@@ -64,6 +70,51 @@ STOP_PHASE = "Stop"
 USER_PROMPT_PHASE = "UserPromptSubmit"
 PERMISSION_PHASE = "PermissionRequest"
 PERMISSION_DENIED_PHASE = "PermissionDenied"
+CURRENT_REQUEST_ANCHOR_RULE_VERSION = "current-request-v2"
+CODEX_ALPHA11_ARG0_ANCHOR_RULE_VERSION = "current-request-v3-codex-alpha11-arg0"
+WORKBUDDY_SKILL_PRE_ANCHOR_RULE_VERSION = "current-request-v3-workbuddy-skill-pre"
+WORKBUDDY_AUTOMATIC_SKILL_PRE_ANCHOR_RULE_VERSION = "current-request-v4-workbuddy-auto-skill-pre"
+WORKBUDDY_SUPPORTED_CLIENT_VERSIONS = frozenset({"5.8.3", "5.9.2"})
+CODEX_ALPHA11_ARG0_VERSION = "0.163.0-alpha.11"
+BUSINESS_DTO_RULE_VERSION = "business-dto-v1"
+_SAME_PROJECT_CD_PREFIX = re.compile(r"""^cd (?P<directory>/[^\s"'`$;&|<>()\\*?\[\]{}]+) && """)
+
+
+def _managed_command_wrapper_prefix(
+    command: str,
+    prefix: list[str],
+    project_root: Path | None,
+) -> list[str] | None:
+    """Allow one literal same-project ``cd`` before the fixed wrapper only.
+
+    The raw command remains the evidence value.  This helper only removes a
+    finite shell prelude from the parsed operation, after proving the literal
+    directory is the caller-supplied project root.
+    """
+
+    if len(prefix) == 2:
+        return prefix
+    if len(prefix) != 5 or project_root is None:
+        return None
+
+    match = _SAME_PROJECT_CD_PREFIX.match(command)
+    if match is None:
+        return None
+    directory = match.group("directory")
+    if prefix[:3] != ["cd", directory, "&&"]:
+        return None
+    try:
+        candidate_root = Path(directory)
+        expected_root = project_root.resolve(strict=True)
+        if (
+            not candidate_root.is_absolute()
+            or ".." in candidate_root.parts
+            or candidate_root.resolve(strict=True) != expected_root
+        ):
+            return None
+    except (OSError, ValueError):
+        return None
+    return prefix[3:]
 
 
 def parse_installed_managed_command(
@@ -101,7 +152,9 @@ def parse_installed_managed_command(
     if len(argv) < 5 or "managed" not in argv:
         return None
     managed_index = argv.index("managed")
-    prefix = argv[:managed_index]
+    prefix = _managed_command_wrapper_prefix(command, argv[:managed_index], project_root)
+    if prefix is None:
+        return None
     if len(prefix) != 2 or not prefix[1].endswith("selc-suite.py"):
         return None
     if project_root is not None:
@@ -297,27 +350,27 @@ def observe_request_boundary(
                 return {"status": "conflict"}
             if event["status"] == "suppressed":
                 return {"status": "suppressed"}
+        if event["status"] == "replayed" and event["projection_status"] == "applied":
+            return {"status": "replayed"}
+        projection_event = (
+            normalized
+            if event["status"] == "recorded"
+            else _projection_event(database, event, normalized)
+        )
+        if projection_event is None:
+            return {"status": "recorded_unusable"}
         with records.projection_transaction(database):
-            if normalized["phase"] == USER_PROMPT_PHASE:
-                _record_prompt_context(database, normalized, event["event_id"])
-                return {"status": "prompt_recorded"}
-            if normalized["phase"] == STOP_PHASE:
-                _close_pending_windows_on_stop(database, normalized, event["event_id"])
-                _close_execution_activity(database, normalized)
-                _close_idle_managed_task(database, normalized)
-                return {"status": "stop_recorded"}
-            if normalized["phase"] in {PERMISSION_PHASE, PERMISSION_DENIED_PHASE}:
-                _record_permission_context(database, normalized)
-                return {"status": "permission_recorded"}
-            if normalized["phase"] == POST_PHASE:
-                _close_matching_window(database, normalized)
-                return {"status": "post_recorded"}
-            receipt = _issue_receipt(database, installation, normalized, event["event_id"])
-            if receipt is None:
-                return {
-                    "status": "replayed" if event["status"] == "replayed" else "recorded_unusable"
-                }
-            return {"status": "recorded", "receipt": receipt}
+            result = _project_native_event(
+                database,
+                installation,
+                projection_event,
+                event_id=event["event_id"],
+            )
+            database.execute(
+                "UPDATE managed_native_events SET projection_status = 'applied' WHERE event_id = ?",
+                (event["event_id"],),
+            )
+            return result
 
 
 def activate(*, project_root: Path, suite_id: str, skill: str, receipt: str) -> dict[str, object]:
@@ -429,6 +482,7 @@ def _activate_consumed_receipt(
     receipt_row: Any,
 ) -> dict[str, object]:
     context = _context_for_receipt(database, receipt_row)
+    trigger_kind = _confirm_context_selection(database, context, skill)
     task_id = context["task_id"]
     fixture_receipt = _receipt_is_fixture(database, receipt_row)
     if task_id is None:
@@ -464,6 +518,7 @@ def _activate_consumed_receipt(
         skill=skill,
         host=str(receipt_row["host"]),
         installation=installation,
+        trigger_kind=trigger_kind,
     )
     database.execute(
         "UPDATE managed_receipts SET task_id = ?, call_id = ? WHERE receipt_digest = ?",
@@ -680,6 +735,7 @@ def _run_action_locked(
             )
         normalized_request = _validate_action_request(action, request)
         request_digest = _digest({"skill": skill, "input": normalized_request})
+        frozen_inputs = _freeze_declared_action_inputs(action, normalized_request)
         with records.projection_transaction(database):
             _assert_managed_call(database, task_id, call_id, suite_id, skill, installation)
             _assert_no_pending_action(database, task_id)
@@ -721,7 +777,21 @@ def _run_action_locked(
                     host_versions=host_versions,
                 )
             context = _assert_receipt_subject(database, receipt_row, task_id, call_id)
-            if context["request_digest"] and context["request_digest"] != request_digest:
+            _assert_correction_binding_current(database, context, installation)
+            _assert_context_selected_skill(context, skill)
+            _assert_context_action_business_dto(context, normalized_request)
+            _assert_correction_request_input(
+                database,
+                context,
+                action,
+                normalized_request,
+                frozen_inputs,
+            )
+            if (
+                not _context_uses_automatic_selection(context)
+                and context["request_digest"]
+                and context["request_digest"] != request_digest
+            ):
                 raise SelcError(
                     "RECEIPT_ARGUMENT_MISMATCH",
                     "managed action inputs differ from the native request bound to this receipt",
@@ -753,6 +823,7 @@ def _run_action_locked(
                 action=action,
                 request=normalized_request,
                 staging=staging,
+                frozen_inputs=frozen_inputs,
                 on_execution_started=lambda identity, heartbeat_path: _record_execution_started(
                     database, action_run_id, suite_id, identity, heartbeat_path
                 ),
@@ -946,7 +1017,11 @@ def _stage_instruction_artifact_locked(
             else:
                 receipt_row = None
             if receipt_row is not None:
-                _assert_receipt_subject(database, receipt_row, task_id, call_id)
+                context = _assert_receipt_subject(database, receipt_row, task_id, call_id)
+                _assert_correction_binding_current(database, context, installation)
+                _assert_context_selected_skill(context, str(action["skill"]))
+                checker_input_digest = hashlib.sha256(checker_input_bytes).hexdigest()
+                _assert_correction_checker_input_digest(database, context, checker_input_digest)
             action_run_id = f"managed-action-{secrets.token_hex(12)}"
             staging = _action_staging_root(project_root, suite_id, action_run_id)
             artifact_path = staging / "artifact"
@@ -1068,7 +1143,6 @@ def _publish_locked(
         _assert_active_installation(project_root, suite_id, installation)
         manifest = load_manifest(_current_root(project_root, suite_id))
         host_versions = managed_host_versions(manifest)
-        target_path = _safe_target_path(project_root, target)
         with records.projection_transaction(database):
             _assert_managed_call(database, task_id, call_id, suite_id, None, installation)
             _assert_no_inflight_publication(database, task_id)
@@ -1109,8 +1183,12 @@ def _publish_locked(
                     expected_action="publish",
                     host_versions=host_versions,
                 )
-            _assert_receipt_subject(database, receipt_row, task_id, call_id)
+            context = _assert_receipt_subject(database, receipt_row, task_id, call_id)
+            _assert_correction_binding_current(database, context, installation)
             action_row = _finished_action_for_artifact(database, task_id, call_id, artifact_path)
+            _assert_correction_action_input(database, context, action_row)
+            _assert_correction_publish_target(database, context, project_root, target)
+            target_path = _safe_target_path(project_root, target)
             delivery_id, ordinal, predecessor = _reserve_publication(
                 database,
                 suite_id=suite_id,
@@ -1206,6 +1284,11 @@ def _publish_locked(
                 "recover or start a new managed publication",
             )
         try:
+            context = _context_for_receipt(database, receipt_snapshot)
+            _assert_correction_binding_current(database, context, installation)
+            _assert_correction_action_input(database, context, action_snapshot)
+            _assert_correction_checker_execution(database, context, execution)
+            _assert_correction_publish_target(database, context, project_root, target)
             # Revalidate the project-relative parent after checker execution.
             # The later descriptor checks bind the exchange itself, while this
             # check rejects a directory that was redirected outside the project
@@ -1666,7 +1749,13 @@ def _normalize_native_payload(
 
     request_from_prompt = False
     command_value: dict[str, str] | None = None
+    correction: dict[str, object] | None = None
     tool_command_digest = ""
+    technical_skill_event = False
+    technical_skill_pre = False
+    technical_skill_valid = False
+    technical_skill_args_digest = ""
+    business_dto_digest: str | None = None
     if phase == USER_PROMPT_PHASE:
         request = payload["request"]
         if not isinstance(request, dict):
@@ -1681,6 +1770,8 @@ def _normalize_native_payload(
         operation_digest = ""
         request_digest = _native_request_digest(payload, skill)
         raw_request_digest = _raw_request_digest(payload)
+        correction = _correction_declaration(payload["request"])
+        business_dto_digest = _business_dto_goal_digest_from_request(payload["request"])
         tool_use_id = ""
     elif phase in {STOP_PHASE, PERMISSION_PHASE, PERMISSION_DENIED_PHASE}:
         if payload["request"] != {"source": "user-prompt"}:
@@ -1704,56 +1795,105 @@ def _normalize_native_payload(
                 "native tool boundary has no tool identity",
                 "pause before managed execution and repair the host collector",
             )
-        if _required_string(payload, "tool_name") not in {"Bash", "exec_command", "shell"}:
-            raise SelcError(
-                "NATIVE_COLLECTOR_INVALID", "native tool is not an installed action tool"
-            )
-        tool_input = payload["tool_input"]
-        if not isinstance(tool_input, dict) or set(tool_input) != {"command"}:
-            raise SelcError(
-                "NATIVE_COLLECTOR_INVALID", "native tool input is not a fixed managed command"
-            )
-        command = _required_managed_command(tool_input)
-        tool_command_digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
-        parsed_command = parse_installed_managed_command(
-            command,
-            suite_id,
-            project_root=project_root,
-        )
-        if parsed_command is None:
-            if payload.get("unmanaged_tool") is not True:
-                raise SelcError(
-                    "NATIVE_COLLECTOR_INVALID",
-                    "native tool is not the fixed installed managed wrapper",
-                )
-            action = "unmanaged"
-            skill = ""
-            command_value = {
-                "action": action,
-                "command_digest": hashlib.sha256(command.encode("utf-8")).hexdigest(),
-            }
-            command_digest = _digest(command_value)
-            operation_digest = ""
-        else:
-            action = _required_string(parsed_command, "action")
-            skill = _optional_string(parsed_command, "skill") or ""
+        technical_skill_event = payload.get("technical_skill_event") is True
+        if technical_skill_event:
             if (
-                parsed_command.get("format") == "shell"
-                and parsed_command.get("arguments", "")
-                and json.loads(parsed_command["arguments"]).get("--host") != host
+                host != "workbuddy"
+                or _required_string(payload, "tool_name") != "Skill"
+                or phase not in {PRE_PHASE, POST_PHASE}
             ):
                 raise SelcError(
                     "NATIVE_COLLECTOR_INVALID",
-                    "managed wrapper host does not match the native callback host",
+                    "native technical Skill event has an unsupported host or phase",
                 )
-            command_value = parsed_command
-            command_digest = _digest(command_value)
-            operation_digest = command_digest if parsed_command.get("format") == "shell" else ""
-        tool_use_id = _required_string(payload, "tool_use_id")
-        request = payload["request"]
-        request_from_prompt = request == {"source": "user-prompt"}
-        request_digest = "" if request_from_prompt else _native_request_digest(payload, skill)
-        raw_request_digest = "" if request_from_prompt else _raw_request_digest(payload)
+            technical_skill_pre = payload.get("technical_skill_pre") is True
+            if technical_skill_pre != (phase == PRE_PHASE):
+                raise SelcError(
+                    "NATIVE_COLLECTOR_INVALID",
+                    "native technical Skill event has an invalid Pre marker",
+                )
+            technical_skill_valid = payload.get("technical_skill_valid") is True
+            technical_skill_args_digest = _required_string(payload, "technical_skill_args_digest")
+            if not _is_sha256_digest(technical_skill_args_digest):
+                raise SelcError(
+                    "NATIVE_COLLECTOR_INVALID",
+                    "native technical Skill arguments have no fixed digest",
+                )
+            skill = _optional_string(payload, "technical_skill_name") or ""
+            request = payload["request"]
+            if not isinstance(request, dict):
+                raise SelcError(
+                    "NATIVE_COLLECTOR_INVALID",
+                    "native technical Skill request is not an object",
+                )
+            action = "technical_skill"
+            command_digest = _digest(
+                {
+                    "phase": phase,
+                    "tool": "Skill",
+                    "skill": skill,
+                    "args_digest": technical_skill_args_digest,
+                }
+            )
+            operation_digest = ""
+            request_digest = _native_request_digest(payload, skill)
+            raw_request_digest = _raw_request_digest(payload)
+            correction = _correction_declaration(request)
+            business_dto_digest = _business_dto_goal_digest_from_request(request)
+            tool_use_id = _required_string(payload, "tool_use_id")
+        elif _required_string(payload, "tool_name") not in {"Bash", "exec_command", "shell"}:
+            raise SelcError(
+                "NATIVE_COLLECTOR_INVALID", "native tool is not an installed action tool"
+            )
+        else:
+            tool_input = payload["tool_input"]
+            if not isinstance(tool_input, dict) or set(tool_input) != {"command"}:
+                raise SelcError(
+                    "NATIVE_COLLECTOR_INVALID",
+                    "native tool input is not a fixed managed command",
+                )
+            command = _required_managed_command(tool_input)
+            tool_command_digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
+            parsed_command = parse_installed_managed_command(
+                command,
+                suite_id,
+                project_root=project_root,
+            )
+            if parsed_command is None:
+                if payload.get("unmanaged_tool") is not True:
+                    raise SelcError(
+                        "NATIVE_COLLECTOR_INVALID",
+                        "native tool is not the fixed installed managed wrapper",
+                    )
+                action = "unmanaged"
+                skill = ""
+                command_value = {
+                    "action": action,
+                    "command_digest": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+                }
+                command_digest = _digest(command_value)
+                operation_digest = ""
+            else:
+                action = _required_string(parsed_command, "action")
+                skill = _optional_string(parsed_command, "skill") or ""
+                if (
+                    parsed_command.get("format") == "shell"
+                    and parsed_command.get("arguments", "")
+                    and json.loads(parsed_command["arguments"]).get("--host") != host
+                ):
+                    raise SelcError(
+                        "NATIVE_COLLECTOR_INVALID",
+                        "managed wrapper host does not match the native callback host",
+                    )
+                command_value = parsed_command
+                command_digest = _digest(command_value)
+                operation_digest = command_digest if parsed_command.get("format") == "shell" else ""
+            tool_use_id = _required_string(payload, "tool_use_id")
+            request = payload["request"]
+            request_from_prompt = request == {"source": "user-prompt"}
+            request_digest = "" if request_from_prompt else _native_request_digest(payload, skill)
+            raw_request_digest = "" if request_from_prompt else _raw_request_digest(payload)
+            business_dto_digest = None
 
     surface = _required_string(payload, "surface")
     client_version = _required_string(payload, "client_version")
@@ -1814,24 +1954,43 @@ def _normalize_native_payload(
                 for key, value in decoded_arguments.items()
             ):
                 operation_arguments = decoded_arguments
+    payload_digest_input: dict[str, object] = {
+        "identity": stable_identity,
+        "command": command_value,
+        "raw_request": raw_request_digest or "prompt-context",
+        "source": "fixture" if fixture else "native-collector",
+    }
+    # Existing native rows predate technical Skill boundaries.  Their digest
+    # formula is a durable replay contract, so only the new event family adds
+    # its technical fields.
+    if technical_skill_event:
+        payload_digest_input["technical_skill"] = {
+            "pre": technical_skill_pre,
+            "valid": technical_skill_valid,
+            "args_digest": technical_skill_args_digest,
+        }
+
     return {
         "event_id": f"native-{secrets.token_hex(16)}",
         "stable_identity": stable_identity,
-        "payload_digest": _digest(
-            {
-                "identity": stable_identity,
-                "command": command_value,
-                "raw_request": raw_request_digest or "prompt-context",
-                "source": "fixture" if fixture else "native-collector",
-            }
-        ),
+        "payload_digest": _digest(payload_digest_input),
         "payload_json": _encoded(
             {
                 "action": action,
+                "skill": skill,
                 "command_digest": command_digest,
                 "operation_digest": operation_digest,
+                "operation_arguments": operation_arguments,
                 "tool_command_digest": tool_command_digest or None,
+                "technical_skill_event": technical_skill_event,
+                "technical_skill_pre": technical_skill_pre,
+                "technical_skill_valid": technical_skill_valid,
+                "technical_skill_args_digest": technical_skill_args_digest or None,
                 "request_digest": request_digest or None,
+                "business_dto_digest": business_dto_digest,
+                "business_dto_rule_version": (
+                    BUSINESS_DTO_RULE_VERSION if business_dto_digest is not None else None
+                ),
                 "raw_request_digest": raw_request_digest or None,
                 "request_from_prompt": request_from_prompt,
                 "request_id": request_id,
@@ -1842,6 +2001,7 @@ def _normalize_native_payload(
                 "parent_request_id": _optional_string(payload, "parent_request_id"),
                 "parent_message_id": _optional_string(payload, "parent_message_id"),
                 "causation": causation,
+                "correction": correction,
                 "prefix": stored_prefix,
                 "root_proof_status": root_proof_status,
                 "source": "fixture" if fixture else "native-collector",
@@ -1865,10 +2025,19 @@ def _normalize_native_payload(
         "operation_digest": operation_digest,
         "operation_arguments": operation_arguments,
         "tool_command_digest": tool_command_digest,
+        "technical_skill_event": technical_skill_event,
+        "technical_skill_pre": technical_skill_pre,
+        "technical_skill_valid": technical_skill_valid,
+        "technical_skill_args_digest": technical_skill_args_digest,
         "request_digest": request_digest,
+        "business_dto_digest": business_dto_digest,
+        "business_dto_rule_version": (
+            BUSINESS_DTO_RULE_VERSION if business_dto_digest is not None else None
+        ),
         "raw_request_digest": raw_request_digest,
         "request_from_prompt": request_from_prompt,
         "causation": causation,
+        "correction": correction,
         "prefix": transcript,
         "transcript_path": str(transcript.get("path") or ""),
         "root_valid": (
@@ -1877,6 +2046,7 @@ def _normalize_native_payload(
             and trusted_producer
         ),
         "fixture": fixture,
+        "message_id": _optional_string(payload, "message_id") or "",
     }
 
 
@@ -2309,6 +2479,138 @@ def _contains_unresolved_history_base(value: object, names: set[str]) -> bool:
     return False
 
 
+def _projection_event(
+    database: Any,
+    stored: dict[str, str],
+    incoming: dict[str, object],
+) -> dict[str, object] | None:
+    """Rebuild one projection from durable raw facts and a verified native path.
+
+    A callback can fail after its native row commits but before a derived
+    context, receipt, or Stop closure commits.  Replays may arrive after the
+    transcript grows, so the original frozen prefix remains authoritative and
+    the replay contributes only a matching file handle/path for bounded reads.
+    """
+
+    row = database.execute(
+        """SELECT payload_json, host, suite_id, session_id, generation_id, request_id,
+        tool_use_id, phase FROM managed_native_events WHERE event_id = ?""",
+        (stored["event_id"],),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    stored_prefix = payload.get("prefix")
+    incoming_prefix = incoming.get("prefix")
+    stored_fields = _frozen_prefix_fields(stored_prefix)
+    incoming_fields = _frozen_prefix_fields(incoming_prefix)
+    if stored_fields is None or incoming_fields is None:
+        unavailable_prefix = {"length": None, "sha256": None, "root_candidate": False}
+        if stored_prefix != unavailable_prefix or incoming_prefix != unavailable_prefix:
+            return None
+    else:
+        _, _, stored_path_hash, stored_device, stored_inode = stored_fields
+        _, _, incoming_path_hash, incoming_device, incoming_inode = incoming_fields
+        if (
+            stored_path_hash != incoming_path_hash
+            or stored_device != incoming_device
+            or stored_inode != incoming_inode
+        ):
+            return None
+    source = payload.get("source")
+    if source not in {"fixture", "native-collector"}:
+        return None
+    reconstructed = dict(incoming)
+    reconstructed.update(
+        {
+            "event_id": stored["event_id"],
+            "host": row["host"],
+            "suite_id": row["suite_id"],
+            "session_id": row["session_id"],
+            "generation_id": row["generation_id"],
+            "request_id": row["request_id"],
+            "surface": payload.get("surface"),
+            "client_version": payload.get("client_version"),
+            "tool_use_id": row["tool_use_id"],
+            "phase": row["phase"],
+            "action": payload.get("action"),
+            "skill": payload.get("skill", incoming.get("skill", "")),
+            "command_digest": payload.get("command_digest"),
+            "operation_digest": payload.get("operation_digest"),
+            "operation_arguments": payload.get(
+                "operation_arguments",
+                incoming.get("operation_arguments", {}),
+            ),
+            "tool_command_digest": payload.get("tool_command_digest") or "",
+            "technical_skill_event": payload.get("technical_skill_event") is True,
+            "technical_skill_pre": payload.get("technical_skill_pre") is True,
+            "technical_skill_valid": payload.get("technical_skill_valid") is True,
+            "technical_skill_args_digest": payload.get("technical_skill_args_digest") or "",
+            "request_digest": payload.get("request_digest") or "",
+            "business_dto_digest": payload.get("business_dto_digest"),
+            "business_dto_rule_version": payload.get("business_dto_rule_version"),
+            "raw_request_digest": payload.get("raw_request_digest") or "",
+            "request_from_prompt": payload.get("request_from_prompt") is True,
+            "root_request_id": payload.get("root_request_id") or "",
+            "parent_request_id": payload.get("parent_request_id") or "",
+            "message_id": payload.get("message_id") or "",
+            "causation": payload.get("causation") or "unknown",
+            "correction": payload.get("correction"),
+            "fixture": source == "fixture",
+            "root_valid": bool(stored_prefix.get("root_candidate"))
+            and source == "native-collector"
+            and payload.get("root_proof_status") == "verified",
+        }
+    )
+    reconstructed["prefix"] = dict(stored_prefix)
+    reconstructed["transcript_path"] = incoming["transcript_path"]
+    return reconstructed
+
+
+def _project_native_event(
+    database: Any,
+    installation: dict[str, Any],
+    event: dict[str, object],
+    *,
+    event_id: str,
+) -> dict[str, object]:
+    """Apply one idempotent projection after its immutable native row commits."""
+
+    if event["phase"] == USER_PROMPT_PHASE:
+        _record_prompt_context(database, event, event_id)
+        return {"status": "prompt_recorded"}
+    if event.get("technical_skill_event") is True and event.get("technical_skill_pre") is True:
+        context = database.execute(
+            "SELECT * FROM managed_contexts WHERE context_key = ?", (_context_key(event),)
+        ).fetchone()
+        if context is None or not _ensure_current_request_anchor(
+            database, context, event, event_id
+        ):
+            return {"status": "technical_unusable"}
+        return {"status": "technical_recorded"}
+    if event["phase"] == STOP_PHASE:
+        _close_pending_windows_on_stop(database, event, event_id)
+        _close_execution_activity(database, event)
+        _close_idle_managed_task(database, event)
+        _close_correction_binding(database, event)
+        return {"status": "stop_recorded"}
+    if event["phase"] in {PERMISSION_PHASE, PERMISSION_DENIED_PHASE}:
+        _record_permission_context(database, event)
+        return {"status": "permission_recorded"}
+    if event["phase"] == POST_PHASE:
+        _close_matching_window(database, event)
+        return {"status": "post_recorded"}
+    receipt = _issue_receipt(database, installation, event, event_id)
+    if receipt is None:
+        return {"status": "recorded_unusable"}
+    return {"status": "recorded", "receipt": receipt}
+
+
 def _store_native_event(database: Any, event: dict[str, object]) -> dict[str, str]:
     suppressed = database.execute(
         "SELECT 1 FROM managed_suppressions WHERE stable_identity = ?", (event["stable_identity"],)
@@ -2333,7 +2635,11 @@ def _store_native_event(database: Any, event: dict[str, object]) -> dict[str, st
     ).fetchone()
     if existing is not None:
         if existing["payload_digest"] == event["payload_digest"]:
-            return {"status": "replayed", "event_id": str(existing["event_id"])}
+            return {
+                "status": "replayed",
+                "event_id": str(existing["event_id"]),
+                "projection_status": str(existing["projection_status"]),
+            }
         database.execute(
             """INSERT INTO managed_native_conflicts(
             stable_identity, original_event_id, incoming_digest, received_at)
@@ -2371,7 +2677,11 @@ def _store_native_event(database: Any, event: dict[str, object]) -> dict[str, st
             task_id = context["task_id"]
         if task_id is not None:
             reduce_managed_assessment(database, str(task_id))
-        return {"status": "conflict", "event_id": str(existing["event_id"])}
+        return {
+            "status": "conflict",
+            "event_id": str(existing["event_id"]),
+            "projection_status": "applied",
+        }
     database.execute(
         """INSERT INTO managed_native_events(
         event_id, stable_identity, payload_digest, payload_json, host, suite_id, session_id,
@@ -2392,7 +2702,11 @@ def _store_native_event(database: Any, event: dict[str, object]) -> dict[str, st
             records.utc_now(),
         ),
     )
-    return {"status": "recorded", "event_id": str(event["event_id"])}
+    return {
+        "status": "recorded",
+        "event_id": str(event["event_id"]),
+        "projection_status": "pending",
+    }
 
 
 def _context_key(event: dict[str, object]) -> str:
@@ -2420,8 +2734,9 @@ def _record_prompt_context(database: Any, event: dict[str, object], event_id: st
         database.execute(
             """INSERT INTO managed_contexts(
             context_key, suite_id, host, session_id, generation_id, request_id, root_request_id,
-            request_digest, input_skill, root_event_id, root_valid, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+            request_digest, input_skill, business_dto_digest, business_dto_rule_version,
+            root_event_id, root_valid, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
             (
                 context_key,
                 event["suite_id"],
@@ -2432,22 +2747,35 @@ def _record_prompt_context(database: Any, event: dict[str, object], event_id: st
                 event["root_request_id"],
                 event["request_digest"],
                 event["skill"],
+                event["business_dto_digest"],
+                event["business_dto_rule_version"],
                 event_id,
                 int(bool(event["root_valid"])),
                 records.utc_now(),
             ),
         )
-    elif context["request_digest"] != event["request_digest"]:
+    elif (
+        context["request_digest"] != event["request_digest"]
+        or context["business_dto_digest"] != event["business_dto_digest"]
+        or context["business_dto_rule_version"] != event["business_dto_rule_version"]
+    ):
         database.execute(
             "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?", (context_key,)
         )
-    if event["causation"] == "business_correction":
+    if event["causation"] in {"business_correction", "correction_candidate"}:
+        # Prose and a host marker may describe a correction, but neither proves
+        # which fixed goal is being preserved.  Leave the context unlinked
+        # until a verified current JSON declaration passes the durable binding
+        # checks at its first PreToolUse boundary.
         database.execute(
-            "UPDATE managed_contexts SET intervention = 1 WHERE context_key = ?", (context_key,)
+            "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?", (context_key,)
         )
+    elif event["causation"] in {"input_preparation", "automatic_retry", "permission"}:
         _link_explicit_followup_context(database, context_key, event)
-    elif event["causation"] in {"input_preparation", "automatic_retry", "permission", "audit"}:
-        _link_explicit_followup_context(database, context_key, event)
+    elif event["causation"] == "audit":
+        database.execute(
+            "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?", (context_key,)
+        )
 
 
 def _promote_codex_prompt_root(
@@ -2557,6 +2885,8 @@ def _promote_codex_prompt_root(
         generation_id=str(event["generation_id"]),
         raw_prompt_digest=raw_prompt_digest,
     ):
+        return False
+    if not _context_raw_prompt_matches_business_dto(context, root_payload, appended_history):
         return False
     database.execute(
         "UPDATE managed_contexts SET root_valid = 1 WHERE context_key = ?",
@@ -2692,6 +3022,44 @@ def _codex_appended_prompt_is_verified(
             continue
         return False
     return True
+
+
+def _context_raw_prompt_matches_business_dto(
+    context: Any,
+    prompt_payload: dict[str, object],
+    appended_history: list[dict[str, object]],
+) -> bool:
+    """Reparse frozen native user text for selectorless DTOs without broad parsing."""
+
+    if not _context_uses_automatic_selection(context):
+        return True
+    if (
+        prompt_payload.get("business_dto_digest") != context["business_dto_digest"]
+        or prompt_payload.get("business_dto_rule_version") != context["business_dto_rule_version"]
+    ):
+        return False
+    raw_prompt = _codex_raw_prompt_from_appended_history(appended_history)
+    return _business_dto_goal_digest_from_raw_prompt(raw_prompt) == context["business_dto_digest"]
+
+
+def _codex_raw_prompt_from_appended_history(history: list[dict[str, object]]) -> str:
+    """Read only the already-validated first current user record."""
+
+    if not history:
+        return ""
+    first = history[0]
+    payload = first.get("payload") if first.get("type") == "response_item" else None
+    if not isinstance(payload, dict):
+        return ""
+    content = payload.get("content")
+    if (
+        not isinstance(content, list)
+        or len(content) != 1
+        or not isinstance(content[0], dict)
+        or not isinstance(content[0].get("text"), str)
+    ):
+        return ""
+    return content[0]["text"]
 
 
 def _codex_commentary_item_is_verified(item: dict[str, object]) -> bool:
@@ -2885,6 +3253,7 @@ def _reconcile_stopped_execution_activity(database: Any, suite_id: str) -> None:
         event = {key: str(value) for key, value in dict(row).items()}
         _close_execution_activity(database, event)
         _close_idle_managed_task(database, event)
+        _close_correction_binding(database, event)
 
 
 def _record_permission_context(database: Any, event: dict[str, object]) -> None:
@@ -2898,6 +3267,2211 @@ def _record_permission_context(database: Any, event: dict[str, object]) -> None:
     # The native row itself is the record.  A request is neither an allow nor a
     # denial, and no caller, actor, or retry is invented from its presence.
     reduce_managed_assessment(database, str(context["task_id"]))
+
+
+def _context_correction_declaration(database: Any, context: Any) -> dict[str, object] | None:
+    """Read the prompt-side control without accepting a tool-side substitute."""
+
+    row = database.execute(
+        "SELECT payload_json FROM managed_native_events WHERE event_id = ?",
+        (context["root_event_id"],),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row["payload_json"]))
+    except json.JSONDecodeError:
+        return {"valid": False}
+    if not isinstance(payload, dict) or "correction" not in payload:
+        return None
+    value = payload["correction"]
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        return {"valid": False}
+    return value
+
+
+def _ensure_current_request_anchor(
+    database: Any,
+    context: Any,
+    event: dict[str, object],
+    event_id: str,
+) -> bool:
+    """Persist the first valid current-turn Pre proof without promoting a root.
+
+    A correction may be a later turn in a session that already contains managed
+    business.  Its P0/P1 pair proves only this new request, so ``root_valid``
+    deliberately remains false.  Replays and later Pre callbacks reuse the
+    first durable proof rather than rescanning a growing transcript.
+    """
+
+    technical_skill_pre = event.get("technical_skill_pre") is True
+    if technical_skill_pre and _native_request_is_terminated(
+        database,
+        suite_id=str(event["suite_id"]),
+        host=str(event["host"]),
+        session_id=str(event["session_id"]),
+        generation_id=str(event["generation_id"]),
+        request_id=str(event["request_id"]),
+        tool_use_id=str(event["tool_use_id"]),
+    ):
+        return False
+    existing = database.execute(
+        """SELECT p0_event_id, pre_event_id, rule_version
+        FROM managed_request_anchors WHERE context_key = ?""",
+        (context["context_key"],),
+    ).fetchone()
+    if existing is not None:
+        return _durable_current_request_anchor_is_verified(database, context, event, existing)
+    if event["host"] not in {"codex", "workbuddy"} or event["fixture"]:
+        return False
+    if not technical_skill_pre and not event["request_from_prompt"]:
+        return False
+    if technical_skill_pre and (
+        _has_prior_workbuddy_skill_pre(database, context, event_id)
+        or _request_has_prior_tool_boundary(database, context, event_id)
+    ):
+        return False
+    prompt_row = database.execute(
+        """SELECT payload_json, host, session_id, generation_id, request_id
+        FROM managed_native_events WHERE event_id = ? AND phase = ?""",
+        (context["root_event_id"], USER_PROMPT_PHASE),
+    ).fetchone()
+    if prompt_row is None:
+        return False
+    identity = (
+        event["host"],
+        event["session_id"],
+        event["generation_id"],
+        event["request_id"],
+    )
+    if (
+        tuple(prompt_row[key] for key in ("host", "session_id", "generation_id", "request_id"))
+        != identity
+    ):
+        return False
+    try:
+        prompt_payload = json.loads(str(prompt_row["payload_json"]))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(prompt_payload, dict):
+        return False
+    raw_prompt_digest = prompt_payload.get("raw_request_digest")
+    p0_fields = _frozen_prefix_fields(prompt_payload.get("prefix"))
+    p1_fields = _frozen_prefix_fields(event.get("prefix"))
+    if not isinstance(raw_prompt_digest, str) or len(raw_prompt_digest) != 64:
+        return False
+    if p0_fields is None or p1_fields is None:
+        return False
+    p0_hash, p0_length, p0_path_hash, p0_device, p0_inode = p0_fields
+    p1_hash, p1_length, p1_path_hash, p1_device, p1_inode = p1_fields
+    if (
+        p1_length <= p0_length
+        or p0_path_hash != p1_path_hash
+        or p0_device != p1_device
+        or p0_inode != p1_inode
+    ):
+        return False
+    p1_raw = _read_frozen_prefix_buffer(event, p1_fields)
+    if p1_raw is None or hashlib.sha256(p1_raw).hexdigest() != p1_hash:
+        return False
+    if hashlib.sha256(p1_raw[:p0_length]).hexdigest() != p0_hash:
+        return False
+    try:
+        p0_history = _parse_native_history(p1_raw[:p0_length])
+        p1_history = _parse_native_history(p1_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return False
+    unresolved_history_base = {
+        "history_base",
+        "historyBase",
+        "forked_from",
+        "forkedFrom",
+        "compacted_from",
+        "compactedFrom",
+    }
+    if any(
+        _contains_unresolved_history_base(record, unresolved_history_base) for record in p1_history
+    ):
+        return False
+    appended_history = p1_history[len(p0_history) :]
+    cwd = Path(str(event["cwd"]))
+    if event["host"] == "codex":
+        anchor_rule_version = _codex_current_turn_anchor_rule_version(
+            p0_history,
+            session_id=str(event["session_id"]),
+            cwd=cwd,
+            generation_id=str(event["generation_id"]),
+            prompt_version=prompt_payload.get("client_version"),
+            pre_version=event.get("client_version"),
+        )
+        current_request_valid = (
+            anchor_rule_version is not None
+            and _codex_appended_prompt_is_verified(
+                appended_history,
+                session_id=str(event["session_id"]),
+                cwd=cwd,
+                generation_id=str(event["generation_id"]),
+                raw_prompt_digest=raw_prompt_digest,
+            )
+        )
+    elif technical_skill_pre:
+        current_request_valid = _workbuddy_skill_pre_request_is_verified(
+            p0_history,
+            appended_history,
+            session_id=str(event["session_id"]),
+            cwd=cwd,
+            request_id=str(event["request_id"]),
+            raw_prompt_digest=raw_prompt_digest,
+            prompt_payload=prompt_payload,
+            event=event,
+        )
+        anchor_rule_version = _workbuddy_anchor_rule_version(prompt_payload, current_request_valid)
+    else:
+        current_request_valid = _workbuddy_current_request_is_verified(
+            p0_history,
+            appended_history,
+            session_id=str(event["session_id"]),
+            cwd=cwd,
+            request_id=str(event["request_id"]),
+            raw_prompt_digest=raw_prompt_digest,
+        )
+        anchor_rule_version = CURRENT_REQUEST_ANCHOR_RULE_VERSION if current_request_valid else None
+    if not current_request_valid:
+        return False
+    if event["host"] == "codex" and not _context_raw_prompt_matches_business_dto(
+        context,
+        prompt_payload,
+        appended_history,
+    ):
+        return False
+    assert anchor_rule_version is not None
+    database.execute(
+        """INSERT INTO managed_request_anchors(
+        context_key, p0_event_id, pre_event_id, rule_version, created_at)
+        VALUES (?, ?, ?, ?, ?)""",
+        (
+            context["context_key"],
+            context["root_event_id"],
+            event_id,
+            anchor_rule_version,
+            records.utc_now(),
+        ),
+    )
+    if _context_uses_automatic_selection(context) and technical_skill_pre:
+        database.execute(
+            """UPDATE managed_contexts SET selected_skill = ?
+            WHERE context_key = ? AND selected_skill IS NULL""",
+            (event["skill"], context["context_key"]),
+        )
+    return True
+
+
+def _current_request_anchor_rule_is_supported(host: str, rule_version: object) -> bool:
+    """Accept durable request proofs only under their original host rule."""
+
+    if rule_version == CURRENT_REQUEST_ANCHOR_RULE_VERSION:
+        return host in {"codex", "workbuddy"}
+    if rule_version == CODEX_ALPHA11_ARG0_ANCHOR_RULE_VERSION:
+        return host == "codex"
+    return host == "workbuddy" and rule_version in {
+        WORKBUDDY_SKILL_PRE_ANCHOR_RULE_VERSION,
+        WORKBUDDY_AUTOMATIC_SKILL_PRE_ANCHOR_RULE_VERSION,
+    }
+
+
+def _has_prior_workbuddy_skill_pre(database: Any, context: Any, event_id: str) -> bool:
+    """Fence the first frozen Skill Pre against a later callback's bytes."""
+
+    rows = database.execute(
+        """SELECT event_id, payload_json FROM managed_native_events
+        WHERE suite_id = ? AND host = ? AND session_id = ? AND generation_id = ?
+          AND request_id = ? AND phase = ? AND event_id != ?""",
+        (
+            context["suite_id"],
+            context["host"],
+            context["session_id"],
+            context["generation_id"],
+            context["request_id"],
+            PRE_PHASE,
+            event_id,
+        ),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            return True
+        if isinstance(payload, dict) and payload.get("technical_skill_event") is True:
+            return True
+    return False
+
+
+def _request_has_prior_tool_boundary(database: Any, context: Any, event_id: str) -> bool:
+    """Do not establish a first technical anchor after tool activity began.
+
+    The current event is already durable when this runs.  Every other matching
+    Pre or Post row was therefore observed earlier and makes a later Skill
+    proof unusable, regardless of its tool identifier.
+    """
+
+    row = database.execute(
+        """SELECT 1 FROM managed_native_events
+        WHERE suite_id = ? AND host = ? AND session_id = ? AND generation_id = ?
+          AND request_id = ? AND event_id != ? AND phase IN (?, ?)
+        LIMIT 1""",
+        (
+            context["suite_id"],
+            context["host"],
+            context["session_id"],
+            context["generation_id"],
+            context["request_id"],
+            event_id,
+            PRE_PHASE,
+            POST_PHASE,
+        ),
+    ).fetchone()
+    return row is not None
+
+
+def _durable_current_request_anchor_is_verified(
+    database: Any,
+    context: Any,
+    event: dict[str, object],
+    anchor: Any,
+) -> bool:
+    """Validate the immutable native facts referenced by one persisted anchor.
+
+    Reuse never rescans a transcript that may have grown.  It only checks the
+    recorded prompt and Pre identities that originally established this exact
+    context and rule.
+    """
+
+    pre_event_id = anchor["pre_event_id"]
+    p0_event_id = anchor["p0_event_id"]
+    rule_version = anchor["rule_version"]
+    if (
+        not isinstance(pre_event_id, str)
+        or not pre_event_id
+        or not isinstance(p0_event_id, str)
+        or p0_event_id != context["root_event_id"]
+        or not _current_request_anchor_rule_is_supported(str(context["host"]), rule_version)
+    ):
+        return False
+    if any(
+        event[key] != context[key]
+        for key in ("suite_id", "host", "session_id", "generation_id", "request_id")
+    ):
+        return False
+    rows = database.execute(
+        """SELECT event_id, payload_json, suite_id, host, session_id, generation_id,
+                  request_id, phase
+        FROM managed_native_events
+        WHERE event_id IN (?, ?)""",
+        (p0_event_id, pre_event_id),
+    ).fetchall()
+    if len(rows) != 2:
+        return False
+    rows_by_id = {row["event_id"]: row for row in rows}
+    prompt_row = rows_by_id.get(p0_event_id)
+    pre_row = rows_by_id.get(pre_event_id)
+    if prompt_row is None or pre_row is None:
+        return False
+    expected_scope = tuple(
+        context[key] for key in ("suite_id", "host", "session_id", "generation_id", "request_id")
+    )
+    for row in (prompt_row, pre_row):
+        row_scope = tuple(
+            row[key] for key in ("suite_id", "host", "session_id", "generation_id", "request_id")
+        )
+        if row_scope != expected_scope:
+            return False
+    if prompt_row["phase"] != USER_PROMPT_PHASE or pre_row["phase"] != PRE_PHASE:
+        return False
+    try:
+        prompt_payload = json.loads(str(prompt_row["payload_json"]))
+        pre_payload = json.loads(str(pre_row["payload_json"]))
+    except json.JSONDecodeError:
+        return False
+    if (
+        not isinstance(prompt_payload, dict)
+        or not isinstance(pre_payload, dict)
+        or prompt_payload.get("source") != "native-collector"
+        or pre_payload.get("source") != "native-collector"
+    ):
+        return False
+    if rule_version in {
+        WORKBUDDY_SKILL_PRE_ANCHOR_RULE_VERSION,
+        WORKBUDDY_AUTOMATIC_SKILL_PRE_ANCHOR_RULE_VERSION,
+    }:
+        workbuddy_boundary_is_valid = (
+            context["host"] == "workbuddy"
+            and _workbuddy_client_versions_are_supported_and_equal(
+                prompt_payload.get("client_version"),
+                pre_payload.get("client_version"),
+                event.get("client_version"),
+            )
+            and pre_payload.get("action") == "technical_skill"
+            and pre_payload.get("technical_skill_event") is True
+            and pre_payload.get("technical_skill_pre") is True
+            and pre_payload.get("technical_skill_valid") is True
+        )
+        if not workbuddy_boundary_is_valid:
+            return False
+        if rule_version == WORKBUDDY_AUTOMATIC_SKILL_PRE_ANCHOR_RULE_VERSION:
+            return (
+                _context_uses_automatic_selection(context)
+                and prompt_payload.get("skill") == ""
+                and prompt_payload.get("business_dto_digest") == context["business_dto_digest"]
+                and prompt_payload.get("business_dto_rule_version")
+                == context["business_dto_rule_version"]
+                and pre_payload.get("skill") == context["selected_skill"]
+            )
+        return (
+            context["input_skill"]
+            and prompt_payload.get("skill") == context["input_skill"]
+            and pre_payload.get("skill") == context["input_skill"]
+        )
+    return (
+        pre_payload.get("technical_skill_event") is not True
+        and pre_payload.get("request_from_prompt") is True
+    )
+
+
+def _context_has_unusable_technical_skill_pre(
+    database: Any, context: Any, event: dict[str, object]
+) -> bool:
+    """Fence every business receipt after an unusable first Skill boundary."""
+
+    rows = database.execute(
+        """SELECT event_id, payload_json FROM managed_native_events
+        WHERE suite_id = ? AND host = ? AND session_id = ? AND generation_id = ?
+          AND request_id = ? AND phase = ?
+        ORDER BY rowid""",
+        (
+            context["suite_id"],
+            context["host"],
+            context["session_id"],
+            context["generation_id"],
+            context["request_id"],
+            PRE_PHASE,
+        ),
+    ).fetchall()
+    first_skill_event_id: str | None = None
+    for row in rows:
+        try:
+            payload = json.loads(str(row["payload_json"]))
+        except json.JSONDecodeError:
+            return True
+        if isinstance(payload, dict) and payload.get("technical_skill_event") is True:
+            first_skill_event_id = str(row["event_id"])
+            break
+    if first_skill_event_id is None:
+        return False
+    anchor = database.execute(
+        """SELECT p0_event_id, pre_event_id, rule_version
+        FROM managed_request_anchors WHERE context_key = ?""",
+        (context["context_key"],),
+    ).fetchone()
+    return (
+        anchor is None
+        or anchor["pre_event_id"] != first_skill_event_id
+        or not _durable_current_request_anchor_is_verified(database, context, event, anchor)
+    )
+
+
+def _workbuddy_current_request_is_verified(
+    p0_history: list[dict[str, object]],
+    appended_history: list[dict[str, object]],
+    *,
+    session_id: str,
+    cwd: Path,
+    request_id: str,
+    raw_prompt_digest: str,
+) -> bool:
+    """Bind one WorkBuddy user message to its callback without promoting a root.
+
+    A WorkBuddy correction follows existing session history, so P0 can contain
+    earlier business records.  P0 proves only the frozen native path/session
+    scope; P1 must add exactly the observed user-message serializer form whose
+    text bytes match the callback's original raw prompt digest.
+    """
+
+    if not p0_history or len(appended_history) != 1:
+        return False
+    if not all(
+        _workbuddy_history_record_matches_scope(record, session_id, cwd) for record in p0_history
+    ):
+        return False
+    record = appended_history[0]
+    if not _workbuddy_history_record_matches_scope(record, session_id, cwd):
+        return False
+    if record.get("type") != "message" or record.get("role") != "user":
+        return False
+    content = record.get("content")
+    if (
+        not isinstance(content, list)
+        or len(content) != 1
+        or not isinstance(content[0], dict)
+        or set(content[0]) != {"type", "text"}
+        or content[0].get("type") != "input_text"
+        or not isinstance(content[0].get("text"), str)
+    ):
+        return False
+    provider = record.get("providerData")
+    if (
+        not isinstance(provider, dict)
+        or provider.get("startsNewUserRequest") is not True
+        or provider.get("conversationRequestId") != request_id
+    ):
+        return False
+    return hashlib.sha256(content[0]["text"].encode("utf-8")).hexdigest() == raw_prompt_digest
+
+
+def _workbuddy_client_versions_are_supported_and_equal(*versions: object) -> bool:
+    """Require one explicit WorkBuddy release across a durable request boundary."""
+
+    if not versions or any(not isinstance(version, str) for version in versions):
+        return False
+    if any(version not in WORKBUDDY_SUPPORTED_CLIENT_VERSIONS for version in versions):
+        return False
+    return len(set(versions)) == 1
+
+
+def _context_uses_automatic_selection(context: Any) -> bool:
+    """Recognize only a newly persisted selectorless, structured request."""
+
+    return (
+        context["input_skill"] == ""
+        and isinstance(context["business_dto_digest"], str)
+        and _is_sha256_digest(context["business_dto_digest"])
+        and context["business_dto_rule_version"] == BUSINESS_DTO_RULE_VERSION
+    )
+
+
+def _workbuddy_anchor_rule_version(
+    prompt_payload: dict[str, object], current_request_valid: bool
+) -> str | None:
+    """Keep explicit and selectorless Skill Pre proofs independently versioned."""
+
+    if not current_request_valid:
+        return None
+    if prompt_payload.get("skill") == "":
+        if (
+            isinstance(prompt_payload.get("business_dto_digest"), str)
+            and prompt_payload.get("business_dto_rule_version") == BUSINESS_DTO_RULE_VERSION
+        ):
+            return WORKBUDDY_AUTOMATIC_SKILL_PRE_ANCHOR_RULE_VERSION
+        return None
+    return WORKBUDDY_SKILL_PRE_ANCHOR_RULE_VERSION
+
+
+def _workbuddy_skill_pre_request_is_verified(
+    p0_history: list[dict[str, object]],
+    appended_history: list[dict[str, object]],
+    *,
+    session_id: str,
+    cwd: Path,
+    request_id: str,
+    raw_prompt_digest: str,
+    prompt_payload: dict[str, object],
+    event: dict[str, object],
+) -> bool:
+    """Verify the finite pending-``Skill`` serializer for supported WorkBuddy versions.
+
+    This rule proves that the current user request reached a pending native
+    Skill call.  It deliberately does not infer an executable path, a Skill
+    result, or a discovery outcome.
+    """
+
+    event_version = event.get("client_version")
+    prompt_version = prompt_payload.get("client_version")
+    if (
+        event.get("host") != "workbuddy"
+        or event.get("surface") != "WorkBuddy"
+        or prompt_payload.get("surface") != "WorkBuddy"
+        or not _workbuddy_client_versions_are_supported_and_equal(
+            prompt_version,
+            event_version,
+        )
+        or event.get("technical_skill_event") is not True
+        or event.get("technical_skill_pre") is not True
+        or event.get("technical_skill_valid") is not True
+        or event.get("session_id") != session_id
+        or event.get("request_id") != request_id
+        or event.get("cwd") != str(cwd)
+    ):
+        return False
+    prompt_skill = prompt_payload.get("skill")
+    prompt_request_digest = prompt_payload.get("request_digest")
+    prompt_correction = prompt_payload.get("correction")
+    prompt_is_automatic = prompt_skill == ""
+    if not isinstance(prompt_skill, str):
+        return False
+    if prompt_is_automatic:
+        if (
+            not isinstance(prompt_payload.get("business_dto_digest"), str)
+            or prompt_payload.get("business_dto_rule_version") != BUSINESS_DTO_RULE_VERSION
+            or not isinstance(event.get("skill"), str)
+            or not event["skill"]
+        ):
+            return False
+    elif (
+        not prompt_skill
+        or event.get("skill") != prompt_skill
+        or event.get("request_digest") != prompt_request_digest
+        or event.get("correction") != prompt_correction
+    ):
+        return False
+    expected_args_digest = event.get("technical_skill_args_digest")
+    if (
+        not isinstance(expected_args_digest, str)
+        or not _is_sha256_digest(expected_args_digest)
+        or len(appended_history) not in {4, 5, 6}
+        or not p0_history
+        or not all(
+            _workbuddy_history_record_matches_scope(record, session_id, cwd)
+            for record in p0_history
+        )
+    ):
+        return False
+    user_record = appended_history[0]
+    snapshot_record = appended_history[1]
+    current_index = 2
+    title_record: dict[str, object] | None = None
+    candidate_title = appended_history[current_index]
+    if isinstance(candidate_title, dict) and candidate_title.get("type") == "ai-title":
+        title_record = candidate_title
+        current_index += 1
+    if current_index >= len(appended_history):
+        return False
+    reasoning_record = appended_history[current_index]
+    current_index += 1
+
+    assistant_record: dict[str, object] | None = None
+    if current_index < len(appended_history):
+        candidate_assistant = appended_history[current_index]
+        if isinstance(candidate_assistant, dict) and candidate_assistant.get("type") == "message":
+            assistant_record = candidate_assistant
+            current_index += 1
+    if current_index != len(appended_history) - 1:
+        return False
+    call_record = appended_history[current_index]
+    if not _workbuddy_user_message_is_verified(
+        user_record,
+        session_id=session_id,
+        cwd=cwd,
+        request_id=request_id,
+        raw_prompt_digest=raw_prompt_digest,
+    ):
+        return False
+    user_id = user_record.get("id")
+    if (
+        not isinstance(user_id, str)
+        or not user_id
+        or not _workbuddy_record_has_explicit_scope(user_record, session_id, cwd)
+    ):
+        return False
+    if _workbuddy_initial_metadata_history_is_verified(p0_history, session_id, cwd):
+        if "parentId" in user_record:
+            return False
+    else:
+        p0_tail_id = p0_history[-1].get("id")
+        if (
+            not isinstance(p0_tail_id, str)
+            or not p0_tail_id
+            or user_record.get("parentId") != p0_tail_id
+        ):
+            return False
+    callback_message_ids = (prompt_payload.get("message_id"), event.get("message_id"))
+    if any(
+        message_id not in {None, ""} and message_id != user_id
+        for message_id in callback_message_ids
+    ):
+        return False
+    if not _workbuddy_file_history_snapshot_is_verified(
+        snapshot_record,
+        user_id=user_id,
+        cwd=cwd,
+    ):
+        return False
+    if title_record is not None and not _workbuddy_ai_title_is_verified(
+        title_record, session_id, cwd
+    ):
+        return False
+    if not isinstance(reasoning_record, dict) or not _workbuddy_record_has_explicit_scope(
+        reasoning_record, session_id, cwd
+    ):
+        return False
+    reasoning_id = reasoning_record.get("id")
+    reasoning_identity = _workbuddy_model_identity(reasoning_record, request_id)
+    reasoning_message_id = reasoning_identity[0] if reasoning_identity is not None else None
+    if (
+        reasoning_record.get("type") != "reasoning"
+        or not isinstance(reasoning_id, str)
+        or not reasoning_id
+        or reasoning_id == user_id
+        or reasoning_record.get("parentId") != user_id
+        or reasoning_message_id is None
+        or reasoning_message_id == user_id
+    ):
+        return False
+    assistant_id: str | None = None
+    reasoning_step_sequence = _workbuddy_model_step_sequence(reasoning_record)
+    if assistant_record is not None:
+        assistant_id = _workbuddy_assistant_text_is_verified(
+            assistant_record,
+            session_id=session_id,
+            cwd=cwd,
+            request_id=request_id,
+            reasoning_id=reasoning_id,
+            reasoning_identity=reasoning_identity,
+            reasoning_step_sequence=reasoning_step_sequence,
+        )
+        if assistant_id is None:
+            return False
+
+    if not isinstance(call_record, dict) or not _workbuddy_record_has_explicit_scope(
+        call_record, session_id, cwd
+    ):
+        return False
+    call_id = call_record.get("id")
+    call_tool_id = call_record.get("callId")
+    call_identity = _workbuddy_model_identity(call_record, request_id)
+    call_message_id = call_identity[0] if call_identity is not None else None
+    call_parent_id = assistant_id or reasoning_id
+    call_matches_model_turn = call_identity == reasoning_identity
+    if assistant_id is not None:
+        call_matches_model_turn = (
+            call_matches_model_turn
+            and reasoning_step_sequence is not None
+            and _workbuddy_model_step_sequence(call_record) == reasoning_step_sequence
+        )
+    if (
+        call_record.get("type") != "function_call"
+        or call_record.get("name") != "Skill"
+        or not isinstance(call_id, str)
+        or not call_id
+        or call_id in {user_id, reasoning_id, assistant_id}
+        or not isinstance(call_tool_id, str)
+        or not call_tool_id
+        or call_tool_id != event.get("tool_use_id")
+        or call_record.get("parentId") != call_parent_id
+        or "status" in call_record
+        or call_message_id is None
+        or not call_matches_model_turn
+    ):
+        return False
+    current_records = [user_record, reasoning_record, call_record]
+    if title_record is not None:
+        current_records.append(title_record)
+    if assistant_record is not None:
+        current_records.append(assistant_record)
+    if not _workbuddy_native_ids_are_unique(p0_history, current_records):
+        return False
+    if _workbuddy_p0_call_id_is_reused(p0_history, call_tool_id):
+        return False
+    if prompt_is_automatic:
+        raw_prompt = _workbuddy_user_raw_prompt(user_record)
+        if raw_prompt is None:
+            return False
+        expected_business_digest = prompt_payload["business_dto_digest"]
+        if _business_dto_goal_digest_from_raw_prompt(raw_prompt) != expected_business_digest:
+            return False
+        return _workbuddy_skill_call_matches_business_dto(
+            call_record,
+            skill=str(event["skill"]),
+            business_dto_digest=expected_business_digest,
+            correction=prompt_correction,
+            args_digest=expected_args_digest,
+        )
+    return _workbuddy_skill_call_matches_request(
+        call_record,
+        skill=prompt_skill,
+        request_digest=str(prompt_request_digest),
+        correction=prompt_correction,
+        args_digest=expected_args_digest,
+    )
+
+
+def _workbuddy_user_message_is_verified(
+    record: object,
+    *,
+    session_id: str,
+    cwd: Path,
+    request_id: str,
+    raw_prompt_digest: str,
+    message_id: str | None = None,
+) -> bool:
+    """Bind one current WorkBuddy user record to the callback's raw prompt."""
+
+    if not _workbuddy_history_record_matches_scope(record, session_id, cwd):
+        return False
+    if (
+        not isinstance(record, dict)
+        or record.get("type") != "message"
+        or record.get("role") != "user"
+    ):
+        return False
+    if message_id is not None and record.get("id") != message_id:
+        return False
+    content = record.get("content")
+    if (
+        not isinstance(content, list)
+        or len(content) != 1
+        or not isinstance(content[0], dict)
+        or set(content[0]) != {"type", "text"}
+        or content[0].get("type") != "input_text"
+        or not isinstance(content[0].get("text"), str)
+    ):
+        return False
+    provider = record.get("providerData")
+    if (
+        not isinstance(provider, dict)
+        or provider.get("startsNewUserRequest") is not True
+        or provider.get("conversationRequestId") != request_id
+    ):
+        return False
+    raw_prompt = _workbuddy_user_raw_prompt(record)
+    return (
+        raw_prompt is not None
+        and hashlib.sha256(raw_prompt.encode("utf-8")).hexdigest() == raw_prompt_digest
+    )
+
+
+def _workbuddy_user_raw_prompt(record: object) -> str | None:
+    """Extract the raw prompt only from the exact observed hidden-context envelope."""
+
+    if not isinstance(record, dict):
+        return None
+    content = record.get("content")
+    if (
+        not isinstance(content, list)
+        or len(content) != 1
+        or not isinstance(content[0], dict)
+        or content[0].get("type") != "input_text"
+        or not isinstance(content[0].get("text"), str)
+    ):
+        return None
+    return _workbuddy_user_envelope_raw_prompt(content[0]["text"])
+
+
+def _workbuddy_user_envelope_matches_raw_prompt(text: str, raw_prompt_digest: str) -> bool:
+    """Verify the one observed WorkBuddy hidden-context envelope without decoding it."""
+
+    raw_prompt = _workbuddy_user_envelope_raw_prompt(text)
+    return (
+        raw_prompt is not None
+        and hashlib.sha256(raw_prompt.encode("utf-8")).hexdigest() == raw_prompt_digest
+    )
+
+
+def _workbuddy_user_envelope_raw_prompt(text: str) -> str | None:
+    """Decode no data: return only the final raw user-query segment when exact."""
+
+    context_open = '<system-reminder data-role="user-context">\n'
+    additional_open = '\n</system-reminder>\n<system-reminder data-role="additional-data">\n'
+    query_open = "\n</system-reminder>\n<user_query>"
+    query_close = "</user_query>"
+    if not text.startswith(context_open) or not text.endswith(query_close):
+        return None
+    remaining = text[len(context_open) : -len(query_close)]
+    if remaining.count(additional_open) != 1:
+        return None
+    opaque_context, remaining = remaining.split(additional_open, 1)
+    if remaining.count(query_open) != 1:
+        return None
+    opaque_additional, raw_prompt = remaining.split(query_open, 1)
+    structural_markers = (
+        "<system-reminder",
+        "</system-reminder",
+        "<user_query",
+        "</user_query",
+    )
+    if any(
+        marker in value
+        for value in (opaque_context, opaque_additional, raw_prompt)
+        for marker in structural_markers
+    ):
+        return None
+    return raw_prompt
+
+
+def _workbuddy_initial_metadata_history_is_verified(
+    history: list[dict[str, object]], session_id: str, cwd: Path
+) -> bool:
+    """Recognize only the existing metadata-only initial WorkBuddy profile."""
+
+    if not history or not all(record.get("type") == "session-meta" for record in history):
+        return False
+    if not all(
+        _workbuddy_history_record_matches_scope(record, session_id, cwd) for record in history
+    ):
+        return False
+    try:
+        prefix = b"".join(
+            (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+            for record in history
+        )
+    except (TypeError, ValueError):
+        return False
+    return _metadata_only_prefix(
+        prefix,
+        host="workbuddy",
+        session_id=session_id,
+        cwd=cwd,
+    )
+
+
+def _workbuddy_assistant_text_is_verified(
+    record: dict[str, object],
+    *,
+    session_id: str,
+    cwd: Path,
+    request_id: str,
+    reasoning_id: str,
+    reasoning_identity: tuple[str, str],
+    reasoning_step_sequence: int | None,
+) -> str | None:
+    """Verify the one observed completed assistant text record between model and Skill."""
+
+    expected_fields = {
+        "_meta",
+        "content",
+        "cwd",
+        "id",
+        "parentId",
+        "providerData",
+        "role",
+        "sessionId",
+        "status",
+        "timestamp",
+        "type",
+    }
+    if set(record) != expected_fields:
+        return None
+    identifier = record.get("id")
+    timestamp = record.get("timestamp")
+    metadata = record.get("_meta")
+    provider = record.get("providerData")
+    content = record.get("content")
+    expected_provider_fields = {
+        "agent",
+        "conversationRequestId",
+        "messageId",
+        "model",
+        "requestModelId",
+        "requestModelName",
+        "stepSeq",
+        "traceId",
+    }
+    string_provider_fields = expected_provider_fields - {"stepSeq"}
+    if (
+        not isinstance(identifier, str)
+        or not identifier
+        or record.get("type") != "message"
+        or record.get("role") != "assistant"
+        or record.get("status") != "completed"
+        or record.get("parentId") != reasoning_id
+        or record.get("sessionId") != session_id
+        or record.get("cwd") != str(cwd)
+        or type(timestamp) is not int
+        or not isinstance(metadata, dict)
+        or set(metadata) != {"baggage", "traceparent"}
+        or not all(isinstance(value, str) and value for value in metadata.values())
+        or not isinstance(provider, dict)
+        or set(provider) != expected_provider_fields
+        or not all(
+            isinstance(provider.get(field), str) and provider[field]
+            for field in string_provider_fields
+        )
+        or type(provider.get("stepSeq")) is not int
+        or not isinstance(content, list)
+        or len(content) != 1
+        or not isinstance(content[0], dict)
+        or set(content[0]) != {"providerData", "text", "type"}
+        or content[0].get("type") != "output_text"
+        or not isinstance(content[0].get("text"), str)
+    ):
+        return None
+    content_provider = content[0].get("providerData")
+    if (
+        not isinstance(content_provider, dict)
+        or set(content_provider) != {"annotations"}
+        or content_provider.get("annotations") != []
+        or _workbuddy_model_identity(record, request_id) != reasoning_identity
+        or reasoning_step_sequence is None
+        or _workbuddy_model_step_sequence(record) != reasoning_step_sequence
+    ):
+        return None
+    return identifier
+
+
+def _workbuddy_file_history_snapshot_is_verified(
+    record: object,
+    *,
+    user_id: str,
+    cwd: Path,
+) -> bool:
+    """Verify the observed snapshot form without treating it as a business event."""
+
+    if not isinstance(record, dict):
+        return False
+    expected_fields = {
+        "_meta",
+        "cwd",
+        "isSnapshotUpdate",
+        "messageId",
+        "snapshot",
+        "timestamp",
+        "type",
+    }
+    if set(record) != expected_fields:
+        return False
+    timestamp = record.get("timestamp")
+    metadata = record.get("_meta")
+    snapshot = record.get("snapshot")
+    metadata_is_valid = (
+        isinstance(metadata, dict)
+        and set(metadata) == {"baggage", "traceparent"}
+        and all(isinstance(value, str) and value for value in metadata.values())
+    )
+    snapshot_is_valid = (
+        isinstance(snapshot, dict)
+        and set(snapshot) == {"messageId", "trackedFileBackups"}
+        and snapshot.get("messageId") == user_id
+        and snapshot.get("trackedFileBackups") == {}
+    )
+    return (
+        record.get("type") == "file-history-snapshot"
+        and record.get("messageId") == user_id
+        and record.get("cwd") == str(cwd)
+        and type(timestamp) is int
+        and type(record.get("isSnapshotUpdate")) is bool
+        and metadata_is_valid
+        and snapshot_is_valid
+    )
+
+
+def _workbuddy_ai_title_is_verified(record: dict[str, object], session_id: str, cwd: Path) -> bool:
+    """Accept one observed title metadata record between snapshot and reasoning."""
+
+    if set(record) != {"id", "type", "aiTitle", "timestamp", "sessionId", "cwd", "_meta"}:
+        return False
+    identifier = record.get("id")
+    timestamp = record.get("timestamp")
+    metadata = record.get("_meta")
+    return (
+        isinstance(identifier, str)
+        and bool(identifier)
+        and record.get("type") == "ai-title"
+        and isinstance(record.get("aiTitle"), str)
+        and type(timestamp) is int
+        and record.get("sessionId") == session_id
+        and record.get("cwd") == str(cwd)
+        and isinstance(metadata, dict)
+        and set(metadata) == {"baggage", "traceparent"}
+        and all(isinstance(value, str) and value for value in metadata.values())
+    )
+
+
+def _workbuddy_native_ids_are_unique(
+    p0_history: list[dict[str, object]], current_records: list[dict[str, object]]
+) -> bool:
+    """Keep current native identities distinct from every frozen P0 record."""
+
+    p0_ids: set[str] = set()
+    for record in p0_history:
+        if "id" not in record:
+            continue
+        identifier = record["id"]
+        if not isinstance(identifier, str) or not identifier or identifier in p0_ids:
+            return False
+        p0_ids.add(identifier)
+    current_ids: set[str] = set()
+    for record in current_records:
+        identifier = record.get("id")
+        if (
+            not isinstance(identifier, str)
+            or not identifier
+            or identifier in p0_ids
+            or identifier in current_ids
+        ):
+            return False
+        current_ids.add(identifier)
+    return True
+
+
+def _workbuddy_p0_call_id_is_reused(p0_history: list[dict[str, object]], call_id: str) -> bool:
+    """Reject only a current Skill call that reuses an earlier call/result ID."""
+
+    return any(
+        record.get("type") in {"function_call", "function_call_result"}
+        and record.get("callId") == call_id
+        for record in p0_history
+    )
+
+
+def _workbuddy_record_has_explicit_scope(
+    record: dict[str, object], session_id: str, cwd: Path
+) -> bool:
+    """Require the native request scope on current user/model/tool records."""
+
+    return record.get("sessionId") == session_id and record.get("cwd") == str(cwd)
+
+
+def _workbuddy_model_identity(record: dict[str, object], request_id: str) -> tuple[str, str] | None:
+    """Read the independent model message and model identities from one record."""
+
+    provider = record.get("providerData")
+    if not isinstance(provider, dict) or provider.get("conversationRequestId") != request_id:
+        return None
+    message_id = provider.get("messageId")
+    model = provider.get("model")
+    if not isinstance(message_id, str) or not message_id:
+        return None
+    if not isinstance(model, str) or not model:
+        return None
+    return message_id, model
+
+
+def _workbuddy_model_step_sequence(record: dict[str, object]) -> int | None:
+    """Read the observed integer model step shared by assistant-text Skill turns."""
+
+    provider = record.get("providerData")
+    if not isinstance(provider, dict):
+        return None
+    step_sequence = provider.get("stepSeq")
+    return step_sequence if type(step_sequence) is int else None
+
+
+def _workbuddy_skill_call_matches_request(
+    record: dict[str, object],
+    *,
+    skill: str,
+    request_digest: str,
+    correction: object,
+    args_digest: str,
+) -> bool:
+    arguments = record.get("arguments")
+    if not isinstance(arguments, str):
+        return False
+    try:
+        call_input = json.loads(arguments)
+    except json.JSONDecodeError:
+        return False
+    if (
+        not isinstance(call_input, dict)
+        or set(call_input) != {"skill", "args"}
+        or call_input.get("skill") != skill
+        or not isinstance(call_input.get("args"), str)
+    ):
+        return False
+    args = call_input["args"]
+    if hashlib.sha256(args.encode("utf-8")).hexdigest() != args_digest:
+        return False
+    try:
+        parsed_input, end = json.JSONDecoder().raw_decode(args)
+    except json.JSONDecodeError:
+        return False
+    if end != len(args) or not isinstance(parsed_input, dict):
+        return False
+    business_input = dict(parsed_input)
+    has_correction = "selc" in business_input
+    correction_value = business_input.pop("selc") if has_correction else None
+    call_correction = _workbuddy_raw_correction_declaration(correction_value, has_correction)
+    try:
+        call_digest = hashlib.sha256(
+            canonical_json({"skill": skill, "input": business_input}).encode("utf-8")
+        ).hexdigest()
+    except (TypeError, ValueError):
+        return False
+    return call_digest == request_digest and call_correction == correction
+
+
+def _workbuddy_skill_call_matches_business_dto(
+    record: dict[str, object],
+    *,
+    skill: str,
+    business_dto_digest: str,
+    correction: object,
+    args_digest: str,
+) -> bool:
+    """Bind selectorless raw Skill arguments to the Prompt's fixed DTO goal."""
+
+    arguments = record.get("arguments")
+    if not isinstance(arguments, str):
+        return False
+    try:
+        call_input = json.loads(arguments)
+    except json.JSONDecodeError:
+        return False
+    if (
+        not isinstance(call_input, dict)
+        or set(call_input) != {"skill", "args"}
+        or call_input.get("skill") != skill
+        or not isinstance(call_input.get("args"), str)
+    ):
+        return False
+    args = call_input["args"]
+    if hashlib.sha256(args.encode("utf-8")).hexdigest() != args_digest:
+        return False
+    if _business_dto_goal_digest_from_raw_prompt(args) != business_dto_digest:
+        return False
+    try:
+        parsed_input, end = json.JSONDecoder().raw_decode(args)
+    except json.JSONDecodeError:
+        return False
+    if end != len(args) or not isinstance(parsed_input, dict):
+        return False
+    has_correction = "selc" in parsed_input
+    call_correction = _workbuddy_raw_correction_declaration(
+        parsed_input.get("selc"), has_correction
+    )
+    return call_correction == correction
+
+
+def _workbuddy_raw_correction_declaration(
+    value: object,
+    present: bool,
+) -> dict[str, object] | None:
+    """Normalize only the raw ``selc`` object carried inside Skill arguments."""
+
+    if not present:
+        return None
+    if not isinstance(value, dict) or set(value) != {"intent", "target", "preserve_goal"}:
+        return {"valid": False}
+    if (
+        value.get("intent") != "correct_delivery"
+        or not isinstance(value.get("target"), str)
+        or not value["target"]
+        or value.get("preserve_goal") is not True
+    ):
+        return {"valid": False}
+    return {
+        "intent": "correct_delivery",
+        "target": value["target"],
+        "preserve_goal": True,
+        "valid": True,
+    }
+
+
+def _business_dto_goal_digest_from_raw_prompt(raw_prompt: str) -> str | None:
+    """Parse one complete JSON DTO without accepting surrounding prompt text."""
+
+    try:
+        dto, end = json.JSONDecoder().raw_decode(raw_prompt)
+    except json.JSONDecodeError:
+        return None
+    if end != len(raw_prompt):
+        return None
+    return _business_dto_goal_digest(dto)
+
+
+def _workbuddy_history_record_matches_scope(
+    record: object,
+    session_id: str,
+    cwd: Path,
+) -> bool:
+    """Reject a conflicting native scope while leaving prior business opaque."""
+
+    if not isinstance(record, dict):
+        return False
+    record_session = record.get("sessionId")
+    if record_session is not None and record_session != session_id:
+        return False
+    record_cwd = record.get("cwd")
+    return record_cwd is None or record_cwd == str(cwd)
+
+
+def _codex_current_turn_suffix_is_verified(
+    history: list[dict[str, object]],
+    *,
+    session_id: str,
+    cwd: Path,
+    generation_id: str,
+) -> bool:
+    """Accept only the observed resumed-turn initializer after prior history.
+
+    Earlier records may describe closed business work.  They cannot be reused
+    as a new root, and the current suffix must not include the initial-only
+    developer/settings records or another user/business item.
+    """
+
+    start_indexes = [
+        index
+        for index, record in enumerate(history)
+        if record.get("type") == "event_msg"
+        and isinstance(record.get("payload"), dict)
+        and record["payload"].get("type") == "task_started"
+        and _codex_initial_event_is_verified(record["payload"], generation_id, session_id)
+    ]
+    if len(start_indexes) != 1:
+        return False
+    suffix = history[start_indexes[0] :]
+    if len(suffix) != 4:
+        return False
+    task_started, environment_context, world_state, turn_context = suffix
+    if not _codex_initial_event_is_verified(task_started.get("payload"), generation_id, session_id):
+        return False
+    environment_payload = environment_context.get("payload")
+    environment_metadata = (
+        environment_payload.get("internal_chat_message_metadata_passthrough")
+        if isinstance(environment_payload, dict)
+        else None
+    )
+    if (
+        environment_context.get("type") != "response_item"
+        or not isinstance(environment_payload, dict)
+        or environment_payload.get("type") != "message"
+        or environment_payload.get("role") != "user"
+        or not isinstance(environment_metadata, dict)
+        or environment_metadata.get("turn_id") != generation_id
+        or environment_metadata.get("content_item_kinds") != ["environments.environment_context"]
+        or not _codex_record_cwd_is_current(environment_context, cwd)
+    ):
+        return False
+    return (
+        world_state.get("type") == "world_state"
+        and _codex_world_state_is_verified(world_state.get("payload"))
+        and turn_context.get("type") == "turn_context"
+        and _codex_turn_context_is_verified(turn_context.get("payload"), generation_id, cwd)
+    )
+
+
+def _codex_current_turn_anchor_rule_version(
+    history: list[dict[str, object]],
+    *,
+    session_id: str,
+    cwd: Path,
+    generation_id: str,
+    prompt_version: object,
+    pre_version: object,
+) -> str | None:
+    """Select the exact durable rule that proved this Codex current turn.
+
+    The original full-world-state shape remains the v2 proof.  Alpha.11 has a
+    separately observed continuation shape that changes only Codex's temporary
+    ``arg0`` path.  A pre-existing proof is never reclassified by this helper.
+    """
+
+    if _codex_current_turn_suffix_is_verified(
+        history,
+        session_id=session_id,
+        cwd=cwd,
+        generation_id=generation_id,
+    ):
+        return CURRENT_REQUEST_ANCHOR_RULE_VERSION
+    if prompt_version != CODEX_ALPHA11_ARG0_VERSION or pre_version != CODEX_ALPHA11_ARG0_VERSION:
+        return None
+    if not _codex_alpha11_session_metadata_is_verified(history, session_id, cwd):
+        return None
+    if not _codex_alpha11_current_turn_delta_is_verified(
+        history,
+        session_id=session_id,
+        cwd=cwd,
+        generation_id=generation_id,
+    ):
+        return None
+    return CODEX_ALPHA11_ARG0_ANCHOR_RULE_VERSION
+
+
+def _codex_alpha11_session_metadata_is_verified(
+    history: list[dict[str, object]],
+    session_id: str,
+    cwd: Path,
+) -> bool:
+    """Verify the one alpha.11 session record frozen with the current request."""
+
+    metadata_records = [record for record in history if record.get("type") == "session_meta"]
+    if len(metadata_records) != 1:
+        return False
+    metadata = metadata_records[0].get("payload")
+    if not isinstance(metadata, dict):
+        return False
+    identities = {
+        value
+        for key in ("id", "session_id")
+        if isinstance((value := metadata.get(key)), str) and value
+    }
+    return (
+        identities == {session_id}
+        and metadata.get("cwd") == str(cwd)
+        and metadata.get("cli_version") == CODEX_ALPHA11_ARG0_VERSION
+    )
+
+
+def _codex_alpha11_current_turn_delta_is_verified(
+    history: list[dict[str, object]],
+    *,
+    session_id: str,
+    cwd: Path,
+    generation_id: str,
+) -> bool:
+    """Verify alpha.11's closed-world arg0 replacement without reducing deltas."""
+
+    start_indexes = [
+        index
+        for index, record in enumerate(history)
+        if record.get("type") == "event_msg"
+        and isinstance(record.get("payload"), dict)
+        and record["payload"].get("type") == "task_started"
+        and _codex_initial_event_is_verified(record["payload"], generation_id, session_id)
+    ]
+    if len(start_indexes) != 1:
+        return False
+    start_index = start_indexes[0]
+    suffix = history[start_index:]
+    if len(suffix) != 4:
+        return False
+    task_started, environment_context, world_state, turn_context = suffix
+    if not _codex_initial_event_is_verified(task_started.get("payload"), generation_id, session_id):
+        return False
+    if not _codex_current_environment_context_is_verified(
+        environment_context,
+        generation_id=generation_id,
+        cwd=cwd,
+    ):
+        return False
+    if (
+        world_state.get("type") != "world_state"
+        or not _codex_alpha11_delta_world_state_is_verified(world_state.get("payload"))
+        or turn_context.get("type") != "turn_context"
+        or not _codex_turn_context_is_verified(turn_context.get("payload"), generation_id, cwd)
+    ):
+        return False
+
+    baseline = _codex_alpha11_latest_full_world_state(history[:start_index])
+    if baseline is None:
+        return False
+    baseline_index, previous_filesystem = baseline
+    for record in history[baseline_index + 1 :]:
+        if record.get("type") != "world_state":
+            continue
+        current_filesystem = _codex_alpha11_delta_filesystem(record.get("payload"))
+        if current_filesystem is None:
+            return False
+        if not _codex_alpha11_arg0_transition_is_verified(
+            previous_filesystem,
+            current_filesystem,
+        ):
+            return False
+        previous_filesystem = current_filesystem
+    return _codex_environment_context_contains_filesystem_once(
+        environment_context,
+        previous_filesystem,
+    )
+
+
+def _codex_current_environment_context_is_verified(
+    record: dict[str, object],
+    *,
+    generation_id: str,
+    cwd: Path,
+) -> bool:
+    """Bind the current environment record before checking its opaque text."""
+
+    payload = record.get("payload")
+    metadata = (
+        payload.get("internal_chat_message_metadata_passthrough")
+        if isinstance(payload, dict)
+        else None
+    )
+    return (
+        record.get("type") == "response_item"
+        and isinstance(payload, dict)
+        and payload.get("type") == "message"
+        and payload.get("role") == "user"
+        and isinstance(metadata, dict)
+        and metadata.get("turn_id") == generation_id
+        and metadata.get("content_item_kinds") == ["environments.environment_context"]
+        and _codex_record_cwd_is_current(record, cwd)
+    )
+
+
+def _codex_alpha11_latest_full_world_state(
+    history: list[dict[str, object]],
+) -> tuple[int, str] | None:
+    """Return the latest valid full filesystem state before the resumed turn."""
+
+    latest: tuple[int, str] | None = None
+    for index, record in enumerate(history):
+        if record.get("type") != "world_state":
+            continue
+        payload = record.get("payload")
+        if not _codex_world_state_is_verified(payload):
+            continue
+        assert isinstance(payload, dict)
+        state = payload["state"]
+        environments = state.get("environments") if isinstance(state, dict) else None
+        filesystem = environments.get("filesystem") if isinstance(environments, dict) else None
+        if isinstance(filesystem, str):
+            latest = (index, filesystem)
+    return latest
+
+
+def _codex_alpha11_delta_world_state_is_verified(payload: object) -> bool:
+    """Accept only the observed alpha.11 filesystem delta serializer shape."""
+
+    if not isinstance(payload, dict) or set(payload) != {"full", "state"}:
+        return False
+    if payload.get("full") is not False or not isinstance(payload.get("state"), dict):
+        return False
+    state = payload["state"]
+    if set(state) != {"environments"} or not isinstance(state["environments"], dict):
+        return False
+    environments = state["environments"]
+    return set(environments) == {"filesystem"} and isinstance(environments["filesystem"], str)
+
+
+def _codex_alpha11_delta_filesystem(payload: object) -> str | None:
+    """Read a filesystem string only after the strict delta shape has been proven."""
+
+    if not _codex_alpha11_delta_world_state_is_verified(payload):
+        return None
+    assert isinstance(payload, dict)
+    state = payload["state"]
+    assert isinstance(state, dict)
+    environments = state["environments"]
+    assert isinstance(environments, dict)
+    filesystem = environments["filesystem"]
+    assert isinstance(filesystem, str)
+    return filesystem
+
+
+def _codex_alpha11_arg0_transition_is_verified(
+    old_filesystem: str,
+    new_filesystem: str,
+) -> bool:
+    """Require one changed, account-bound arg0 path and byte equality otherwise."""
+
+    path_pattern = _codex_alpha11_arg0_path_pattern()
+    if path_pattern is None:
+        return False
+    old_bytes = old_filesystem.encode("utf-8")
+    new_bytes = new_filesystem.encode("utf-8")
+    old_matches = list(path_pattern.finditer(old_bytes))
+    new_matches = list(path_pattern.finditer(new_bytes))
+    if len(old_matches) != 1 or len(new_matches) != 1:
+        return False
+    old_match = old_matches[0]
+    new_match = new_matches[0]
+    if old_match.group() == new_match.group():
+        return False
+    normalized_old = old_bytes[: old_match.start()] + old_bytes[old_match.end() :]
+    normalized_new = new_bytes[: new_match.start()] + new_bytes[new_match.end() :]
+    return normalized_old == normalized_new
+
+
+def _codex_alpha11_arg0_path_pattern() -> re.Pattern[bytes] | None:
+    """Match one observed full arg0 path for the trusted current POSIX account."""
+
+    home = _trusted_posix_account_home()
+    if home is None:
+        return None
+    try:
+        home_bytes = str(home).encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    return re.compile(
+        rb"<path>"
+        + re.escape(home_bytes)
+        + rb"/\.codex/tmp/arg0-macos/codex-arg0[A-Za-z0-9]+</path>"
+    )
+
+
+def _trusted_posix_account_home() -> Path | None:
+    """Read the current account home from the OS, never from HOME or a request."""
+
+    if pwd is None:
+        return None
+    try:
+        account = pwd.getpwuid(os.getuid())
+    except (AttributeError, KeyError, OSError):
+        return None
+    home = Path(account.pw_dir)
+    return home if home.is_absolute() else None
+
+
+def _codex_environment_context_contains_filesystem_once(
+    record: dict[str, object],
+    filesystem: str,
+) -> bool:
+    """Keep environment text opaque while requiring the proven filesystem once."""
+
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return False
+    content = payload.get("content")
+    if not isinstance(content, list):
+        return False
+    occurrences = 0
+    for item in content:
+        if not isinstance(item, dict) or item.get("type") != "input_text":
+            continue
+        text = item.get("text")
+        if isinstance(text, str):
+            occurrences += text.count(filesystem)
+    return occurrences == 1
+
+
+def _bind_verified_correction(
+    database: Any,
+    *,
+    project_root: Path,
+    installation: dict[str, Any],
+    context: Any,
+    event: dict[str, object],
+    declaration: dict[str, object],
+    anchor_event_id: str,
+) -> bool:
+    """Bind one exact failed delivery to a new request without selecting a latest task.
+
+    All reads run under the registry-to-suite lock already held by the caller
+    and its short records transaction.  The stored binding is intentionally a
+    snapshot: later publication cannot cause this correction to retarget.
+    """
+
+    if declaration.get("valid") is not True or declaration.get("intent") != "correct_delivery":
+        return False
+    target = declaration.get("target")
+    if not isinstance(target, str) or declaration.get("preserve_goal") is not True:
+        return False
+    target_path = _correction_target_path(project_root, target)
+    if target_path is None:
+        return False
+    existing = database.execute(
+        "SELECT * FROM managed_correction_bindings WHERE context_key = ?",
+        (context["context_key"],),
+    ).fetchone()
+    if existing is not None:
+        if existing["business_dto_digest"] is not None and (
+            existing["business_dto_digest"] != context["business_dto_digest"]
+            or existing["business_dto_rule_version"] != context["business_dto_rule_version"]
+        ):
+            return False
+        return _correction_binding_is_current(database, existing, installation)
+    anchor = database.execute(
+        """SELECT p0_event_id, pre_event_id, rule_version FROM managed_request_anchors
+        WHERE context_key = ?""",
+        (context["context_key"],),
+    ).fetchone()
+    if (
+        anchor is None
+        or anchor["pre_event_id"] != anchor_event_id
+        or not _durable_current_request_anchor_is_verified(database, context, event, anchor)
+    ):
+        return False
+    if context["task_id"] is not None or bool(context["root_valid"]):
+        return False
+    try:
+        assert_no_live_execution(database, str(event["suite_id"]))
+    except SelcError:
+        return False
+
+    source = _unique_owned_correction_source(
+        database,
+        suite_id=str(event["suite_id"]),
+        target_path=target_path,
+        context=context,
+        actual_skill=str(event["skill"]),
+        installation=installation,
+    )
+    if source is None:
+        return False
+    if not _native_relation_matches_source(database, context, event, source):
+        return False
+    active_binding = database.execute(
+        """SELECT 1 FROM managed_correction_bindings
+        WHERE task_id = ? AND status = 'active' LIMIT 1""",
+        (source["task_id"],),
+    ).fetchone()
+    if active_binding is not None:
+        return False
+    task_id = str(source["task_id"])
+    _assert_no_inflight_publication(database, task_id)
+    database.execute(
+        """INSERT INTO managed_correction_bindings(
+        context_key, suite_id, task_id, source_delivery_id, source_ordinal,
+        target_path, target_device, target_inode, target_digest,
+        target_parent_device, target_parent_inode, input_digest,
+        business_dto_digest, business_dto_rule_version,
+        checker_input_digest, checker_name, checker_version, checker_digest, rule_version,
+        resource_identity, resource_digest, composite_identity, composite_digest,
+        installation_digest, installation_version, anchor_event_id, anchor_rule_version,
+        status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+        (
+            context["context_key"],
+            event["suite_id"],
+            task_id,
+            source["delivery_id"],
+            source["ordinal"],
+            str(target_path),
+            source["target_device"],
+            source["target_inode"],
+            source["target_digest"],
+            source["target_parent_device"],
+            source["target_parent_inode"],
+            source["input_digest"],
+            source["business_dto_digest"],
+            source["business_dto_rule_version"],
+            source["checker_input_digest"],
+            source["checker_name"],
+            source["checker_version"],
+            source["checker_digest"],
+            source["rule_version"],
+            source["resource_identity"],
+            source["resource_digest"],
+            source["composite_identity"],
+            source["composite_digest"],
+            installation["digest"],
+            installation["version"],
+            anchor_event_id,
+            anchor["rule_version"],
+            records.utc_now(),
+        ),
+    )
+    database.execute(
+        """UPDATE managed_contexts
+        SET task_id = ?, intervention = 1
+        WHERE context_key = ? AND task_id IS NULL AND root_valid = 0""",
+        (task_id, context["context_key"]),
+    )
+    return (
+        database.execute(
+            "SELECT task_id FROM managed_contexts WHERE context_key = ?",
+            (context["context_key"],),
+        ).fetchone()["task_id"]
+        == task_id
+    )
+
+
+def _correction_target_path(project_root: Path, target: str) -> Path | None:
+    """Resolve an existing owned target without creating a directory for a claim."""
+
+    relative = Path(target)
+    if not target or relative.is_absolute() or ".." in relative.parts:
+        return None
+    candidate = project_root / relative
+    try:
+        parent = candidate.parent.resolve(strict=True)
+        parent.relative_to(project_root.resolve(strict=True))
+    except (OSError, ValueError):
+        return None
+    if candidate.is_symlink() or not candidate.is_file():
+        return None
+    return candidate
+
+
+def _unique_owned_correction_source(
+    database: Any,
+    *,
+    suite_id: str,
+    target_path: Path,
+    context: Any,
+    actual_skill: str,
+    installation: dict[str, Any],
+) -> Any | None:
+    """Return the one durable delivery whose owned object still names target."""
+
+    rows = database.execute(
+        """SELECT publications.delivery_id, publications.ordinal, publications.task_id,
+        publications.target_path, intents.staged_device AS target_device,
+        intents.staged_inode AS target_inode, intents.staged_digest AS target_digest,
+        intents.target_parent_device, intents.target_parent_inode,
+        actions.request_digest AS input_digest, actions.artifact_path AS action_artifact_path,
+        calls.skill, calls.actual_harness,
+        calls.expected_version, calls.expected_hash, checker_runs.checker_name,
+        checker_runs.checker_version, checker_runs.checker_digest, checker_runs.rule_version,
+        checker_runs.result AS checker_result, checker_runs.input_digest AS checker_input_digest,
+        checker_runs.resource_identity, checker_runs.resource_digest,
+        checker_runs.composite_identity, checker_runs.composite_digest,
+        checker_runs.installation_digest AS checker_installation_digest,
+        checker_runs.installation_version AS checker_installation_version,
+        receipts.host AS receipt_host, receipts.session_id AS receipt_session,
+        source_context.business_dto_digest, source_context.business_dto_rule_version,
+        source_prompt.payload_json AS source_prompt_payload
+        FROM managed_publications AS publications
+        JOIN managed_publication_intents AS intents
+          ON intents.delivery_id = publications.delivery_id
+        JOIN managed_actions AS actions ON actions.action_run_id = publications.action_run_id
+        JOIN calls ON calls.call_id = publications.call_id
+        JOIN checker_runs ON checker_runs.delivery_id = publications.delivery_id
+        JOIN managed_receipts AS receipts ON receipts.receipt_digest = publications.receipt_digest
+        JOIN managed_contexts AS source_context
+          ON source_context.suite_id = receipts.suite_id
+          AND source_context.host = receipts.host
+          AND source_context.session_id = receipts.session_id
+          AND source_context.generation_id = receipts.generation_id
+          AND source_context.request_id = receipts.request_id
+        JOIN managed_native_events AS source_prompt
+          ON source_prompt.event_id = source_context.root_event_id
+          AND source_prompt.phase = ?
+        WHERE publications.suite_id = ? AND publications.target_path = ?
+          AND publications.status = 'recorded' AND intents.state = 'recorded'""",
+        (USER_PROMPT_PHASE, suite_id, str(target_path)),
+    ).fetchall()
+    matching: list[Any] = []
+    target_stat = target_path.stat()
+    parent_stat = target_path.parent.stat()
+    target_digest = file_hash(target_path)
+    for row in rows:
+        if (
+            target_stat.st_dev != row["target_device"]
+            or target_stat.st_ino != row["target_inode"]
+            or target_digest != row["target_digest"]
+            or parent_stat.st_dev != row["target_parent_device"]
+            or parent_stat.st_ino != row["target_parent_inode"]
+            or row["skill"] != actual_skill
+            or row["actual_harness"] != context["host"]
+            or row["receipt_host"] != context["host"]
+            or row["receipt_session"] != context["session_id"]
+            or row["expected_version"] != installation["version"]
+            or row["expected_hash"] != installation["digest"]
+            or row["checker_installation_version"] != installation["version"]
+            or row["checker_installation_digest"] != installation["digest"]
+            or row["checker_result"] != "fail"
+            or _stored_action_checker_input_digest(row["action_artifact_path"])
+            != row["checker_input_digest"]
+        ):
+            continue
+        if not _correction_goal_is_preserved(database, context, row, actual_skill):
+            continue
+        closed_windows = database.execute(
+            "SELECT status FROM managed_windows WHERE delivery_id = ?",
+            (row["delivery_id"],),
+        ).fetchall()
+        if not closed_windows or any(window["status"] != "closed" for window in closed_windows):
+            continue
+        matching.append(row)
+    return matching[0] if len(matching) == 1 else None
+
+
+def _correction_goal_is_preserved(
+    database: Any,
+    context: Any,
+    source: Any,
+    actual_skill: str,
+) -> bool:
+    """Compare formal goals, using a narrow legacy explicit-only fallback.
+
+    New records must carry the independently frozen business DTO digest on
+    both sides.  A NULL legacy source is not evidence for a cross-selector
+    correction, so the old action/request digest comparison remains available
+    only when both immutable Prompt records explicitly named the same skill.
+    """
+
+    source_has_goal = _has_business_dto_evidence(
+        source["business_dto_digest"], source["business_dto_rule_version"]
+    )
+    current_has_goal = _has_business_dto_evidence(
+        context["business_dto_digest"], context["business_dto_rule_version"]
+    )
+    source_goal_valid = _is_valid_business_dto_evidence(
+        source["business_dto_digest"], source["business_dto_rule_version"]
+    )
+    current_goal_valid = _is_valid_business_dto_evidence(
+        context["business_dto_digest"], context["business_dto_rule_version"]
+    )
+    if source_goal_valid and current_goal_valid:
+        return source["business_dto_digest"] == context["business_dto_digest"]
+    if (source_has_goal and not source_goal_valid) or (current_has_goal and not current_goal_valid):
+        return False
+
+    source_selector = _immutable_prompt_selector(source["source_prompt_payload"])
+    current_selector = _context_immutable_prompt_selector(database, context)
+    return (
+        source_selector == actual_skill
+        and current_selector == actual_skill
+        and source["input_digest"] == context["request_digest"]
+    )
+
+
+def _has_business_dto_evidence(digest: object, rule_version: object) -> bool:
+    """Distinguish a legacy NULL pair from incomplete new-protocol evidence."""
+
+    return digest is not None or rule_version is not None
+
+
+def _is_valid_business_dto_evidence(digest: object, rule_version: object) -> bool:
+    return (
+        isinstance(digest, str)
+        and _is_sha256_digest(digest)
+        and rule_version == BUSINESS_DTO_RULE_VERSION
+    )
+
+
+def _context_immutable_prompt_selector(database: Any, context: Any) -> str | None:
+    """Read the original selector only from the durable Prompt event."""
+
+    row = database.execute(
+        """SELECT payload_json FROM managed_native_events
+        WHERE event_id = ? AND phase = ?""",
+        (context["root_event_id"], USER_PROMPT_PHASE),
+    ).fetchone()
+    return None if row is None else _immutable_prompt_selector(row["payload_json"])
+
+
+def _immutable_prompt_selector(payload_json: object) -> str | None:
+    """Return a nonempty selector from one immutable Prompt payload only."""
+
+    if not isinstance(payload_json, str):
+        return None
+    try:
+        payload = json.loads(payload_json)
+    except json.JSONDecodeError:
+        return None
+    selector = payload.get("skill") if isinstance(payload, dict) else None
+    return selector if isinstance(selector, str) and selector else None
+
+
+def _native_relation_matches_source(
+    database: Any,
+    context: Any,
+    event: dict[str, object],
+    source: Any,
+) -> bool:
+    """Reject a supplied native ancestry relation when it contradicts the source."""
+
+    relations = {
+        str(event.get("root_request_id", "")),
+        str(event.get("parent_request_id", "")),
+    }
+    relations.discard("")
+    if not relations:
+        return True
+    placeholders = ", ".join("?" for _ in relations)
+    rows = database.execute(
+        f"""SELECT DISTINCT task_id FROM managed_contexts
+        WHERE suite_id = ? AND host = ? AND session_id = ? AND task_id IS NOT NULL
+          AND (request_id IN ({placeholders}) OR root_request_id IN ({placeholders}))""",
+        (
+            context["suite_id"],
+            context["host"],
+            context["session_id"],
+            *sorted(relations),
+            *sorted(relations),
+        ),
+    ).fetchall()
+    return {str(row["task_id"]) for row in rows} == {str(source["task_id"])}
+
+
+def _correction_binding_is_current(
+    database: Any,
+    binding: Any,
+    installation: dict[str, Any],
+) -> bool:
+    """Fence a correction to its original delivery instead of a newer target version."""
+
+    if binding["status"] != "active":
+        return False
+    if (
+        binding["installation_digest"] != installation["digest"]
+        or binding["installation_version"] != installation["version"]
+    ):
+        return False
+    target_path = Path(str(binding["target_path"]))
+    try:
+        target_stat = target_path.stat()
+        parent_stat = target_path.parent.stat()
+    except OSError:
+        return False
+    if (
+        target_path.is_symlink()
+        or not target_path.is_file()
+        or target_stat.st_dev != binding["target_device"]
+        or target_stat.st_ino != binding["target_inode"]
+        or file_hash(target_path) != binding["target_digest"]
+        or parent_stat.st_dev != binding["target_parent_device"]
+        or parent_stat.st_ino != binding["target_parent_inode"]
+    ):
+        return False
+    source = database.execute(
+        """SELECT publications.delivery_id, publications.ordinal, publications.status,
+        publications.target_path, intents.state, intents.staged_device, intents.staged_inode,
+        intents.staged_digest, actions.request_digest, actions.artifact_path AS action_artifact_path,
+        checker_runs.input_digest AS checker_input_digest, checker_runs.checker_name,
+        checker_runs.checker_version, checker_runs.checker_digest, checker_runs.rule_version,
+        checker_runs.resource_identity, checker_runs.resource_digest,
+        checker_runs.composite_identity, checker_runs.composite_digest,
+        checker_runs.installation_digest, checker_runs.installation_version,
+        source_context.business_dto_digest, source_context.business_dto_rule_version
+        FROM managed_publications AS publications
+        JOIN managed_publication_intents AS intents ON intents.delivery_id = publications.delivery_id
+        JOIN managed_actions AS actions ON actions.action_run_id = publications.action_run_id
+        JOIN checker_runs ON checker_runs.delivery_id = publications.delivery_id
+        JOIN managed_receipts AS receipts ON receipts.receipt_digest = publications.receipt_digest
+        JOIN managed_contexts AS source_context
+          ON source_context.suite_id = receipts.suite_id
+          AND source_context.host = receipts.host
+          AND source_context.session_id = receipts.session_id
+          AND source_context.generation_id = receipts.generation_id
+          AND source_context.request_id = receipts.request_id
+        WHERE publications.delivery_id = ? AND publications.task_id = ?""",
+        (binding["source_delivery_id"], binding["task_id"]),
+    ).fetchone()
+    if source is None or source["status"] != "recorded" or source["state"] != "recorded":
+        return False
+    expected = {
+        "ordinal": binding["source_ordinal"],
+        "target_path": binding["target_path"],
+        "staged_device": binding["target_device"],
+        "staged_inode": binding["target_inode"],
+        "staged_digest": binding["target_digest"],
+        "request_digest": binding["input_digest"],
+        "checker_input_digest": binding["checker_input_digest"],
+        "checker_name": binding["checker_name"],
+        "checker_version": binding["checker_version"],
+        "checker_digest": binding["checker_digest"],
+        "rule_version": binding["rule_version"],
+        "resource_identity": binding["resource_identity"],
+        "resource_digest": binding["resource_digest"],
+        "composite_identity": binding["composite_identity"],
+        "composite_digest": binding["composite_digest"],
+        "installation_digest": binding["installation_digest"],
+        "installation_version": binding["installation_version"],
+    }
+    if any(source[key] != value for key, value in expected.items()):
+        return False
+    if (
+        binding["business_dto_digest"] is not None
+        or binding["business_dto_rule_version"] is not None
+    ) and (
+        binding["business_dto_digest"] != source["business_dto_digest"]
+        or binding["business_dto_rule_version"] != source["business_dto_rule_version"]
+        or binding["business_dto_rule_version"] != BUSINESS_DTO_RULE_VERSION
+    ):
+        return False
+    if (
+        _stored_action_checker_input_digest(source["action_artifact_path"])
+        != binding["checker_input_digest"]
+    ):
+        return False
+    newer = database.execute(
+        """SELECT 1 FROM managed_publications
+        WHERE task_id = ? AND target_path = ? AND status = 'recorded' AND ordinal > ? LIMIT 1""",
+        (binding["task_id"], binding["target_path"], binding["source_ordinal"]),
+    ).fetchone()
+    if newer is not None:
+        return False
+    windows = database.execute(
+        "SELECT status FROM managed_windows WHERE delivery_id = ?",
+        (binding["source_delivery_id"],),
+    ).fetchall()
+    return bool(windows) and all(window["status"] == "closed" for window in windows)
+
+
+def _assert_correction_binding_current(
+    database: Any,
+    context: Any,
+    installation: dict[str, Any],
+) -> None:
+    """Fence a bound correction at every state-changing consumption point."""
+
+    binding = database.execute(
+        "SELECT * FROM managed_correction_bindings WHERE context_key = ?",
+        (context["context_key"],),
+    ).fetchone()
+    if binding is None:
+        return
+    if not _correction_binding_is_current(database, binding, installation):
+        raise SelcError(
+            "CORRECTION_BINDING_STALE",
+            "the fixed failed delivery or owned target changed before this correction ran",
+            "start a new verified correction request from the current delivered target",
+        )
+
+
+def _stored_action_checker_input_digest(artifact_path: object) -> str | None:
+    """Hash the frozen checker input staged beside one managed artifact."""
+
+    if not isinstance(artifact_path, str) or not artifact_path:
+        return None
+    input_path = Path(artifact_path).parent / "input"
+    if input_path.is_symlink() or not input_path.is_file():
+        return None
+    try:
+        return file_hash(input_path)
+    except OSError:
+        return None
+
+
+def _assert_correction_checker_input_digest(
+    database: Any,
+    context: Any,
+    checker_input_digest: str | None,
+) -> None:
+    """Require a correction to preserve the failed delivery's checker input bytes."""
+
+    binding = database.execute(
+        "SELECT checker_input_digest FROM managed_correction_bindings WHERE context_key = ?",
+        (context["context_key"],),
+    ).fetchone()
+    if binding is None:
+        return
+    if not checker_input_digest or checker_input_digest != binding["checker_input_digest"]:
+        raise SelcError(
+            "CORRECTION_BINDING_STALE",
+            "the correction's checker input no longer matches the failed delivery",
+            "restore the fixed input bytes or start a new verified request",
+        )
+
+
+def _assert_correction_action_input(database: Any, context: Any, action_row: Any) -> None:
+    """Recheck staged checker bytes before reserving or exchanging a correction."""
+
+    _assert_correction_checker_input_digest(
+        database,
+        context,
+        _stored_action_checker_input_digest(action_row["artifact_path"]),
+    )
+
+
+def _assert_correction_publish_target(
+    database: Any,
+    context: Any,
+    project_root: Path,
+    target: str,
+) -> None:
+    """Keep one correction on its bound owned target through the visible exchange."""
+
+    binding = database.execute(
+        "SELECT target_path FROM managed_correction_bindings WHERE context_key = ?",
+        (context["context_key"],),
+    ).fetchone()
+    if binding is None:
+        return
+    relative = Path(target)
+    if not target or relative.is_absolute() or ".." in relative.parts:
+        raise SelcError(
+            "CORRECTION_TARGET_MISMATCH",
+            "the correction publication target is not the bound owned target",
+            "publish only to the exact target named by the verified correction request",
+        )
+    requested = project_root / relative
+    try:
+        requested_parent = requested.parent.resolve(strict=True)
+        requested_canonical = requested_parent / requested.name
+        bound_canonical = Path(str(binding["target_path"])).resolve(strict=True)
+    except OSError as error:
+        raise SelcError(
+            "CORRECTION_TARGET_MISMATCH",
+            "the correction publication target is not the bound owned target",
+            "publish only to the exact target named by the verified correction request",
+        ) from error
+    if requested_canonical != bound_canonical:
+        raise SelcError(
+            "CORRECTION_TARGET_MISMATCH",
+            "the correction publication target is not the bound owned target",
+            "publish only to the exact target named by the verified correction request",
+        )
+
+
+def _assert_correction_request_input(
+    database: Any,
+    context: Any,
+    action: dict[str, object],
+    request: dict[str, object],
+    frozen_inputs: dict[str, bytes],
+) -> None:
+    """Compare the frozen primary input before starting corrected business work."""
+
+    schema = action.get("input")
+    fields = schema.get("fields") if isinstance(schema, dict) else None
+    input_specification = fields.get("input") if isinstance(fields, dict) else None
+    input_value = request.get("input")
+    if (
+        not isinstance(input_specification, dict)
+        or input_specification.get("type") != "path"
+        or not isinstance(input_value, str)
+    ):
+        _assert_correction_checker_input_digest(database, context, None)
+        return
+    input_bytes = frozen_inputs.get("input")
+    if input_bytes is None:
+        _assert_correction_checker_input_digest(database, context, None)
+        return
+    input_digest = hashlib.sha256(input_bytes).hexdigest()
+    _assert_correction_checker_input_digest(database, context, input_digest)
+
+
+def _assert_correction_checker_execution(
+    database: Any,
+    context: Any,
+    execution: Any | None,
+) -> None:
+    """Reject a changed checker basis before exchanging corrected publication bytes."""
+
+    binding = database.execute(
+        "SELECT * FROM managed_correction_bindings WHERE context_key = ?",
+        (context["context_key"],),
+    ).fetchone()
+    if binding is None:
+        return
+    if execution is None:
+        raise SelcError(
+            "CORRECTION_BINDING_STALE",
+            "the correction has no independent checker execution",
+            "run the fixed checker before publishing a correction",
+        )
+    result = getattr(execution, "result", None)
+    checker = getattr(result, "checker", None)
+    expected = {
+        "checker_input_digest": getattr(result, "input_digest", None),
+        "checker_name": getattr(checker, "name", None),
+        "checker_version": getattr(checker, "version", None),
+        "checker_digest": getattr(checker, "digest", None),
+        "rule_version": getattr(result, "rule_version", None),
+        "resource_identity": getattr(result, "resource_identity", None),
+        "resource_digest": getattr(result, "resource_digest", None),
+        "composite_identity": getattr(result, "composite_identity", None),
+        "composite_digest": getattr(result, "composite_digest", None),
+        "installation_digest": getattr(execution, "installation_digest", None),
+        "installation_version": getattr(execution, "installation_version", None),
+    }
+    if any(binding[key] != value for key, value in expected.items()):
+        raise SelcError(
+            "CORRECTION_BINDING_STALE",
+            "the correction checker basis differs from the failed delivery",
+            "restore the fixed checker and input basis before publishing",
+        )
+
+
+def _close_correction_binding(database: Any, event: dict[str, object]) -> None:
+    """Release correction ownership only after its task has no live activity."""
+
+    binding = database.execute(
+        """SELECT task_id FROM managed_correction_bindings
+        WHERE context_key = ? AND status = 'active'""",
+        (_context_key(event),),
+    ).fetchone()
+    if binding is None:
+        return
+    task_id = str(binding["task_id"])
+    active_work = database.execute(
+        """SELECT 1
+        FROM calls
+        WHERE task_id = ? AND status = 'active'
+        UNION ALL
+        SELECT 1
+        FROM managed_actions
+        WHERE task_id = ? AND status IN ('reserved', 'finished')
+        UNION ALL
+        SELECT 1
+        FROM managed_publications
+        WHERE task_id = ? AND status IN ('reserved', 'prepared', 'supplied')
+        LIMIT 1""",
+        (task_id, task_id, task_id),
+    ).fetchone()
+    if active_work is not None:
+        return
+    database.execute(
+        """UPDATE managed_correction_bindings SET status = 'closed'
+        WHERE context_key = ? AND status = 'active'""",
+        (_context_key(event),),
+    )
 
 
 def _issue_receipt(
@@ -2915,9 +5489,9 @@ def _issue_receipt(
         database.execute(
             """INSERT INTO managed_contexts(
             context_key, suite_id, host, session_id, generation_id, request_id, root_request_id,
-            request_digest, input_skill,
+            request_digest, input_skill, business_dto_digest, business_dto_rule_version,
             root_event_id, root_valid, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)""",
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?, 'active', ?)""",
             (
                 context_key,
                 event["suite_id"],
@@ -2933,20 +5507,30 @@ def _issue_receipt(
                 records.utc_now(),
             ),
         )
+        context = database.execute(
+            "SELECT * FROM managed_contexts WHERE context_key = ?", (context_key,)
+        ).fetchone()
+        if context is None:
+            return None
     elif event["request_from_prompt"]:
-        if event["action"] != "unmanaged":
-            if context["input_skill"] and context["input_skill"] != event["skill"]:
-                return None
-            if not context["input_skill"]:
-                database.execute(
-                    "UPDATE managed_contexts SET input_skill = ? WHERE context_key = ?",
-                    (event["skill"], context_key),
-                )
-        if event["host"] == "codex" and not _promote_codex_prompt_root(
-            database,
-            context,
-            event,
-            event_id,
+        correction = _context_correction_declaration(database, context)
+        if event["action"] != "unmanaged" and not _context_accepts_receipt_skill(
+            database, context, event
+        ):
+            database.execute(
+                "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?",
+                (context_key,),
+            )
+            return None
+        if (
+            correction is None
+            and event["host"] == "codex"
+            and not _promote_codex_prompt_root(
+                database,
+                context,
+                event,
+                event_id,
+            )
         ):
             database.execute(
                 "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?",
@@ -2966,26 +5550,74 @@ def _issue_receipt(
             "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?", (context_key,)
         )
         return None
-    effective_causation = str(event["causation"])
-    if event["request_from_prompt"] and effective_causation == "unknown":
-        effective_causation = _prompt_context_causation(database, context)
-    if effective_causation == "business_correction":
+    correction = _context_correction_declaration(database, context)
+    if _context_has_unusable_technical_skill_pre(database, context, event):
         database.execute(
-            "UPDATE managed_contexts SET intervention = 1 WHERE context_key = ?", (context_key,)
+            "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?",
+            (context_key,),
         )
-        _link_explicit_followup_context(database, context_key, event)
-    elif effective_causation == "correction_candidate":
-        if _link_history_followup_context(database, context_key, event):
-            database.execute(
-                "UPDATE managed_contexts SET intervention = 1 WHERE context_key = ?",
-                (context_key,),
-            )
-        else:
+        return None
+    if _native_request_is_terminated(
+        database,
+        suite_id=str(event["suite_id"]),
+        host=str(event["host"]),
+        session_id=str(event["session_id"]),
+        generation_id=str(event["generation_id"]),
+        request_id=str(event["request_id"]),
+        tool_use_id=str(event["tool_use_id"]),
+    ):
+        return None
+    if correction is not None:
+        if not _ensure_current_request_anchor(database, context, event, event_id):
             database.execute(
                 "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?",
                 (context_key,),
             )
-    elif effective_causation in {"input_preparation", "automatic_retry", "permission", "audit"}:
+            return None
+        anchor = database.execute(
+            """SELECT pre_event_id FROM managed_request_anchors
+            WHERE context_key = ?""",
+            (context_key,),
+        ).fetchone()
+        if (
+            anchor is None
+            or not isinstance(anchor["pre_event_id"], str)
+            or not anchor["pre_event_id"]
+        ):
+            database.execute(
+                "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?",
+                (context_key,),
+            )
+            return None
+        if not _bind_verified_correction(
+            database,
+            project_root=Path(str(event["cwd"])),
+            installation=installation,
+            context=context,
+            event=event,
+            declaration=correction,
+            anchor_event_id=anchor["pre_event_id"],
+        ):
+            database.execute(
+                "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?",
+                (context_key,),
+            )
+            return None
+        context = database.execute(
+            "SELECT * FROM managed_contexts WHERE context_key = ?", (context_key,)
+        ).fetchone()
+        if context is None:
+            return None
+    effective_causation = str(event["causation"])
+    if event["request_from_prompt"] and effective_causation == "unknown":
+        effective_causation = _prompt_context_causation(database, context)
+    unbound_correction = effective_causation in {"business_correction", "correction_candidate"}
+    if correction is None and (unbound_correction or effective_causation == "audit"):
+        database.execute(
+            "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?", (context_key,)
+        )
+        return None
+    elif effective_causation in {"input_preparation", "automatic_retry", "permission"}:
         _link_explicit_followup_context(database, context_key, event)
     if event["action"] == "unmanaged":
         if effective_causation in {"unknown", "business_correction", "correction_candidate"}:
@@ -3059,6 +5691,36 @@ def _issue_receipt(
     return raw_receipt
 
 
+def _context_accepts_receipt_skill(database: Any, context: Any, event: dict[str, object]) -> bool:
+    """Check selector and automatic choice before a business receipt exists."""
+
+    actual_skill = event.get("skill")
+    if not isinstance(actual_skill, str) or not actual_skill:
+        return False
+    if context["input_skill"]:
+        return context["input_skill"] == actual_skill
+    selected_skill = context["selected_skill"]
+    if selected_skill is not None:
+        return selected_skill == actual_skill
+    if not _context_uses_automatic_selection(context):
+        return event["action"] == "activate"
+    if event["host"] != "codex" or event["action"] != "activate":
+        return False
+    rows = database.execute(
+        """SELECT skill FROM managed_receipts
+        WHERE suite_id = ? AND host = ? AND session_id = ? AND generation_id = ?
+          AND request_id = ? AND action = 'activate' AND status IN ('ready', 'consumed')""",
+        (
+            context["suite_id"],
+            context["host"],
+            context["session_id"],
+            context["generation_id"],
+            context["request_id"],
+        ),
+    ).fetchall()
+    return all(row["skill"] == actual_skill for row in rows)
+
+
 def _prompt_context_causation(database: Any, context: Any) -> str:
     """Read the immutable prompt classification for its matching tool boundary."""
 
@@ -3087,109 +5749,14 @@ def _operation_subject(event: dict[str, object]) -> tuple[str, str] | None:
     return None
 
 
-def _link_history_followup_context(
-    database: Any, context_key: str, event: dict[str, object]
-) -> bool:
-    """Link a WorkBuddy follow-up only through its bounded native parent chain.
-
-    WorkBuddy callbacks do not expose a parent request field.  The tool-boundary
-    prefix does contain the newly appended user message and its message-parent
-    chain, so this reads only that frozen callback-owned prefix and maps an
-    ancestor request to an already-owned task.  Ambiguity deliberately remains
-    unlinked; text similarity and session reuse are never relations.
-    """
-
-    if event["host"] != "workbuddy":
-        return False
-    prefix = event.get("prefix")
-    if not isinstance(prefix, dict):
-        return False
-    length = prefix.get("length")
-    if type(length) is not int or length < 0:
-        return False
-    path_value = event.get("transcript_path")
-    if not isinstance(path_value, str) or not path_value:
-        return False
-    try:
-        with Path(path_value).open("rb") as stream:
-            raw = stream.read(length)
-        history = [json.loads(line) for line in raw.splitlines() if line.strip()]
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return False
-    if not all(isinstance(record, dict) for record in history):
-        return False
-
-    session_id = str(event["session_id"])
-    cwd = str(event["cwd"])
-    request_id = str(event["request_id"])
-    records_by_id = {
-        str(record["id"]): record
-        for record in history
-        if isinstance(record.get("id"), str)
-        and record.get("sessionId") == session_id
-        and record.get("cwd") == cwd
-    }
-    matching_users = [
-        record
-        for record in records_by_id.values()
-        if record.get("type") == "message"
-        and record.get("role") == "user"
-        and isinstance(record.get("providerData"), dict)
-        and record["providerData"].get("conversationRequestId") == request_id
-    ]
-    if len(matching_users) != 1:
-        return False
-
-    ancestor_requests: set[str] = set()
-    current = matching_users[0]
-    visited: set[str] = set()
-    while True:
-        parent_id = current.get("parentId")
-        if parent_id is None:
-            break
-        if not isinstance(parent_id, str) or parent_id in visited:
-            return False
-        visited.add(parent_id)
-        parent = records_by_id.get(parent_id)
-        if parent is None:
-            return False
-        provider = parent.get("providerData")
-        if isinstance(provider, dict):
-            ancestor_request = provider.get("conversationRequestId")
-            if (
-                isinstance(ancestor_request, str)
-                and ancestor_request
-                and ancestor_request != request_id
-            ):
-                ancestor_requests.add(ancestor_request)
-        current = parent
-    if not ancestor_requests:
-        return False
-
-    placeholders = ", ".join("?" for _ in ancestor_requests)
-    rows = database.execute(
-        f"""SELECT DISTINCT task_id FROM managed_contexts
-        WHERE suite_id = ? AND host = ? AND session_id = ?
-          AND request_id IN ({placeholders}) AND task_id IS NOT NULL""",
-        (event["suite_id"], event["host"], session_id, *sorted(ancestor_requests)),
-    ).fetchall()
-    task_ids = {str(row["task_id"]) for row in rows}
-    if len(task_ids) != 1:
-        return False
-    database.execute(
-        "UPDATE managed_contexts SET task_id = ? WHERE context_key = ?",
-        (task_ids.pop(), context_key),
-    )
-    return True
-
-
 def _link_explicit_followup_context(
     database: Any, context_key: str, event: dict[str, object]
 ) -> None:
     """Reuse a task only when the producer supplies an exact native relation.
 
-    A matching session, text, or generation is never enough.  Corrections and
-    audits can link through a trusted root request or direct parent request.
+    A matching session, text, or generation is never enough.  Only technical
+    preparation, automatic retry, and permission contexts can link through a
+    trusted root request or direct parent request.
     An ambiguous relation remains unassigned so activation pauses instead of
     hiding an intervention in a new task.
     """
@@ -3304,11 +5871,66 @@ def _consume_receipt_row(
                 "the current native host version is not declared by this installation",
                 "pause before business execution and install a suite that declares this host version",
             )
+    if _native_request_is_terminated(
+        database,
+        suite_id=str(row["suite_id"]),
+        host=str(row["host"]),
+        session_id=str(row["session_id"]),
+        generation_id=str(row["generation_id"]),
+        request_id=str(row["request_id"]),
+        tool_use_id=str(row["tool_use_id"]),
+    ):
+        database.execute(
+            "UPDATE managed_receipts SET status = 'invalid', invalidated_at = ? WHERE receipt_digest = ?",
+            (records.utc_now(), row["receipt_digest"]),
+        )
+        raise SelcError(
+            "RECEIPT_INVALID",
+            "the native request or tool boundary already terminated",
+            "wait for a new verified native request before starting managed work",
+        )
+    context = _context_for_receipt(database, row)
+    _assert_correction_binding_current(database, context, installation)
     database.execute(
         "UPDATE managed_receipts SET status = 'consumed', consumed_at = ? WHERE receipt_digest = ?",
         (records.utc_now(), row["receipt_digest"]),
     )
     return row
+
+
+def _native_request_is_terminated(
+    database: Any,
+    *,
+    suite_id: str,
+    host: str,
+    session_id: str,
+    generation_id: str,
+    request_id: str,
+    tool_use_id: str,
+) -> bool:
+    """Fence a late Pre against its exact Post or the request's durable Stop."""
+
+    row = database.execute(
+        """SELECT 1 FROM managed_native_events
+        WHERE suite_id = ? AND host = ? AND session_id = ? AND generation_id = ?
+          AND request_id = ?
+          AND (
+              phase = ?
+              OR (phase = ? AND tool_use_id = ?)
+          )
+        LIMIT 1""",
+        (
+            suite_id,
+            host,
+            session_id,
+            generation_id,
+            request_id,
+            STOP_PHASE,
+            POST_PHASE,
+            tool_use_id,
+        ),
+    ).fetchone()
+    return row is not None
 
 
 def _context_for_receipt(database: Any, receipt: Any) -> Any:
@@ -3367,12 +5989,13 @@ def _insert_managed_call(
     skill: str,
     host: str,
     installation: dict[str, Any],
+    trigger_kind: str,
 ) -> None:
     database.execute(
         """INSERT INTO calls(
         call_id, task_id, skill, executor, actual_harness, evidence, expected_version, expected_hash,
         trigger_kind, status, created_at, assessment_owner)
-        VALUES (?, ?, ?, ?, ?, 'managed-native', ?, ?, 'explicit', 'active', ?, ?)""",
+        VALUES (?, ?, ?, ?, ?, 'managed-native', ?, ?, ?, 'active', ?, ?)""",
         (
             call_id,
             task_id,
@@ -3381,10 +6004,95 @@ def _insert_managed_call(
             host,
             installation["version"],
             installation["digest"],
+            trigger_kind,
             records.utc_now(),
             MANAGED_OWNER,
         ),
     )
+
+
+def _confirm_context_selection(database: Any, context: Any, skill: str) -> str:
+    """Freeze the selected skill when an activation receipt is actually consumed."""
+
+    if context["input_skill"]:
+        if context["input_skill"] != skill:
+            raise SelcError(
+                "MANAGED_CONTEXT_INVALID",
+                "the activated skill differs from the user-selected skill",
+            )
+        original_selector = _context_immutable_prompt_selector(database, context)
+        if original_selector is None:
+            return "unknown"
+        if original_selector != skill:
+            raise SelcError(
+                "MANAGED_CONTEXT_INVALID",
+                "the activated skill differs from the immutable user-selected skill",
+            )
+        return "explicit"
+    if not _context_uses_automatic_selection(context):
+        selected_skill = context["selected_skill"]
+        if selected_skill is not None and selected_skill != skill:
+            raise SelcError(
+                "MANAGED_CONTEXT_INVALID",
+                "the activated skill differs from the prior unknown selection",
+            )
+        database.execute(
+            """UPDATE managed_contexts SET selected_skill = ?
+            WHERE context_key = ? AND selected_skill IS NULL""",
+            (skill, context["context_key"]),
+        )
+        return "unknown"
+    selected_skill = context["selected_skill"]
+    if selected_skill is not None and selected_skill != skill:
+        raise SelcError(
+            "MANAGED_CONTEXT_INVALID",
+            "the activated skill differs from the fixed automatic selection",
+        )
+    database.execute(
+        """UPDATE managed_contexts SET selected_skill = ?
+        WHERE context_key = ? AND selected_skill IS NULL""",
+        (skill, context["context_key"]),
+    )
+    selected = database.execute(
+        "SELECT selected_skill FROM managed_contexts WHERE context_key = ?",
+        (context["context_key"],),
+    ).fetchone()
+    if selected is None or selected["selected_skill"] != skill:
+        raise SelcError(
+            "MANAGED_CONTEXT_INVALID",
+            "another activation reserved this automatic request for a different skill",
+        )
+    return "automatic"
+
+
+def _assert_context_selected_skill(context: Any, skill: str) -> None:
+    """Keep later action and staging receipts on the activation's fixed skill."""
+
+    if context["input_skill"]:
+        if context["input_skill"] != skill:
+            raise SelcError(
+                "MANAGED_CONTEXT_INVALID",
+                "managed action differs from the user-selected skill",
+            )
+        return
+    if context["selected_skill"] != skill:
+        raise SelcError(
+            "MANAGED_CONTEXT_INVALID",
+            "managed action differs from the activated skill selection",
+        )
+
+
+def _assert_context_action_business_dto(context: Any, request: dict[str, object]) -> None:
+    """Independently compare an automatic action's DTO with its frozen Prompt goal."""
+
+    if not _context_uses_automatic_selection(context):
+        return
+    if _business_dto_goal_digest(request) != context["business_dto_digest"]:
+        raise SelcError(
+            "RECEIPT_ARGUMENT_MISMATCH",
+            "managed action DTO differs from the native automatic request",
+            "invoke the exact structured business DTO selected by the native request",
+        )
 
 
 def _assert_managed_call(
@@ -3478,6 +6186,7 @@ def _execute_declared_action(
     action: dict[str, object],
     request: dict[str, object],
     staging: Path,
+    frozen_inputs: dict[str, bytes],
     on_execution_started: Callable[[ProcessIdentity, Path], None] | None = None,
     on_execution_finished: Callable[[], None] | None = None,
 ) -> tuple[Path, str]:
@@ -3506,7 +6215,9 @@ def _execute_declared_action(
             raise SelcError(
                 "MANAGED_INPUT_INVALID", "the installed text action needs an input path"
             )
-        input_bytes = _read_managed_input(Path(input_value))
+        input_bytes = frozen_inputs.get("input")
+        if input_bytes is None:
+            raise SelcError("MANAGED_INPUT_INVALID", "the managed input snapshot is unavailable")
         staged_input = staging / "input"
         _write_fsynced(staged_input, input_bytes)
         completed = _run_managed_subprocess(
@@ -3529,7 +6240,7 @@ def _execute_declared_action(
         if completed.returncode != 0 or not artifact.is_file() or artifact.is_symlink():
             raise SelcError("MANAGED_ACTION_FAILED", "fixed installed text-report action failed")
     elif kind == "python-script-v1":
-        staged_request = _stage_fixed_action_inputs(action, request, staging)
+        staged_request = _stage_fixed_action_inputs(action, request, staging, frozen_inputs)
         request_path = staging / "request.json"
         _write_fsynced(request_path, canonical_json(staged_request).encode("utf-8"))
         completed = _run_managed_subprocess(
@@ -3763,8 +6474,35 @@ def _read_managed_input(source: Path) -> bytes:
     return input_bytes
 
 
+def _freeze_declared_action_inputs(
+    action: dict[str, object], request: dict[str, object]
+) -> dict[str, bytes]:
+    """Read every declared path input exactly once before business execution.
+
+    The snapshot is both the correction comparison value and the only source
+    that reaches the managed script.  A caller can therefore never change a
+    path between validation and staging to alter the business subprocess.
+    """
+
+    schema = action["input"]
+    if not isinstance(schema, dict) or not isinstance(schema.get("fields"), dict):
+        raise SelcError("MANAGED_INPUT_INVALID", "managed action schema is invalid")
+    frozen: dict[str, bytes] = {}
+    for field, specification in schema["fields"].items():
+        if not isinstance(specification, dict) or specification.get("type") != "path":
+            continue
+        value = request.get(field)
+        if not isinstance(value, str):
+            raise SelcError("MANAGED_INPUT_INVALID", f"managed input {field} must be a path")
+        frozen[str(field)] = _read_managed_input(Path(value))
+    return frozen
+
+
 def _stage_fixed_action_inputs(
-    action: dict[str, object], request: dict[str, object], staging: Path
+    action: dict[str, object],
+    request: dict[str, object],
+    staging: Path,
+    frozen_inputs: dict[str, bytes],
 ) -> dict[str, object]:
     """Copy declared path values before launching a fixed generic script."""
 
@@ -3779,7 +6517,10 @@ def _stage_fixed_action_inputs(
         if not isinstance(value, str):
             raise SelcError("MANAGED_INPUT_INVALID", f"managed input {field} must be a path")
         private_path = staging / "input" if field == "input" else staging / "inputs" / str(field)
-        _write_fsynced(private_path, _read_managed_input(Path(value)))
+        input_bytes = frozen_inputs.get(str(field))
+        if input_bytes is None:
+            raise SelcError("MANAGED_INPUT_INVALID", "the managed input snapshot is unavailable")
+        _write_fsynced(private_path, input_bytes)
         staged[str(field)] = str(private_path)
     return staged
 
@@ -5182,7 +7923,7 @@ def _optional_string(value: dict[str, object], key: str) -> str | None:
 def _native_request_digest(payload: dict[str, object], skill: str) -> str:
     request = payload["request"]
     if not isinstance(request, dict) or set(request).difference(
-        {"skill", "input", "raw_prompt_digest"}
+        {"skill", "input", "raw_prompt_digest", "correction"}
     ):
         raise SelcError(
             "NATIVE_COLLECTOR_INVALID",
@@ -5206,9 +7947,7 @@ def _native_request_digest(payload: dict[str, object], skill: str) -> str:
             )
         return ""
     try:
-        semantic_request = {
-            key: value for key, value in request.items() if key != "raw_prompt_digest"
-        }
+        semantic_request = {"skill": request_skill, "input": input_value}
         encoded = canonical_json(semantic_request).encode("utf-8")
     except (TypeError, ValueError) as error:
         raise SelcError(
@@ -5223,6 +7962,75 @@ def _native_request_digest(payload: dict[str, object], skill: str) -> str:
             "reduce the declared managed request",
         )
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _business_dto_goal_digest(value: object) -> str | None:
+    """Hash one complete business DTO after removing only its control declaration.
+
+    This is a goal comparison, not an action request digest.  It deliberately
+    has no skill name, path inference, trigger classification, or caller-supplied
+    digest field.  Nested ``selc`` keys remain ordinary business data.
+    """
+
+    if not isinstance(value, dict) or value.get("classification") == "unknown":
+        return None
+    business_dto = dict(value)
+    has_control = "selc" in business_dto
+    control = business_dto.pop("selc", None)
+    if has_control:
+        declaration = _workbuddy_raw_correction_declaration(control, True)
+        if declaration is None or declaration.get("valid") is not True:
+            return None
+    try:
+        encoded = canonical_json(business_dto).encode("utf-8")
+    except (TypeError, ValueError):
+        return None
+    if len(encoded) > 16_384:
+        return None
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _business_dto_goal_digest_from_request(request: object) -> str | None:
+    """Read the trusted collector's DTO after rejecting malformed control data."""
+
+    if not isinstance(request, dict) or not isinstance(request.get("input"), dict):
+        return None
+    if "correction" in request:
+        declaration = _correction_declaration(request)
+        if declaration is None or declaration.get("valid") is not True:
+            return None
+    return _business_dto_goal_digest(request["input"])
+
+
+def _correction_declaration(request: object) -> dict[str, object] | None:
+    """Return only the finite correction control declared beside a DTO.
+
+    ``request`` itself originates at the native adapter.  The current-request
+    anchor later proves that the adapter's declaration came from the exact raw
+    JSON user message before it can bind a pre-existing task.
+    """
+
+    if not isinstance(request, dict) or "correction" not in request:
+        return None
+    declaration = request.get("correction")
+    if not isinstance(declaration, dict):
+        return {"valid": False}
+    if set(declaration) != {"intent", "target", "preserve_goal", "valid"}:
+        return {"valid": False}
+    if (
+        declaration.get("intent") != "correct_delivery"
+        or not isinstance(declaration.get("target"), str)
+        or not declaration["target"]
+        or declaration.get("preserve_goal") is not True
+        or declaration.get("valid") is not True
+    ):
+        return {"valid": False}
+    return {
+        "intent": "correct_delivery",
+        "target": declaration["target"],
+        "preserve_goal": True,
+        "valid": True,
+    }
 
 
 def _raw_request_digest(payload: dict[str, object]) -> str:
@@ -5244,6 +8052,12 @@ def _raw_request_digest(payload: dict[str, object]) -> str:
     except (TypeError, ValueError):
         return ""
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _is_sha256_digest(value: str) -> bool:
+    """Recognize the fixed lowercase digest encoding stored in native facts."""
+
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
 
 
 def _environment_value(environment: dict[str, str], key: str) -> str:

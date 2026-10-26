@@ -13,6 +13,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
@@ -23,6 +24,7 @@ from selc.evolve import (
     _remote_release_state,
     confirm_release,
     evaluate_candidate,
+    execute_contribution,
     prepare_candidate,
     prepare_contribution,
     prepare_release,
@@ -59,6 +61,16 @@ class InstallationContractsTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary_directory.name)
+        self.qualification = patch(
+            "selc.evolve.validate_real_evaluation",
+            return_value={
+                "schema_version": 2,
+                "execution_type": "real-harness",
+                "evaluation_hash": "synthetic-fixture-only",
+            },
+        )
+        self.qualification.start()
+        self.addCleanup(self.qualification.stop)
 
     def tearDown(self) -> None:
         self.temporary_directory.cleanup()
@@ -261,8 +273,20 @@ class InstallationContractsTests(unittest.TestCase):
                 self.assertEqual(result["status"], "passed")
 
                 project = self.root / f"path-{kind}-project"
-                install_suite(source=package, project_root=project, harness="codex", ref=None)
-                install_suite(source=package, project_root=project, harness="workbuddy", ref=None)
+                install_suite(
+                    source=package,
+                    project_root=project,
+                    harness="codex",
+                    ref=None,
+                    mode="observed",
+                )
+                install_suite(
+                    source=package,
+                    project_root=project,
+                    harness="workbuddy",
+                    ref=None,
+                    mode="observed",
+                )
                 self.assertEqual(
                     recover_installation(project, f"path-{kind}"),
                     {"recovered": False, "state": "no_journal"},
@@ -295,7 +319,13 @@ class InstallationContractsTests(unittest.TestCase):
         package = self.root / "path-omitted-recovery.zip"
         package_suite(suite, package)
         project = self.root / "path-omitted-recovery-project"
-        first = install_suite(source=package, project_root=project, harness="codex", ref=None)
+        first = install_suite(
+            source=package,
+            project_root=project,
+            harness="codex",
+            ref=None,
+            mode="observed",
+        )
 
         import selc.install as install_module
 
@@ -312,7 +342,13 @@ class InstallationContractsTests(unittest.TestCase):
         install_module._write_registry = fail_once
         try:
             with self.assertRaises(OSError):
-                install_suite(source=package, project_root=project, harness="workbuddy", ref=None)
+                install_suite(
+                    source=package,
+                    project_root=project,
+                    harness="workbuddy",
+                    ref=None,
+                    mode="observed",
+                )
         finally:
             install_module._write_registry = original_write_registry
 
@@ -1720,8 +1756,19 @@ class InstallationContractsTests(unittest.TestCase):
             check=False,
             text=True,
         )
-        self.assertEqual(contribution.returncode, 0, contribution.stdout + contribution.stderr)
-        plan_value = json.loads(plan.read_text(encoding="utf-8"))
+        self.assertEqual(contribution.returncode, 2, contribution.stdout + contribution.stderr)
+        self.assertEqual(json.loads(contribution.stdout)["error"]["code"], "REAL_EVALUATION_REQUIRED")
+
+        plan_value = prepare_contribution(
+            candidate,
+            current,
+            evaluation,
+            None,
+            self.root / "workspace",
+            plan,
+            project,
+            "portable-suite",
+        )
         self.assertEqual(plan_value["source_repository"], str(bare))
         self.assertEqual(plan_value["base_branch"], branch)
         workspace_skill = self.root / "workspace" / "suite" / "skills" / "text-report" / "SKILL.md"
@@ -1729,25 +1776,9 @@ class InstallationContractsTests(unittest.TestCase):
             workspace_skill.read_text(encoding="utf-8") + "unevaluated workspace edit\n",
             encoding="utf-8",
         )
-        rejected = subprocess.run(
-            [
-                sys.executable,
-                str(current / "bin" / "selc-suite.py"),
-                "contribute",
-                "execute",
-                "--plan",
-                str(plan),
-                "--provider",
-                "local",
-            ],
-            capture_output=True,
-            check=False,
-            text=True,
-        )
-        self.assertEqual(rejected.returncode, 2, rejected.stdout + rejected.stderr)
-        self.assertEqual(
-            json.loads(rejected.stdout)["error"]["code"], "UNEVALUATED_WORKSPACE_CHANGE"
-        )
+        with self.assertRaises(SelcError) as rejected:
+            execute_contribution(plan, "local", None, None)
+        self.assertEqual(rejected.exception.code, "UNEVALUATED_WORKSPACE_CHANGE")
 
     def test_release_package_keeps_git_provenance_and_safe_nested_tag(self) -> None:
         checkout = self.root / "release-checkout"

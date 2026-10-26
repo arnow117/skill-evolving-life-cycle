@@ -1,14 +1,23 @@
-# SELC v0.1
+# SELC v0.1.0
 
-SELC creates and maintains a versioned suite of skills, then records task and invocation outcomes locally. The authoring skill at `.claude/skills/selc/` is for Codex. A generated suite installs into Codex and WorkBuddy without requiring this repository, a global `selc` command, or Codex at the WorkBuddy installation site.
+SELC v0.1.0 provides a stable **BASIC** path for creating, validating, sealing, packaging, and ordinarily installing a versioned skill suite. BASIC registration is a direct local skill registration: it installs no hooks, requires no native receipt, and records no automatic task, one-shot, qualification, or success statistics. The authoring skill at `.claude/skills/selc/` is for Codex. A generated suite installs into Codex and WorkBuddy without requiring this repository, a global `selc` command, or Codex at the WorkBuddy installation site.
 
-The `codex/auto-observation` branch is a development preview. Local creation, sealing, packaging, and installation have regression coverage; arbitrary skill generation still needs the managed action and checker declarations described below. Automatic observation and full Codex/WorkBuddy desktop use have not completed acceptance, and there is no formal public Release yet. The authoring skill and end-to-end creation, contribution, publishing, and upgrade workflow are being updated for managed execution. Use this branch for authoring previews until that acceptance is recorded. Legacy record commands in US-003 are evidence/debugging interfaces, not steps required from an ordinary skill user.
+Get this version from [GitHub Release v0.1.0](https://github.com/arnow117/skill-evolving-life-cycle/releases/tag/v0.1.0). The matching source mirror is [Gitee](https://gitee.com/arnow117/skill-evolving-life-cycle). Release assets include the source archive, portable framework, ordinary skill example, basic suite, and SHA256SUMS.
 
-Development evidence as of 2026-10-23 includes one synthetic managed business delivery through the public Codex CLI `0.163.0-alpha.10.2`: task and call recording, action execution, publication, and the independent artifact check ran automatically, with a final result of `pass`. Its one-shot result remains `unknown`; this single CLI run does not establish desktop support, native discovery completeness, or the full lifecycle. Current acceptance details and remaining work are tracked in `.sdlc-v1/context/F-002.engineering.md`.
+| Capability | v0.1.0 support |
+| --- | --- |
+| `create`, `validate`, `seal`, and `package` | BASIC |
+| Fresh basic installation, explicit basic upgrade, and standard-library portable execution | BASIC |
+| Fresh basic installation behavior | No hooks, no receipt, no automatic statistics |
+| Existing installation compatibility | Omitted mode preserves the saved mode; a legacy registration with no saved mode remains observed |
+| Observed hooks, automatic statistics, one-shot results, and native attribution | **EXPERIMENTAL** |
+| Real creator and evaluation, automated contribution, and automated release pipeline | **EXPERIMENTAL** |
+
+The EXPERIMENTAL observed path can currently stop with `RECEIPT_UNAVAILABLE`. It does not guarantee Codex or WorkBuddy desktop support, native discovery completeness, support for a new model or host version, or a qualified managed candidate. F-002/T011 remains incomplete. Publishing this framework source and the ordinary example below does not qualify, release, or replace the evidence required for a managed business candidate.
 
 `scripts/selc.py` is the only global usage entrypoint. Its argparse schema is authoritative; use `selc --help` or `selc <command> --help` for the current parameter list. Runtime dependencies are Python 3.11+ and the standard library. `uv` manages the independent command environment; no dependency is installed implicitly.
 
-The original v0.1 regression suite validates local filesystem, SQLite, local Git, a local release center, and controlled fake GitHub/GitLab clients. Those tests do not establish Codex or WorkBuddy desktop support, real remote mutation, or real model execution; the development evidence above is tracked separately. AiTaxs is not included in this repository or example.
+The original v0.1 regression suite validates local filesystem, SQLite, local Git, a local release center, and controlled fake GitHub/GitLab clients. Those tests do not establish Codex or WorkBuddy desktop support, real remote mutation, or real model execution. AiTaxs is not included in this repository or example.
 
 ## Common setup
 
@@ -26,12 +35,67 @@ selc doctor
 
 All success responses are JSON with `schema_version: 1`. A nonzero response is JSON with a stable `error.code` and recovery instruction. `--project-root` names the owner of the local SQLite database and installed suite state. It must be a directory the caller controls. `--harness` is an explicit `codex` or `workbuddy` registration target; SELC never infers it from a model name.
 
+## BASIC 快速开始
+
+在仓库根目录使用上面的 `selc` 函数。创建一个普通 suite 后，先 seal，再验证和打包；新安装默认进入 BASIC，也可以显式写出 `--mode basic`。
+
+```bash
+selc create --suite-id hello-suite --version 1.0.0 --output /tmp/hello-suite --skill hello
+selc seal --suite /tmp/hello-suite
+selc validate --suite /tmp/hello-suite
+selc package --suite /tmp/hello-suite --output /tmp/hello-suite.zip
+selc install --source /tmp/hello-suite.zip --project-root /tmp/hello-project \
+  --harness workbuddy --mode basic
+```
+
+使用 `selc updates apply` 执行显式升级；它保留已保存的安装模式。完整参数、失败恢复和升级行为见 [US-004](#us-004--check-and-explicitly-update-a-suite)。
+
+## Ordinary no-hook example — item-summary
+
+[`examples/item-summary`](examples/item-summary/) is a standalone ordinary skill with its own MIT license. It needs only Python 3.11+ and a request JSON object whose `input` value names a JSON file containing `{"items": [{"value": 3}, {"value": 5}]}`. Its output is `{"count": 2, "sum": 8}`. Decimal values and missing or non-integer values are errors. A WorkBuddy user can upload a ZIP whose root is this standard skill directory; a project user can instead install a generated suite. Neither consumer path requires Codex.
+
+Run the script from the project working directory so a relative input name resolves in that project:
+
+```bash
+python3 examples/item-summary/scripts/item_summary.py managed-run \
+  --request request.json --output reports/item-summary.json
+```
+
+`managed-run` is the script's fixed subcommand name; this example is still ordinary local file processing. It requires no SELC installation, hooks, native receipt, task ID, or automatic statistics configuration.
+
+## Install modes — start with ordinary use
+
+New installations default to `basic`. This is the normal path for a WorkBuddy or Codex project: the registered skill points directly to its ordinary `SKILL.md` body in the immutable installed suite. It creates no hooks, requires no native receipt, and does not create automatic task, one-shot, qualification, or success-statistics records.
+
+```bash
+selc install --source /tmp/simple-reports.zip \
+  --project-root /tmp/selc-project --harness workbuddy
+selc_python /tmp/selc-project/.selc/installs/simple-reports/current/bin/selc-suite.py run text-report \
+  --input examples/text-report/input.txt --output /tmp/selc-project/report.md
+```
+
+The same generated suite can install itself locally with the same default:
+
+```bash
+selc_python /tmp/simple-reports/install.py \
+  --project-root /tmp/selc-project --harness workbuddy
+```
+
+Pass `--mode basic` only when you want to state that choice explicitly. A missing or malformed unrelated `.codebuddy/settings.json` or `.codex/hooks.json` does not block a fresh basic installation and is left byte-for-byte unchanged. The installation result returns `mode: "basic"` and `observation: {"enabled": false}`.
+
+Choose `--mode observed` only for the managed runtime and automatic evidence path. It creates this suite's collector hooks, requires native receipts, and preserves the existing strict observation and publication checks. An existing installation keeps its saved mode when `--mode` is omitted; an older registration with no saved mode is treated as `observed` for compatibility. `updates apply` and recovery preserve that mode. A mode switch updates every registered harness together and waits for active tasks, calls, sessions, or managed executions to finish.
+
+Managed skills need a separate `basic_path` body before they can be installed in basic mode. Legacy packages that contain only an observed managed body remain usable with `--mode observed`; SELC does not rewrite their instructions to pretend they are ordinary skills. Basic runs produce their requested business artifact but do not claim automatic statistics or evaluation eligibility.
+
+The author owns both bodies when a skill has a `basic_path`: edit and validate its ordinary body for basic use, and its `path` body for observed use. Both directories live below `skills/` and are included in the sealed package. Generated path examples must resolve the physical loaded skill directory because harness registration can be a symbolic link.
+
 ## US-001 — Create a suite
 
 Actor: a Codex skill author. Preconditions: Python 3.11+ and an empty output path. The author owns the suite ID, version, and skill names.
 
 ```bash
 SELC_CREATOR_PYTHON=/opt/homebrew/bin/python3.11
+SELC_CREATOR_PYTHON_ROOT=/opt/homebrew/opt/python@3.11
 SELC_SKILL_CREATOR="${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator"
 selc create \
   --suite-id simple-reports --version 1.0.0 --output /tmp/simple-reports \
@@ -54,7 +118,7 @@ For Codex-authoring changes, use `.claude/skills/selc/SKILL.md` and the system `
 
 ## US-002 — Install and run the text-report example
 
-Actor: a suite user. Preconditions: a package produced by US-001, an empty or compatible project root, and Python 3.11+.
+Actor: a suite user. Preconditions: a package produced by US-001, an empty or compatible project root, and Python 3.11+. The commands below use the default ordinary `basic` mode.
 
 ```bash
 selc install --source /tmp/simple-reports.zip \
@@ -71,7 +135,7 @@ Use `--source <repo> --subdir <relative-suite-dir> --ref <tag-or-commit>` for a 
 
 ## US-003 — Record and aggregate a task
 
-Actor: a harness adapter or user with task evidence. A task ID is the business-operation identity; each invocation gets a separate call ID. `initiator` and `executor` are separate fields. `--test` puts controlled fixtures outside default reports. An installed call must supply the skill entry's `--expected-version` and `--expected-hash`; SELC never fills a missing digest from the current installation, so a stale or incomplete entry cannot mix with a new runtime.
+Actor: a harness adapter or user with task evidence. This diagnostic and observed-mode interface is separate from ordinary basic execution, which does not add production rows or automatic statistics. A task ID is the business-operation identity; each invocation gets a separate call ID. `initiator` and `executor` are separate fields. `--test` puts controlled fixtures outside default reports. An installed call must supply the skill entry's `--expected-version` and `--expected-hash`; SELC never fills a missing digest from the current installation, so a stale or incomplete entry cannot mix with a new runtime.
 
 ```bash
 selc task start --project-root /tmp/selc-project --id task-1 \
@@ -94,6 +158,33 @@ Reports keep independent task and call denominators. Each axis exposes `N`, `S`,
 ## US-003A — Diagnose a declared artifact check
 
 An optional schema-1 `suite.json` `artifact_checks` object declares a fixed checker identity, rule version, required rule IDs, JSON configuration, and an optional OS-network-isolation requirement. A skill entry can name one declaration with `artifact_check`. Declarations contain no executable path, argv, or environment values. A missing declaration, unsupported rule, installed-byte drift, source change, unavailable checker, or manifest digest pin mismatch cannot produce a pass.
+
+For generic managed authoring, `create --managed-declaration declaration.json` accepts this explicit protocol-1 envelope. `managed.actions` names arbitrary declared skills and either `instruction-staging-v1` or `python-script-v1`; `native_hosts` fixes allowed host versions. `artifact_checks` remains a normal manifest section, and `skill_artifact_checks` binds each declared skill to one named checker rather than hiding checker metadata in `managed`.
+
+```json
+{
+  "managed": {
+    "protocol": 1,
+    "native_hosts": {"codex": ["0.163"]},
+    "actions": {
+      "invoice-stage": {
+        "skill": "invoice-writer",
+        "kind": "instruction-staging-v1",
+        "input": {"fields": {}, "required": []}
+      }
+    }
+  },
+  "artifact_checks": {
+    "invoice-json": {
+      "checker": {"name": "json-item-summary", "version": "1"},
+      "rule_version": "1",
+      "required_rule_ids": ["count", "sum"],
+      "configuration": {"duplicate_ids_count_once": true}
+    }
+  },
+  "skill_artifact_checks": {"invoice-writer": "invoice-json"}
+}
+```
 
 ```bash
 selc check --project-root /tmp/selc-project --suite simple-reports \
@@ -120,9 +211,15 @@ Installed managed suites add project-owned discovery entries and silent native h
 
 Normal managed `invoke`, `action`, `stage`, and `publish` commands never accept `--receipt`. Each carries the installed `--host`, `--expected-version`, and `--expected-composite` values, and the collector records the exact wrapper command before the child starts it. The runtime selects the one matching pre-action receipt from the child’s native identity, including the exact activated task and call plus the real input, staged-byte, artifact, and target arguments. A cached entry with a different installation identity, command, input path, or host identity stops before business execution. Declared `instruction-staging-v1` actions use `managed stage` with bounded artifact and checker-input files; they do not require a user to ferry an opaque receipt.
 
+An otherwise exact installed wrapper may have one literal `cd <absolute-current-project> &&` prefix. The directory must be unquoted, contain no `..` components, and resolve to the verified project; other shell combinations remain unsupported. Native evidence keeps the full original command digest, including this prefix.
+
 Publication creates a previously absent target atomically from the checked staged bytes. On Darwin, a verified unchanged owned target can be corrected with a durable `renameatx_np(RENAME_SWAP)` intent: SELC verifies both exchanged objects before recording the delivery. A detected late user replacement remains uncertain and the displaced bytes are saved as a user-accessible conflict object. Filesystems without the exchange primitive report that capability limit; SELC does not stream-copy over an existing target.
 
 The collector accepts a finite JSON request object, optionally with a genuine skill prefix. It records ordinary language and unsupported shapes as observed unknown classification rather than treating them as a collector outage: a raw prompt summary protects callback immutability, while only confirmed declared fields bind action input equality. Unknown semantics can execute and keep first-result assessment unknown. Replayed callbacks keep their original frozen transcript prefix even when native history later grows. A managed callback without a verified root, host version, native transcript prefix, or exact fixed wrapper command pauses before the action. The collector also records technical `PermissionRequest` callbacks without returning an allow, denial, retry, or permission change; an unmatched request remains unknown. The collector stores identifiers and hashes, never prompt, command, artifact, or native transcript-path bodies. The immutable manifest must explicitly allow the observed host version; a missing or changed version pauses. Public fixture payloads remain unverified even if their fields claim a native host. The installed runtime owns `managed hook`; its other `managed` subcommands are coordination and local-fixture interfaces, while ordinary managed skill use never calls legacy `task`, `call`, `event`, or `delivery` record commands. Use `scripts/selc.py managed --help` to inspect those interfaces.
+
+A user may request a correction in the normal Codex UI with structured skill JSON such as `@text-report {"input":"resources/items.json","selc":{"intent":"correct_delivery","target":"reports/item-summary.json","preserve_goal":true}}`. `selc` is a control declaration, not business input: SELC removes it before comparing the fixed input digest. The target is an owned project-relative path, not a task, call, or receipt identifier. A correction binds only when the original input bytes, checker basis, installation facts, and owned target all still match one closed failed publication. Natural-language correction requests and invalid `selc` values remain unknown.
+
+For a supported automatic selection flow, the user supplies one structured business JSON object without naming a skill. SELC stores a hash of that complete object, removes only a top-level `selc` control, and requires the host's verified installed activation to select one declared skill. It never infers a skill from prose, a filesystem path, a shell discovery command, or user-provided trigger metadata. The selected skill, actual action input, checker basis, installation, and owned target remain independently verified; changing selector format alone does not change a correction's fixed goal. WorkBuddy's internal skill-chip transport remains host-only: for supported 5.8.3 and 5.9.2 callbacks it is exactly `@//item-summary/{"input":"resources/items.json"}`. Users should use the normal WorkBuddy skill UI rather than manually constructing that transport; other delimiters, trailing text, versions, hosts, and undeclared skill names remain unknown.
 
 This implementation has local fixture coverage only. It does not claim completed Codex or WorkBuddy desktop discovery, body handoff, correction, root/window, or publication acceptance.
 
@@ -155,26 +252,68 @@ Task entry reads each configured Git upstream at most once per UTC day and store
 
 For a suite first installed from a directory, its saved source root and `subdir: "."` are restored by `updates apply --suite-id`; the framework-only command above therefore does not need a repeated `--source`. That command checks that the resolved source still matches the installed business version and digest; when changing business content, pass `--source` explicitly as in the first apply command. Selecting an external framework with bytes identical to the embedded runtime still records that explicit source selection. A later ordinary `install` without `--framework-source`, including a second-harness installation, and a later explicit business update continue to materialize that selected runtime until the maintainer explicitly selects another framework. SELC snapshots source bytes before it derives metadata or assembles a composite. An omitted external framework remains a request to reuse the saved selection: if its directory or package has changed, SELC returns `STALE_FRAMEWORK_SELECTION` and leaves the installation unchanged; repeat with an explicit `--framework-source` to select and validate the new runtime.
 
-## US-005 — Prepare, evaluate, contribute, and release
+## US-005 — EXPERIMENTAL: Prepare, evaluate, contribute, and release
 
-Actor: an installed-suite contributor or maintainer. Candidate code is isolated from the trusted runner, rules, and holdout cases. This v0.1 runner has two regression and two holdout text cases; it runs the baseline and candidate in the same deterministic environment, with at most two candidates, eight runs, 10 seconds per runner, 60 seconds total, and zero real model calls.
+Actor: an installed-suite contributor or maintainer. This entire observed qualification and automation path is **EXPERIMENTAL**. A local `evolve evaluate` run is an explicitly labelled fixture diagnostic. It has `execution_type: fixture` and can never prepare or execute a contribution or release. `RECEIPT_UNAVAILABLE`, unknown evidence, an unsupported host or model, or missing desktop evidence leaves a candidate unqualified. Production qualification starts with a maintainer-owned case specification that declares each immutable version/variant, its supported scope, and its required case and matrix units. An initial integer-and-empty variant can therefore retain its own observed qualification while an improved decimal-and-cancellation variant supplies the additional required units; a candidate pass never authorizes a different snapshot.
+
+Before running this example, set `SELC_CODEX_BINARY` to the resolved regular Codex executable and `SELC_CODEX_VERSION` to its exact reported version. Set `SELC_SKILL_CREATOR` to the available skill-creator directory, `SELC_CREATOR_PYTHON_ROOT` to the selected creator interpreter dependency root, and `SELC_EVALUATION_PYTHON_ROOT` to the narrow readonly Python dependency root needed by the fixed evaluation adapter. These are explicit authoring inputs.
 
 ```bash
 selc evolve prepare --suite /tmp/suite-repository/suite --output /tmp/candidate
-# Follow the creator brief, then make an explicit candidate-only proposal.
-printf '\nCreator-approved report wording.\n' >> /tmp/candidate/candidate/skills/text-report/SKILL.md
-selc evolve evaluate --candidate /tmp/candidate/candidate --output /tmp/evaluation.json
-selc contribute prepare --candidate /tmp/candidate/candidate \
-  --suite /tmp/suite-repository/suite --evaluation /tmp/evaluation.json \
-  --source-repo /tmp/suite-repository --workspace /tmp/selc-contribution-workspace \
-  --output /tmp/contribution.json
-selc contribute execute --plan /tmp/contribution.json --provider local
-selc release prepare --suite /tmp/suite-repository/suite --candidate /tmp/candidate/candidate \
-  --evaluation /tmp/evaluation.json --provider local --target <contribution-commit> --tag v1.1.0 \
-  --center /tmp/release-center --output /tmp/release-plan.json
+selc evolve policy-template --host-version "$SELC_CODEX_VERSION" \
+  --python-read-root "$SELC_EVALUATION_PYTHON_ROOT" \
+  --output /private/codex-policy-template.json
+# Copy the complete generated object into the Codex matrix's tools_policy_template field.
+selc evolve plan --suite /tmp/suite-repository/suite --cases /private/evaluation-cases.json \
+  --output /private/evaluation-plan
+selc evolve creator prepare --plan /private/evaluation-plan/plan.json \
+  --candidate /tmp/candidate/candidate --output /private/creator-request.json \
+  --binary "$SELC_CODEX_BINARY" --binary-version "$SELC_CODEX_VERSION" \
+  --brief /private/creator-regression-brief.txt \
+  --skill-creator-root "$SELC_SKILL_CREATOR" \
+  --creator-python-root "$SELC_CREATOR_PYTHON_ROOT"
+# A maintainer runs the fixed native creator profile and checks its native evidence.
+selc evolve creator verify --request /private/creator-request.json --candidate /tmp/candidate/candidate \
+  --native-evidence /private/creator-native-evidence.json
+selc evolve bind --plan /private/evaluation-plan/plan.json --candidate /tmp/candidate/candidate \
+  --variant improved --output /private/candidate-binding.json
+selc evolve attempt prepare --plan /private/evaluation-plan/plan.json \
+  --binding /private/candidate-binding.json --case regression-1 --matrix codex-cli \
+  --attempt 1 --output /private/evaluation-attempt-1
+selc evolve attempt native-evidence-template --attempt-path /private/evaluation-attempt-1
+selc evolve attempt collect --attempt-path /private/evaluation-attempt-1
+selc evolve finalize --plan /private/evaluation-plan/plan.json \
+  --binding /private/candidate-binding.json --attempt-path /private/evaluation-attempt-1 \
+  --output /private/evaluation.json
 ```
 
-`evolve prepare` only creates a creator brief; it does not claim an LLM changed the candidate. Follow that brief to make an explicit candidate-only edit such as the command above; an unchanged candidate is rejected with `NO_CONTRIBUTION_CHANGES`. An invalid candidate resource produces a failed report. `--model-calls` must remain zero in v0.1. Holdout details are not copied to the creator brief. `contribute prepare` restores the saved source commit in an isolated workspace, creates a `codex/` non-default branch, maps only candidate skills/resources, and writes a real diff and package. `contribute execute` separately checks the staged index, worktree, and complete baseline-to-commit tree: only the prepared suite's skills, resources, and manifest may be committed. It rechecks the workspace manifest, runtime, wrapper, and business hashes before pushing that branch. With `--provider github|gitlab --repository <owner/repository> --client <controlled-client>`, the source provenance must record a public `github.com` or `gitlab.com` origin for that same repository; SELC verifies the namespace, provider, and host before it commits or pushes, then queries all matching PR/MR states and accepts reuse only for a matching open request. An inactive or incomplete response stops recovery. It rejects an unclassified self-hosted origin in v0.1. `contribute verify --plan <contribution-plan> --provider <github|gitlab> --client <controlled-client>` reloads that same bound identity and branch rather than resolving a client default such as `GH_HOST`.
+`evolve policy-template` writes a schema-1, versioned alpha.11 Codex template. It records the current POSIX account root from the OS, not `HOME`; requires a regular narrow Python dependency directory; and permits only two runtime substitutions: the canonical isolated attempt project and one account-bound `.codex/tmp/arg0-macos/codex-arg0[A-Za-z0-9]+` bootstrap read path. The generated template has this shape, with the actual generated `account_home` and Python root retained only in the maintainer's private plan:
+
+```json
+{
+  "schema_version": 1,
+  "host": "codex",
+  "host_version": "0.163.0-alpha.11",
+  "account_home": "<OS-derived-private-path>",
+  "parameters": {
+    "attempt_project": {"kind": "canonical-attempt-project"},
+    "codex_arg0": {"kind": "current-account-alpha11-bootstrap"}
+  },
+  "policy": {"permission_profile": "<structured restricted profile>", "...": "..."},
+  "cli": {"approval_policy": "never", "ignore_user_config": true, "...": "..."},
+  "hook_trust": {"mode": "normal-state-inheritance-v1", "...": "..."}
+}
+```
+
+Use the complete command output, rather than this abbreviated example, as `matrix[].tools_policy_template`. The evaluator requires exact `permission_profile` and `file_system_sandbox_policy` filesystem entries, verifies that their entries are unique and identical, and rejects an additional root, network/tool/approval change, another account, or another bootstrap shape. It saves the template hash and prelaunch mapping/configuration hash in every attempt, then records the matched native raw-policy hash and validated mapping during collection. An older `tools_policy_digest`-only Codex matrix remains diagnostic with `qualification_support: unverified`; it cannot authorize contribution or release.
+
+Before a `codex-cli` launch, the isolated project installs five managed Codex hooks. Review and trust those exact definitions through Codex's normal hook UI. The adapter then reads only the matching five `hooks.state` hashes from the OS account's `~/.codex/config.toml`, rejects missing, disabled, changed, wrong-source, or extra entries for that hook file, and passes the original values in one public `exec -c 'hooks.state={"<source:key>"={trusted_hash="..."},...}'` setting. It continues to use `--ignore-user-config`: no other account configuration is inherited. The durable launch claim records only the selected state, hook definitions, source paths and digests, and command digest. Later unrelated account-hook changes do not alter a completed qualification.
+
+`evolve plan` copies each exact input into the plan and fixes its trusted checker rules, full baseline runtime, framework, and `runtime/SELC-LICENSE`. Its JSON has `schema_version: 1`, bounded `candidate_budget`, `total_timeout_seconds`, `cases`, `matrix`, and `variants`. Each case names an input, frozen request, trusted checker, and run timeout; each matrix names one supported adapter, host/version, surface, model, versioned policy template, and derived qualification support. A `codex-cli` matrix also pins its regular executable and version. Every variant names its actual immutable manifest version, `baseline` or `candidate` snapshot, scope, required cases, and required matrices. The baseline version must equal the baseline manifest; a candidate snapshot is rewritten to its frozen variant version before binding. It creates a baseline binding when a declared initial version requires one. `evolve bind` materializes the full candidate snapshot before any attempt starts, and `--variant` selects the declared candidate version when a plan has more than one. `evolve finalize` accepts one `--binding` per reported version and lists any unverified variants instead of treating their scope as supported. The creator request pins the supported CLI binary and `--ignore-user-config`, binds a maintainer-owned UTF-8 regression brief into its prompt and run identity, explicitly denies the plan and protected materials, grants writes only to candidate skills and resources, and grants read access only to the explicit skill-creator root and Python runtime root. The brief must contain only the requested regression objective; it must not contain holdout, oracle, or protected-material paths. The skill-creator root must contain `SKILL.md` and `scripts/quick_validate.py`; the Python root covers that validator's selected interpreter dependencies. `creator verify` accepts only the matching native Codex session metadata, user turn, `exec` tool record, effective policy, frozen CLI version, and protected hashes. The real runner accepts only the finite `codex-cli` adapter. It keeps `--ignore-user-config`, then independently supplies only the five normal-UI-reviewed hashes selected by the frozen `hook_trust` template; the post-run native policy remains the effective evidence. WorkBuddy desktop attempts still install and prepare their own registration and request, but report `qualification_support: unverified` and collect as unknown because this evaluator does not implement a WorkBuddy native-attribution parser. Desktop attempts use `desktop-request` followed by `collect`; collection never starts a model. `native-evidence-template` requires an original host-store JSONL cutoff with its SHA-256, path hash, device, and inode; collection recomputes every root, pre, and Post/Stop prefix from those bytes and binds the hook tool through its matching native `CommandExecution` result. Codex outer `exec` IDs and hook tool IDs are separate namespaces. Every attempt has an independent project, SQLite database, and session directory below its immutable plan. It is durably prepared before launch; launched, timed-out, cancelled, or unknown attempts consume their started budget and never automatically retry.
+
+`evolve finalize` records a schema-v2 `real-harness` report only after it reconstructs production receipt, task, call, closed-window, recorded-publication, original native raw-session cutoff, model, effective policy, and checker evidence from each isolated SQLite database. Each qualification names its version scope, exact portable snapshot, required units, and status; the public summary separately lists unverified versions. Missing or uncertain evidence stays `unknown`; model prose, process exit status, output existence, fixture rows, or a report's `eligible` field cannot establish a pass. `evolve summary --report /private/evaluation.json` produces the pathless public summary. `contribute prepare`, `contribute execute`, `release prepare`, and `release execute` each re-run the same qualification. A later Git commit is accepted only when its complete portable tree, manifest, framework, runtime, MIT license, and qualified manifest version equal the evaluated candidate snapshot.
+
+`contribute prepare` restores the saved source commit in an isolated workspace, creates a `codex/` non-default branch, maps only candidate skills/resources, and writes a real diff and package. `contribute execute` separately checks the staged index, worktree, and complete baseline-to-commit tree: only the prepared suite's skills, resources, and manifest may be committed. It rechecks the workspace manifest, runtime, wrapper, and business hashes before pushing that branch. With `--provider github|gitlab --repository <owner/repository> --client <controlled-client>`, the source provenance must record a public `github.com` or `gitlab.com` origin for that same repository; SELC verifies the namespace, provider, and host before it commits or pushes, then queries all matching PR/MR states and accepts reuse only for a matching open request. An inactive or incomplete response stops recovery. It rejects an unclassified self-hosted origin in v0.1. `contribute verify --plan <contribution-plan> --provider <github|gitlab> --client <controlled-client>` reloads that same bound identity and branch rather than resolving a client default such as `GH_HOST`.
 
 If a local push or provider request is interrupted, rerun the same contribution plan. SELC accepts only its one verified contribution commit, rechecks the fixed remote branch before a request is reused, and verifies the provider response against the bound repository, head branch, base branch, and commit. An unknown provider response stops the recovery rather than creating another request. Local releases stage the package and full target metadata inside the bound center before an atomic tag publish; a partial or corrupt existing tag is reported for repair and is never overwritten.
 

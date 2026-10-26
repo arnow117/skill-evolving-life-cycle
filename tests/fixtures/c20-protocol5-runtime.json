@@ -1,0 +1,21 @@
+{
+  "archive_sha256": "ac59b794e0485c52f43b9c60126b4215746d50b4cd4c48f5f55b0ec0c833d9d7",
+  "files": {
+    "selc/__init__.py": "adbdb5c5ebdfcff76ccc59ff3c7abbaac011c518a0b1d2ab533bab78d9598046",
+    "selc/checker_integration.py": "fbde249575fb1a993915a5945f6b10a9db1a2dd8da9ddbd1aef9bb8da029f987",
+    "selc/checkers.py": "98983e08381ce723498334953d11e45c8f6e13766b97cc3384d64ae8f9c5fdb9",
+    "selc/cli.py": "80521c7edf8c0f7c3b4a52cb6a2b42049db02cbc2f027afe662988c94e0a3ef7",
+    "selc/errors.py": "af0b9d717815724031e38ef0c308d3f45349a9c651a80865c475246dd8d7df78",
+    "selc/evolve.py": "b174c8501749631c386f1b6b087a40461fc0bd05aee2d348d166cabc08efa96b",
+    "selc/execution_lease.py": "8bb32b5e95d33f1d5c5bd66d117be6fe477cd486f42978bb50e3b447afbd5080",
+    "selc/install.py": "d11400e5eb1eac9747b9c93ebd948902906ab44e6a30bc428c8704485dbb27dd",
+    "selc/managed_runtime.py": "ffe0a69ca320b3a8dd02fb959857cb6cbcafd88d3785f9080957a01d904322f7",
+    "selc/manifest.py": "0cd301435518c80153cddf7e141912d58f54ef56c9db52c6c754839c70f2d7bd",
+    "selc/native_adapter.py": "41d2355aa851fd817e834d960a67bf2eb73aceef25d6fa6fe5ce1bf4409ba27f",
+    "selc/observation.py": "9acf272031eca57eba8a7854f2502311afe72e17e93cdd4f3dd8411eb4a77e7a",
+    "selc/records.py": "e4ea95c6a1bdb3eee2b341403dbb913d2bd8b9fd1621c6c7550dd3c71d5de860",
+    "selc/util.py": "e9948b050fd5a91c3924a0e04cc2ff81766b742a3d5fb1b40ff049552bf9baaa"
+  },
+  "provenance": "Frozen WorkBuddy c20 installed runtime, writer protocol 5; fixture contains only runtime/selc Python sources.",
+  "writer_protocol_version": 5
+}
