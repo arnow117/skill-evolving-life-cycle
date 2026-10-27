@@ -8,6 +8,8 @@ BASIC 新安装默认不启用 hooks、不要求 receipt、不自动统计。obs
 
 当前安装接口按 SRC-212 分为 basic/observed：新安装默认 basic，普通正文直接注册到 `.codebuddy/skills` 或 `.agents/skills`，不安装采集 hooks、不要求 receipt；已有安装省略模式保留原选择，旧无模式登记按 observed。显式 `--mode observed` 才启用自动统计/受管执行。manifest 可选 `basic_path` 为 skills/ 下独立普通正文；受管旧包没有该正文时需作者补齐或继续 observed。README 是唯一 usage 入口，CLI 参数为权威。T011 真实评估仍未完成，不由基础模式的离线检查替代。
 
+当前未发布源码另有本地统计报告入口 `stats-report`：`--project-root` 必需且可重复，`--output` 必需并指定 `.html` 文件，`--include-test` 可选、仅决定初始显示开关。它生成可双击离线查看的单 HTML，更新数据需重新生成；不新增 runtime 依赖。已发布 v0.1.0 资产不含此命令。使用步骤唯一见 [README US-003B](../README.md#us-003b--view-a-static-local-statistics-report)，实现和检查范围见 [F-004 工程上下文](context/F-004.engineering.md)，不扩展 T011 或自动采集支持声明。
+
 2026-10-25按用户当次确认创建公开Gitee源码镜像 https://gitee.com/arnow117/skill-evolving-life-cycle，从现有公开GitHub仓库完成一次导入。匿名Git读取核对`codex/design`为`8d8328c0313a231f194191d6e12e89f10b4cc128`、`codex/auto-observation`为`4df9b7e3d5be79713028eab48fb0afcc339fdaa7`，默认分支仍为`codex/design`，保留MIT。仅同步GitHub已推送源码；本地未提交候选未包含，也未创建Release或自动同步任务。证据位于同级工作区`20261025-selc-gitee-mirror/`。
 
 ## 定位与事实
@@ -34,6 +36,7 @@ SELC 是在 Codex 创建和维护 skill 套件的 meta skill/脚手架。生成�
 | --- | --- | --- |
 | 作者 skill/CLI | `.claude/skills/selc/`、`scripts/selc.py`、`src/selc/cli.py` | 创建/creator 改写/seal/打包本地流程通过 |
 | 本机记录 | `src/selc/records.py`，项目 `.selc/records.sqlite3` | task/call 双轴结果、反馈修订、导入去重与删除回归通过，见工程 Validation |
+| 本地统计 HTML 报告 | `src/selc/stats_report*.py`、`src/selc/cli.py` 的 `stats-report`、`tests/*stats_report*`、`e2e.config.ts` | roles：architect、server-dev、client-dev、design、security、qa；validate modes：correctness、e2e:Web。仅支持 protocol-6 rollback-journal 的只读来源，拒绝 WAL；独立 HTML 无服务或在线依赖。当前源码入口与证据见 F-004 |
 | 自动观测与业务检查基础 | `observation.py`、`checkers.py`、`checker_integration.py`；manifest可选检查声明 | F-002 T004/T008/T009增量验收通过，131项本地测试；真实宿主正式接入及one-shot完整区间仍未验收 |
 | 安装与宿主适配 | `manifest.py` / `install.py` / `native_adapter.py` / `managed_runtime.py` | 正式native receipt、显式/自动托管激活、action/stage/publish与Stop对账；WorkBuddy5.9.2/GLM-5.3通过实际矩阵，Codex CLI证据单独保留。Codex桌面未验证，已按用户本轮指示取消追加实测；准确范围见F-002工程上下文 |
 | 更新/评估/贡献/发布 | `install.py` / `evolve.py`，portable suite runtime | 框架来源复用、目录恢复、缺省保留与选择并发复核已有返修证据；既有回归仅 public GitHub/GitLab 和 local fixture；本轮已授权真实 GitHub贡献验证，结果待执行 |
@@ -52,5 +55,23 @@ UV_CACHE_DIR=/private/tmp/selc-uv-cache uv run --no-project --python 3.12 python
 ```
 
 README 是面向使用者的唯一全局使用指南，CLI help 为参数权威。F-002已实际执行compileall/py_compile和`git diff --check`；本机uv缓存中的Ruff0.15.6可离线调用，已实际验证版本和四项受影响文件的lint/format检查。具体结果仅适用于工程记录所列快照，不能沿用旧候选的通过结果。该作者工具不是portable运行依赖。官方 skill 格式校验使用当前creator工具环境，不能把其PyYAML当作portable运行依赖。
+
+### 统计报告 Web 检查入口
+
+开发工具为 Node 25.9/npm 11.12，`package.json`、`package-lock.json` 固定 dev-only `e2e 0.18.0`、`@e2e-dev/web 0.13.0`；Playwright 浏览器能力仅用于开发检查，不是 SELC runtime 依赖。测试配置为 `e2e.config.ts`，旅程为 `tests/stats_report.e2e.ts`，直接文件补充脚本为 `tests/stats_report_file_smoke.mjs`，fixture 为 `tests/stats_report_fixture.py`。配置、lockfile 与测试源纳入 Git；`node_modules/` 和 `.e2e/` 下的报告、截图、trace、临时 fixture 等运行产物忽略，实际归档引用见 F-004。
+
+已验证的指定 runner 入口：
+
+```bash
+npm run test:e2e:stats-report -- --output .e2e/runs/routed-http-fresh-final
+```
+
+同一仓库工作目录下已验证的直接文件补充入口：
+
+```bash
+SELC_FILE_SMOKE_DIR=.e2e/file-smoke-final-rates node tests/stats_report_file_smoke.mjs .e2e/file-smoke-final-rates/stats-report.html
+```
+
+指定 runner 的固定 HTTP URL 通过 `browser.route`/`route.fulfill` 传送实际生成 HTML 的原样字节，无 server command 或监听服务；检查宽度为 1440/768/375px。直接 `file://` 补充检查由上述受跟踪脚本执行，宽度为 1440/375px；两种传送方式的证据分开记录，不能把 HTTP 旅程称为双击文件验收。两者均只用确定性浏览器操作与业务断言，零 agent/provider/模型调用或 token 消耗，无需凭据，不启用动作缓存。具体失败历史、检查结果与未验证范围只在 F-004 维护，不由入口存在推断正式 Validate/Review/Ship 已通过。
 
 2026-10-21增量：T014完整前缀工具33项本地检查通过；实际请求5在WorkBuddy5.8.3、自定义GLM-5.3:glm-5.3中精确匹配原生PreToolUse与执行进程身份。生产方案采用无命令改写的直接绑定，T010仍在实现，完整业务及one-shot验收尚未通过；以F-002实施层决定13和私有证据摘要为准。

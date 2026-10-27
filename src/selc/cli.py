@@ -104,6 +104,7 @@ from .records import (
     start_task,
     stats,
 )
+from .stats_report import generate_stats_report
 from .util import exclusive_lock, file_hash
 
 
@@ -118,6 +119,12 @@ class SelcArgumentParser(argparse.ArgumentParser):
 
 def _path(value: str) -> Path:
     return Path(value).expanduser().resolve()
+
+
+def _report_path(value: str) -> Path:
+    """Keep link and hard-link facts intact for safe report-output validation."""
+
+    return Path(value).expanduser()
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -256,6 +263,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     _project(statistics)
     statistics.add_argument("--include-test", action="store_true")
+
+    stats_report = subcommands.add_parser(
+        "stats-report", help="generate an offline local statistics HTML report"
+    )
+    stats_report.add_argument("--project-root", type=_report_path, action="append", required=True)
+    stats_report.add_argument("--output", type=_report_path, required=True)
+    stats_report.add_argument("--include-test", action="store_true")
 
     export = subcommands.add_parser("export", help="export a minimal owner snapshot")
     _project(export)
@@ -1101,6 +1115,14 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
             return stats(database, include_test=arguments.include_test)
         finally:
             database.close()
+    if command == "stats-report":
+        return {
+            "report": generate_stats_report(
+                arguments.project_root,
+                arguments.output,
+                include_test=arguments.include_test,
+            )
+        }
     if command == "export":
         database = open_database(arguments.project_root)
         try:

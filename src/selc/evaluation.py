@@ -18,6 +18,7 @@ import re
 import shutil
 import signal
 import sqlite3
+import stat
 import subprocess
 import time
 import tomllib
@@ -58,8 +59,8 @@ FRAMEWORK_MIT_LICENSE_HASH = "d25592caa5a6ea2534e6d3e38f84e9786650cdb634af57a0fd
 SUPPORTED_ADAPTERS = frozenset({"codex-cli", "codex-desktop", "workbuddy-desktop"})
 CODEX_POLICY_TEMPLATE_SCHEMA_VERSION = 1
 CODEX_ALPHA11_VERSION = "0.163.0-alpha.11"
-CODEX_HOOK_TRUST_SCHEMA_VERSION = 1
-CODEX_HOOK_TRUST_MODE = "normal-state-inheritance-v1"
+CODEX_HOOK_TRUST_SCHEMA_VERSION = 2
+CODEX_HOOK_TRUST_MODE = "normal-project-and-hook-state-inheritance-v2"
 CODEX_MANAGED_HOOK_EVENTS = (
     ("UserPromptSubmit", "user_prompt_submit"),
     ("PreToolUse", "pre_tool_use"),
@@ -1503,12 +1504,12 @@ def _fixed_codex_cli_profile() -> dict[str, object]:
 
 
 def _fixed_codex_hook_trust_template() -> dict[str, object]:
-    """Declare the only normal hook trust state the runner can inherit.
+    """Declare the normal project and hook trust state the runner can inherit.
 
-    Codex's public ``--ignore-user-config`` flag otherwise omits the normal
-    UI-reviewed hook state.  The template does not contain a trust hash: those
-    values can only be copied from the current account's normal hook review
-    immediately before launch.
+    Codex's public ``--ignore-user-config`` flag otherwise omits normal
+    UI-reviewed project and hook state. The template contains no trust values:
+    the exact project decision and five hook hashes can only be copied from the
+    current account's normal review immediately before launch.
     """
 
     return {
@@ -3223,12 +3224,13 @@ def _codex_cli_prompt(request_path: Path, state: dict[str, Any]) -> bytes:
 def _prepare_codex_hook_trust_binding(
     state: dict[str, Any], matrix: dict[str, Any]
 ) -> dict[str, object]:
-    """Copy only normal UI-reviewed state for this attempt's installed hooks.
+    """Copy normal UI-reviewed project and hook state for one isolated attempt.
 
     ``--ignore-user-config`` keeps arbitrary account configuration out of the
-    runner.  Codex stores normal hook review decisions in that configuration,
-    so this helper extracts the five installer-owned entries after they have
-    been reviewed through Codex's normal UI.  It never creates a trust value.
+    runner. Codex stores normal project and hook review decisions in that
+    configuration, so this helper extracts the one matching Git-root decision
+    and five installer-owned entries after normal UI review. It never creates a
+    trust value.
     """
 
     template = matrix.get("tools_policy_template")
@@ -3284,6 +3286,7 @@ def _prepare_codex_hook_trust_binding(
             "the installed suite differs from the frozen attempt snapshot",
             "prepare a new isolated attempt",
         )
+    git_identity = _codex_attempt_git_identity(project_root)
     hook_source = project_root / ".codex" / "hooks.json"
     definitions, hook_source_sha256 = _codex_installed_hook_definitions(
         hook_source,
@@ -3299,13 +3302,22 @@ def _prepare_codex_hook_trust_binding(
             "normal Codex hook trust configuration is not valid UTF-8 TOML",
             "review the normal Codex hook trust state before launching",
         ) from error
+    project_trust = _selected_codex_project_trust(
+        configuration,
+        git_identity,
+        project_root,
+    )
     states = _selected_codex_hook_trust_states(configuration, hook_source, definitions)
     return {
         "schema_version": CODEX_HOOK_TRUST_SCHEMA_VERSION,
         "mode": CODEX_HOOK_TRUST_MODE,
         "template_hash": matrix.get("tools_policy_template_hash"),
+        "account_home": str(account_home),
         "config_source_path": str(config_path),
         "config_source_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "canonical_cwd": str(project_root),
+        "git_identity": git_identity,
+        "project_trust": project_trust,
         "hook_source_path": str(hook_source.resolve()),
         "hook_source_sha256": hook_source_sha256,
         "installation_hooks_hash": installation.get("hooks_hash"),
@@ -3326,6 +3338,203 @@ def _read_regular_bytes(path: Path, description: str) -> bytes:
             f"{description} is unavailable",
             "complete normal hook review before launching",
         ) from error
+
+
+def _codex_attempt_git_identity(project_root: Path) -> dict[str, str]:
+    """Read the one direct Git identity enclosing a Codex attempt.
+
+    An attempt can be a directory below a normally trusted Git root.  It cannot
+    introduce another repository, a worktree ``.git`` file, or alternate Git
+    metadata between that root and the attempt.
+    """
+
+    canonical_cwd = project_root.resolve()
+    direct_root, git_directory = _nearest_direct_git_root(canonical_cwd)
+    repository_root = _git_repository_path(canonical_cwd, "--show-toplevel")
+    git_dir = _git_repository_path(canonical_cwd, "--git-dir")
+    git_common_dir = _git_repository_path(canonical_cwd, "--git-common-dir")
+    if repository_root != direct_root or git_dir != git_directory or git_common_dir != git_dir:
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "the isolated evaluation project has an ambiguous enclosing Git identity",
+            "use normal Codex trust for the existing Git repository",
+        )
+    return {
+        "repository_root": str(repository_root),
+        "git_dir": str(git_dir),
+        "git_common_dir": str(git_common_dir),
+    }
+
+
+def _nearest_direct_git_root(canonical_cwd: Path) -> tuple[Path, Path]:
+    """Find the only direct ``.git`` directory that contains an attempt."""
+
+    current = canonical_cwd
+    direct_root: Path | None = None
+    direct_git_directory: Path | None = None
+    while True:
+        git_entry = current / ".git"
+        entry_type = _git_metadata_entry_type(git_entry)
+        if entry_type is not None:
+            if entry_type != "directory":
+                raise SelcError(
+                    "HOOK_TRUST_SOURCE_INVALID",
+                    "the isolated evaluation project has non-directory Git metadata",
+                    "use normal Codex trust for the existing Git repository",
+                )
+            if direct_root is not None:
+                raise SelcError(
+                    "HOOK_TRUST_SOURCE_INVALID",
+                    "the isolated evaluation project is inside nested Git repositories",
+                    "use one normally trusted Git repository",
+                )
+            direct_root = current
+            direct_git_directory = git_entry.resolve(strict=True)
+        if current == current.parent:
+            break
+        current = current.parent
+    if direct_root is None or direct_git_directory is None:
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "the isolated evaluation project is not inside a direct Git repository",
+            "trust the existing Git repository through Codex's normal UI",
+        )
+    return direct_root, direct_git_directory
+
+
+def _git_metadata_entry_type(git_entry: Path) -> str | None:
+    """Classify a possible ``.git`` entry without following symlinks."""
+
+    try:
+        metadata = git_entry.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "the isolated evaluation project's Git metadata cannot be inspected",
+            "use normal Codex trust for the existing Git repository",
+        ) from error
+    if stat.S_ISLNK(metadata.st_mode):
+        return "symlink"
+    if stat.S_ISDIR(metadata.st_mode):
+        return "directory"
+    return "other"
+
+
+def _git_repository_path(project_root: Path, argument: str) -> Path:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", argument],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "the isolated evaluation project's Git identity is unavailable",
+            "use normal Codex trust for the existing Git repository",
+        ) from error
+    value = completed.stdout.strip()
+    if completed.returncode != 0 or not value or "\n" in value:
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "the isolated evaluation project's Git identity is unavailable",
+            "use normal Codex trust for the existing Git repository",
+        )
+    path = Path(value)
+    if not path.is_absolute():
+        path = project_root / path
+    try:
+        return path.resolve(strict=True)
+    except OSError as error:
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "the isolated evaluation project's Git identity is unavailable",
+            "use normal Codex trust for the existing Git repository",
+        ) from error
+
+
+def _selected_codex_project_trust(
+    configuration: object,
+    git_identity: dict[str, str],
+    canonical_cwd: Path,
+) -> dict[str, str]:
+    """Select one exact normal-UI project trust decision for this Git root."""
+
+    if not isinstance(configuration, dict):
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "normal Codex project trust configuration is not an object",
+            "trust the isolated project through Codex's normal UI",
+        )
+    projects = configuration.get("projects")
+    if not isinstance(projects, dict):
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "normal Codex project trust is missing",
+            "trust the isolated project through Codex's normal UI",
+        )
+    repository_root = Path(git_identity["repository_root"])
+    expected_key = str(repository_root)
+    selected: tuple[str, object] | None = None
+    for raw_key, value in projects.items():
+        if not isinstance(raw_key, str):
+            continue
+        configured_path = Path(raw_key)
+        if not configured_path.is_absolute():
+            continue
+        resolved_path = configured_path.resolve()
+        if resolved_path == repository_root:
+            if raw_key != expected_key:
+                raise SelcError(
+                    "HOOK_TRUST_SOURCE_INVALID",
+                    "normal Codex project trust uses an ambiguous path alias",
+                    "trust the isolated project through Codex's normal UI",
+                )
+            if selected is not None:
+                raise SelcError(
+                    "HOOK_TRUST_SOURCE_INVALID",
+                    "normal Codex project trust has more than one matching identity",
+                    "trust the isolated project through Codex's normal UI",
+                )
+            selected = (raw_key, value)
+            continue
+        is_under_repository = _path_is_within(resolved_path, repository_root)
+        is_cwd_within_entry = _path_is_within(canonical_cwd, resolved_path)
+        if (
+            is_under_repository
+            and is_cwd_within_entry
+            and isinstance(value, dict)
+            and value.get("trust_level") == "untrusted"
+        ):
+            raise SelcError(
+                "HOOK_TRUST_SOURCE_INVALID",
+                "a more specific normal Codex project trust decision is untrusted",
+                "resolve the project trust through Codex's normal UI",
+            )
+    if selected is None:
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "normal Codex project trust is missing for this isolated Git root",
+            "trust the isolated project through Codex's normal UI",
+        )
+    raw_key, value = selected
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"trust_level"}
+        or value.get("trust_level") != "trusted"
+    ):
+        raise SelcError(
+            "HOOK_TRUST_SOURCE_INVALID",
+            "normal Codex project trust is not an unchanged trusted decision",
+            "trust the isolated project through Codex's normal UI",
+        )
+    return {"raw_key": raw_key, "trust_level": "trusted"}
 
 
 def _codex_installed_hook_definitions(
@@ -3466,7 +3675,9 @@ def _hook_trust_cli_entries(
     hook_trust_binding: dict[str, object], state: dict[str, Any], matrix: dict[str, Any]
 ) -> list[str]:
     _validate_saved_codex_hook_trust_binding(hook_trust_binding, state, matrix)
+    project_trust = hook_trust_binding["project_trust"]
     states = hook_trust_binding["states"]
+    assert isinstance(project_trust, dict)
     assert isinstance(states, list)
     state_values: list[str] = []
     for item in states:
@@ -3475,7 +3686,21 @@ def _hook_trust_cli_entries(
         trusted_hash = item["trusted_hash"]
         assert isinstance(key, str) and isinstance(trusted_hash, str)
         state_values.append(f"{json.dumps(key)}={{trusted_hash={json.dumps(trusted_hash)}}}")
-    return ["-c", f"hooks.state={{{','.join(state_values)}}}"]
+    return [
+        "-c",
+        _project_trust_cli_configuration(project_trust),
+        "-c",
+        f"hooks.state={{{','.join(state_values)}}}",
+    ]
+
+
+def _project_trust_cli_configuration(project_trust: dict[str, object]) -> str:
+    """Encode one selected raw project key as a complete TOML inline table."""
+
+    project_key = project_trust["raw_key"]
+    trust_level = project_trust["trust_level"]
+    assert isinstance(project_key, str) and isinstance(trust_level, str)
+    return f"projects={{{json.dumps(project_key)}={{trust_level={json.dumps(trust_level)}}}}}"
 
 
 def _validate_saved_codex_hook_trust_binding(
@@ -3507,8 +3732,12 @@ def _validate_saved_codex_hook_trust_binding(
         "schema_version",
         "mode",
         "template_hash",
+        "account_home",
         "config_source_path",
         "config_source_sha256",
+        "canonical_cwd",
+        "git_identity",
+        "project_trust",
         "hook_source_path",
         "hook_source_sha256",
         "installation_hooks_hash",
@@ -3523,11 +3752,22 @@ def _validate_saved_codex_hook_trust_binding(
         )
     expected_config_path = str(Path(template["account_home"]) / ".codex" / "config.toml")
     expected_hook_source = str(project_root / ".codex" / "hooks.json")
+    try:
+        current_git_identity = _codex_attempt_git_identity(project_root)
+    except SelcError as error:
+        raise SelcError(
+            "HOOK_TRUST_BINDING_INVALID",
+            "the isolated Git identity is unavailable for qualification",
+            "collect the attempt as unknown",
+        ) from error
     if (
         binding.get("schema_version") != CODEX_HOOK_TRUST_SCHEMA_VERSION
         or binding.get("mode") != CODEX_HOOK_TRUST_MODE
         or binding.get("template_hash") != matrix.get("tools_policy_template_hash")
+        or binding.get("account_home") != template.get("account_home")
         or binding.get("config_source_path") != expected_config_path
+        or binding.get("canonical_cwd") != str(project_root)
+        or binding.get("git_identity") != current_git_identity
         or binding.get("hook_source_path") != expected_hook_source
         or binding.get("installation_hooks_hash") != installation.get("hooks_hash")
         or not _is_digest(binding.get("config_source_sha256"))
@@ -3536,6 +3776,19 @@ def _validate_saved_codex_hook_trust_binding(
         raise SelcError(
             "HOOK_TRUST_BINDING_INVALID",
             "the frozen normal hook trust binding does not match this attempt",
+            "collect the attempt as unknown",
+        )
+    project_trust = binding.get("project_trust")
+    expected_project_key = current_git_identity["repository_root"]
+    if (
+        not isinstance(project_trust, dict)
+        or set(project_trust) != {"raw_key", "trust_level"}
+        or project_trust.get("raw_key") != expected_project_key
+        or project_trust.get("trust_level") != "trusted"
+    ):
+        raise SelcError(
+            "HOOK_TRUST_BINDING_INVALID",
+            "the frozen normal Codex project trust is invalid",
             "collect the attempt as unknown",
         )
     definitions = binding.get("definitions")

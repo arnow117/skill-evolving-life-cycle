@@ -6,9 +6,9 @@
       "engineering_context_ref": ".sdlc-v1/context/F-001.engineering.md",
       "id": "F-001",
       "release": {
-        "at": null,
-        "commit": null,
-        "status": "pending"
+        "at": "2026-10-27T00:44:48Z",
+        "commit": "aa079e25727e1d37c4a884d8d75bf6d5805ac4ef",
+        "status": "released"
       },
       "requirement_id": "REQ-001",
       "review": {
@@ -16,7 +16,7 @@
         "by": "/root/selc_release_readiness_review",
         "decision": "approved"
       },
-      "status": "reviewed",
+      "status": "released",
       "tasks": {
         "T-001": {
           "depends_on": [],
@@ -44,7 +44,7 @@
           "updated_at": "2026-10-20T05:43:48Z"
         }
       },
-      "updated_at": "2026-10-20T05:53:05Z",
+      "updated_at": "2026-10-27T00:44:48Z",
       "validation": {
         "at": "2026-10-20T05:48:10Z",
         "command": "UV_CACHE_DIR=/private/tmp/selc-uv-cache uv run --no-project --python 3.12 python -m unittest discover -s tests -v",
@@ -227,6 +227,74 @@
         "commit": "33345ea55492c508d2e153a3b6195d394fcd8d51",
         "result": "pass"
       }
+    },
+    "F-004": {
+      "branch": "codex/auto-observation",
+      "created_at": "2026-10-26T11:12:13Z",
+      "engineering_context_ref": ".sdlc-v1/context/F-004.engineering.md",
+      "id": "F-004",
+      "release": {
+        "at": "2026-10-26T13:19:10Z",
+        "commit": "6e08a71b1317ad4785e84635d041d4ac63e0ebca",
+        "status": "released"
+      },
+      "requirement_id": "REQ-004",
+      "review": {
+        "at": "2026-10-26T13:12:54Z",
+        "by": "/root/stats_report_review_committed",
+        "decision": "approved"
+      },
+      "status": "released",
+      "tasks": {
+        "T018": {
+          "depends_on": [],
+          "id": "T018",
+          "status": "done",
+          "title": "实现只读统计 HTML 报告与完整离线验证",
+          "updated_at": "2026-10-26T13:07:57Z"
+        }
+      },
+      "updated_at": "2026-10-26T13:19:10Z",
+      "validation": {
+        "at": "2026-10-26T13:10:48Z",
+        "command": "npm run test:e2e:stats-report -- --output .e2e/runs/validate-6e08a71-elevated",
+        "commit": "6e08a71b1317ad4785e84635d041d4ac63e0ebca",
+        "result": "pass"
+      }
+    },
+    "F-005": {
+      "branch": "codex/auto-observation",
+      "created_at": "2026-10-27T00:46:46Z",
+      "engineering_context_ref": ".sdlc-v1/context/F-005.engineering.md",
+      "id": "F-005",
+      "release": {
+        "at": null,
+        "commit": null,
+        "status": "pending"
+      },
+      "requirement_id": "REQ-005",
+      "review": {
+        "at": null,
+        "by": null,
+        "decision": "pending"
+      },
+      "status": "in_progress",
+      "tasks": {
+        "T019": {
+          "depends_on": [],
+          "id": "T019",
+          "status": "in_progress",
+          "title": "准备v0.2.0发行元数据与可复现制品",
+          "updated_at": "2026-10-27T00:46:46Z"
+        }
+      },
+      "updated_at": "2026-10-27T00:46:46Z",
+      "validation": {
+        "at": null,
+        "command": null,
+        "commit": null,
+        "result": "pending"
+      }
     }
   },
   "requirements": {
@@ -239,9 +307,9 @@
       "id": "REQ-001",
       "priority": "P1",
       "product_context_ref": ".sdlc-v1/context/REQ-001.product.md",
-      "status": "validated",
+      "status": "released",
       "title": "Skill Evolving Life Cycle 的创建、观测与迭代方案",
-      "updated_at": "2026-10-20T05:53:05Z"
+      "updated_at": "2026-10-27T00:44:48Z"
     },
     "REQ-002": {
       "created_at": "2026-10-20T06:16:03Z",
@@ -268,6 +336,32 @@
       "status": "released",
       "title": "SELC基础可用版首发与双端同步",
       "updated_at": "2026-10-26T04:56:44Z"
+    },
+    "REQ-004": {
+      "created_at": "2026-10-26T09:57:44Z",
+      "depends_on": [],
+      "description": "只读查看显式指定本机项目的四轴统计、筛选与并列总览，保持现有口径和数据边界。",
+      "domain": "skill-observability",
+      "feature_id": "F-004",
+      "id": "REQ-004",
+      "priority": "P1",
+      "product_context_ref": ".sdlc-v1/context/REQ-004.product.md",
+      "status": "released",
+      "title": "本地统计查看与多项目总览",
+      "updated_at": "2026-10-26T13:19:10Z"
+    },
+    "REQ-005": {
+      "created_at": "2026-10-27T00:46:46Z",
+      "depends_on": [],
+      "description": "将已交付统计报告纳入下一正式安装版，复用基础分发与双平台入口，不运行真实模型测试。",
+      "domain": "skill-distribution",
+      "feature_id": "F-005",
+      "id": "REQ-005",
+      "priority": "P1",
+      "product_context_ref": ".sdlc-v1/context/REQ-005.product.md",
+      "status": "in_delivery",
+      "title": "发布包含统计页的SELC v0.2.0安装包",
+      "updated_at": "2026-10-27T00:46:46Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

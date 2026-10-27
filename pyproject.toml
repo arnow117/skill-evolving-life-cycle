@@ -1,6 +1,6 @@
 [project]
 name = "selc"
-version = "0.1.0"
+version = "0.2.0"
 description = "A portable skill evolving life cycle reference implementation"
 requires-python = ">=3.11"
 
