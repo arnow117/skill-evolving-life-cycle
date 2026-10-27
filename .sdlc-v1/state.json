@@ -6,9 +6,9 @@
       "engineering_context_ref": ".sdlc-v1/context/F-001.engineering.md",
       "id": "F-001",
       "release": {
-        "at": null,
-        "commit": null,
-        "status": "pending"
+        "at": "2026-10-27T00:44:48Z",
+        "commit": "aa079e25727e1d37c4a884d8d75bf6d5805ac4ef",
+        "status": "released"
       },
       "requirement_id": "REQ-001",
       "review": {
@@ -16,7 +16,7 @@
         "by": "/root/selc_release_readiness_review",
         "decision": "approved"
       },
-      "status": "reviewed",
+      "status": "released",
       "tasks": {
         "T-001": {
           "depends_on": [],
@@ -44,7 +44,7 @@
           "updated_at": "2026-10-20T05:43:48Z"
         }
       },
-      "updated_at": "2026-10-20T05:53:05Z",
+      "updated_at": "2026-10-27T00:44:48Z",
       "validation": {
         "at": "2026-10-20T05:48:10Z",
         "command": "UV_CACHE_DIR=/private/tmp/selc-uv-cache uv run --no-project --python 3.12 python -m unittest discover -s tests -v",
@@ -273,9 +273,9 @@
       "id": "REQ-001",
       "priority": "P1",
       "product_context_ref": ".sdlc-v1/context/REQ-001.product.md",
-      "status": "validated",
+      "status": "released",
       "title": "Skill Evolving Life Cycle 的创建、观测与迭代方案",
-      "updated_at": "2026-10-20T05:53:05Z"
+      "updated_at": "2026-10-27T00:44:48Z"
     },
     "REQ-002": {
       "created_at": "2026-10-20T06:16:03Z",
