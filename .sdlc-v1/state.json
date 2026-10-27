@@ -261,6 +261,40 @@
         "commit": "6e08a71b1317ad4785e84635d041d4ac63e0ebca",
         "result": "pass"
       }
+    },
+    "F-005": {
+      "branch": "codex/auto-observation",
+      "created_at": "2026-10-27T00:46:46Z",
+      "engineering_context_ref": ".sdlc-v1/context/F-005.engineering.md",
+      "id": "F-005",
+      "release": {
+        "at": null,
+        "commit": null,
+        "status": "pending"
+      },
+      "requirement_id": "REQ-005",
+      "review": {
+        "at": null,
+        "by": null,
+        "decision": "pending"
+      },
+      "status": "in_progress",
+      "tasks": {
+        "T019": {
+          "depends_on": [],
+          "id": "T019",
+          "status": "in_progress",
+          "title": "准备v0.2.0发行元数据与可复现制品",
+          "updated_at": "2026-10-27T00:46:46Z"
+        }
+      },
+      "updated_at": "2026-10-27T00:46:46Z",
+      "validation": {
+        "at": null,
+        "command": null,
+        "commit": null,
+        "result": "pending"
+      }
     }
   },
   "requirements": {
@@ -315,6 +349,19 @@
       "status": "released",
       "title": "本地统计查看与多项目总览",
       "updated_at": "2026-10-26T13:19:10Z"
+    },
+    "REQ-005": {
+      "created_at": "2026-10-27T00:46:46Z",
+      "depends_on": [],
+      "description": "将已交付统计报告纳入下一正式安装版，复用基础分发与双平台入口，不运行真实模型测试。",
+      "domain": "skill-distribution",
+      "feature_id": "F-005",
+      "id": "REQ-005",
+      "priority": "P1",
+      "product_context_ref": ".sdlc-v1/context/REQ-005.product.md",
+      "status": "in_delivery",
+      "title": "发布包含统计页的SELC v0.2.0安装包",
+      "updated_at": "2026-10-27T00:46:46Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",

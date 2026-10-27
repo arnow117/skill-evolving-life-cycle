@@ -1,14 +1,15 @@
-# SELC v0.1.0
+# SELC v0.2.0
 
-SELC v0.1.0 provides a stable **BASIC** path for creating, validating, sealing, packaging, and ordinarily installing a versioned skill suite. BASIC registration is a direct local skill registration: it installs no hooks, requires no native receipt, and records no automatic task, one-shot, qualification, or success statistics. The authoring skill at `.claude/skills/selc/` is for Codex. A generated suite installs into Codex and WorkBuddy without requiring this repository, a global `selc` command, or Codex at the WorkBuddy installation site.
+SELC v0.2.0 provides a stable **BASIC** path for creating, validating, sealing, packaging, and ordinarily installing a versioned skill suite. It also distributes the existing offline `stats-report` command for a single, double-clickable HTML statistics report. BASIC registration is a direct local skill registration: it installs no hooks, requires no native receipt, and records no automatic task, one-shot, qualification, or success statistics. The authoring meta skill at `.claude/skills/selc/` is for Codex authors only. A WorkBuddy user consumes either the ordinary skill ZIP or a generated suite; a generated suite installs into Codex and WorkBuddy without requiring this repository, a global `selc` command, or Codex at the WorkBuddy installation site.
 
-Get this version from [GitHub Release v0.1.0](https://github.com/arnow117/skill-evolving-life-cycle/releases/tag/v0.1.0). The matching source mirror is [Gitee](https://gitee.com/arnow117/skill-evolving-life-cycle). Release assets include the source archive, portable framework, ordinary skill example, basic suite, and SHA256SUMS.
+Get this version from [GitHub Release v0.2.0](https://github.com/arnow117/skill-evolving-life-cycle/releases/tag/v0.2.0). The matching source tag is [Gitee v0.2.0](https://gitee.com/arnow117/skill-evolving-life-cycle/tree/v0.2.0). Release assets include the source archive, portable framework, ordinary skill example, basic suite, and SHA256SUMS. The v0.1.0 tag and assets remain unchanged.
 
-| Capability | v0.1.0 support |
+| Capability | v0.2.0 support |
 | --- | --- |
 | `create`, `validate`, `seal`, and `package` | BASIC |
 | Fresh basic installation, explicit basic upgrade, and standard-library portable execution | BASIC |
 | Fresh basic installation behavior | No hooks, no receipt, no automatic statistics |
+| Offline `stats-report` from source or a complete generated suite | BASIC, read-only local HTML |
 | Existing installation compatibility | Omitted mode preserves the saved mode; a legacy registration with no saved mode remains observed |
 | Observed hooks, automatic statistics, one-shot results, and native attribution | **EXPERIMENTAL** |
 | Real creator and evaluation, automated contribution, and automated release pipeline | **EXPERIMENTAL** |
@@ -158,7 +159,7 @@ Reports keep independent task and call denominators. Each axis exposes `N`, `S`,
 
 ## US-003B — View a static local statistics report
 
-Use `stats-report` when an owner needs an offline, double-clickable count-only snapshot. Pass every selected project explicitly and choose an `.html` output whose parent already exists. The report reads only supported protocol-6 rollback-journal records databases without initializing, exporting, migrating, or mutating them. A project confirmed by its read-only installation registry to be entirely `basic` can appear as an empty source; it does not make an observation or health claim. This command is available from the current source tree; the published v0.1.0 release assets predate it, so use their documented stable-tag entry point only for the commands those assets contain.
+Use `stats-report` when an owner needs an offline, double-clickable count-only snapshot. Pass every selected project explicitly and choose an `.html` output whose parent already exists. The report reads only supported protocol-6 rollback-journal records databases without initializing, exporting, migrating, or mutating them. A project confirmed by its read-only installation registry to be entirely `basic` can appear as an empty source; it does not make an observation or health claim. The v0.2.0 source archive and complete `simple-reports-1.0.0.zip` suite include this command. The portable framework ZIP is a runtime-only package, and the ordinary `item-summary` ZIP is a standalone script; neither includes a global report command.
 
 ```bash
 selc stats-report \
@@ -168,6 +169,14 @@ selc stats-report \
 ```
 
 Open `/tmp/selc-statistics.html` directly in a browser. It contains no network dependency or automatic refresh. Regenerate the same file to inspect later records. `--include-test` starts its local test-sample toggle on; without it, test cells remain embedded but start excluded. Filters recompute only the selected project's embedded cells, and projects stay separate because source overlap is not globally deduplicated.
+
+For an unpacked v0.2.0 source archive, use the `selc` function from [Common setup](#common-setup). For an unpacked complete suite, invoke its local runtime instead:
+
+```bash
+python3 /path/to/simple-reports/bin/selc-suite.py stats-report \
+  --project-root /tmp/selc-project \
+  --output /tmp/selc-statistics.html
+```
 
 The report exposes only count axes and grouping dimensions. It excludes task/call IDs, evidence, prompts, logs, credentials, and source paths. It rejects WAL databases, source aliases, and unsafe output links. A readable source can still produce a partial report when another selected source fails; if all selected sources fail, it leaves an existing output untouched.
 
@@ -253,6 +262,8 @@ selc delete --project-root /tmp/another-project --suite-id simple-reports --appl
 ## US-004 — Check and explicitly update a suite
 
 Actor: an installed-suite maintainer. The saved source baseline and framework version are in `.selc/installations.json`. Update checking never replaces an active suite.
+
+Upgrading from v0.1.0 to the v0.2.0 framework changes the framework runtime only. The `simple-reports` business suite remains version 1.0.0, and a saved BASIC installation remains BASIC unless the maintainer explicitly changes its mode.
 
 ```bash
 selc updates check --source /tmp/suite-repository --subdir suite --ref v1.1.0 --force
