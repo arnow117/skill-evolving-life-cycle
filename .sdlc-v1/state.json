@@ -268,32 +268,32 @@
       "engineering_context_ref": ".sdlc-v1/context/F-005.engineering.md",
       "id": "F-005",
       "release": {
-        "at": null,
-        "commit": null,
-        "status": "pending"
+        "at": "2026-10-27T01:13:07Z",
+        "commit": "e0cb7ca478516b01e996eafc4e96e3d2b4a20774",
+        "status": "released"
       },
       "requirement_id": "REQ-005",
       "review": {
-        "at": null,
-        "by": null,
-        "decision": "pending"
+        "at": "2026-10-27T01:05:40Z",
+        "by": "/root/v020_release_review",
+        "decision": "approved"
       },
-      "status": "in_progress",
+      "status": "released",
       "tasks": {
         "T019": {
           "depends_on": [],
           "id": "T019",
-          "status": "in_progress",
+          "status": "done",
           "title": "准备v0.2.0发行元数据与可复现制品",
-          "updated_at": "2026-10-27T00:46:46Z"
+          "updated_at": "2026-10-27T00:54:50Z"
         }
       },
-      "updated_at": "2026-10-27T00:46:46Z",
+      "updated_at": "2026-10-27T01:13:07Z",
       "validation": {
-        "at": null,
-        "command": null,
-        "commit": null,
-        "result": "pending"
+        "at": "2026-10-27T01:00:26Z",
+        "command": "shasum -a 256 -c SHA256SUMS; fresh BASIC/source-suite report and explicit framework upgrade per F-005 Validation",
+        "commit": "e0cb7ca478516b01e996eafc4e96e3d2b4a20774",
+        "result": "pass"
       }
     }
   },
@@ -359,9 +359,9 @@
       "id": "REQ-005",
       "priority": "P1",
       "product_context_ref": ".sdlc-v1/context/REQ-005.product.md",
-      "status": "in_delivery",
+      "status": "released",
       "title": "发布包含统计页的SELC v0.2.0安装包",
-      "updated_at": "2026-10-27T00:46:46Z"
+      "updated_at": "2026-10-27T01:13:07Z"
     }
   },
   "state_format": "sdlc-lightweight-state-v1",
