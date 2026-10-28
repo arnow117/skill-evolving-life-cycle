@@ -135,6 +135,19 @@ selc_python /tmp/selc-project/.selc/installs/simple-reports/current/bin/selc-sui
 
 The installation result identifies the installed version, digest, source baseline, registered skills, and maintenance guide. Directory, Git, and package installs copy the same explicit portable code/resource surface, not a source repository's `.git`, `.selc`, reports, or interpreter cache. Codex entries are registered below `.agents/skills/`; WorkBuddy entries are registered below `.codebuddy/skills/`. The portable run produces a Markdown report. The installed wrapper also supports `seal`, `validate`, `package`, and `install-local` without this repository. Use `seal` only for an authoring source after creator validation; use `evolve` for installed-suite improvements.
 
+For a downloaded package that carries Git provenance, unpack it and run its bundled CLI against the original ZIP. This needs Python 3.11+, with no source checkout or global `selc` command. For the `simple-item-reports` business suite, replace the example paths with the downloaded files and your project:
+
+```bash
+python3.11 /path/to/unpacked-suite/bin/selc-suite.py install \
+  --source /path/to/suite-1.0.0.zip --project-root /path/to/project \
+  --harness workbuddy --mode basic
+python3.11 /path/to/project/.selc/installs/simple-item-reports/current/bin/selc-suite.py updates apply \
+  --source /path/to/suite-1.1.0.zip --project-root /path/to/project \
+  --harness workbuddy --suite-id simple-item-reports
+```
+
+The ZIP source retains the shared Git repository identity across versions. Direct `install.py` instead saves the unpacked directory as its source; a later separately unpacked directory is a different upstream and returns `NAME_CONFLICT`. Choose the ZIP-source route from the first installation when later updates will also come from ZIPs. BASIC mode and existing harness registrations are preserved by an explicit update.
+
 Use `--source <repo> --subdir <relative-suite-dir> --ref <tag-or-commit>` for a local or remote Git suite source. Without `--ref`, a Git source selects the latest stable tag. An explicit `--framework-source` with optional `--framework-ref` or `--framework-subdir` reads `framework.json`, validates runtime protocol 1 and runtime hash, and builds a complete staged composite: business skills/resources are retained while the portable runtime is replaced. Its source, commit, version, protocol, and digest are saved. A later business update preserves that explicit framework; an embedded installation takes its framework from the new business package. Same source and digest reuse the installation only after verifying its content is unchanged. A different source with the same suite name, a conflicting harness skill name, unsafe subdirectory, incompatible framework protocol, or local edit fails with an explicit code. Preserve the local change or choose another suite name before retrying.
 
 ## US-003 — Record and aggregate a task
@@ -278,6 +291,8 @@ selc updates recover --project-root /tmp/selc-project --suite-id simple-reports
 ```
 
 Task entry reads each configured Git upstream at most once per UTC day and stores either a fresh result or a cache hit. A missing upstream is `unconfigured`; an upstream read failure is `unknown` and retains the usable installation. `updates check --force` always performs a new read but never applies it. `updates check --framework-source` reports its real framework descriptor with `applied: false`; `updates apply --framework-source` stages and validates the real replacement runtime before the atomic switch. `updates apply` checks the full business-framework composite before atomically replacing `current`; an active task or host session, a locally edited current suite, a malformed candidate, incompatible protocol, or registration conflict leaves current untouched. If an interrupted transaction leaves `journal.json`, inspect it and use `updates recover`; SELC never infers that a process exit ended a task or session. Successful replacement removes the prior content after current is activated. There is no local version-selection or rollback command.
+
+Use standard `vX.Y.Z` tags for this repository's stable update path. The current selector excludes tags containing `-`; a namespaced tag such as `simple-item-reports-v1.1.0` needs an explicit `--ref` and is not discovered by the daily default check.
 
 For a suite first installed from a directory, its saved source root and `subdir: "."` are restored by `updates apply --suite-id`; the framework-only command above therefore does not need a repeated `--source`. That command checks that the resolved source still matches the installed business version and digest; when changing business content, pass `--source` explicitly as in the first apply command. Selecting an external framework with bytes identical to the embedded runtime still records that explicit source selection. A later ordinary `install` without `--framework-source`, including a second-harness installation, and a later explicit business update continue to materialize that selected runtime until the maintainer explicitly selects another framework. SELC snapshots source bytes before it derives metadata or assembles a composite. An omitted external framework remains a request to reuse the saved selection: if its directory or package has changed, SELC returns `STALE_FRAMEWORK_SELECTION` and leaves the installation unchanged; repeat with an explicit `--framework-source` to select and validate the new runtime.
 
