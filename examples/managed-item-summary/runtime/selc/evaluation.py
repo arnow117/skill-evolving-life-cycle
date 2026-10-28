@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -33,11 +34,13 @@ from .checkers import (
     check_artifact,
 )
 from .errors import SelcError
-from .install import current_installation, install_suite
+from .install import current_installation, install_root, install_suite
 from .managed_runtime import (
+    _discovery_read_binding,
     _history_contains_publication_result,
     _metadata_only_prefix,
     _trusted_posix_account_home,
+    _validate_action_request,
     _verify_native_history_path,
     _workbuddy_assistant_text_is_verified,
     _workbuddy_model_identity,
@@ -47,7 +50,15 @@ from .managed_runtime import (
     _workbuddy_record_has_explicit_scope,
     _workbuddy_user_message_is_verified,
 )
-from .manifest import copy_portable_suite, load_manifest, portable_tree_hash, suite_content_hash
+from .manifest import (
+    copy_portable_suite,
+    load_manifest,
+    managed_configuration,
+    normalize_declared_skills,
+    portable_tree_hash,
+    suite_content_hash,
+)
+from .native_adapter import _managed_prompt_request
 from .util import (
     canonical_json,
     exclusive_lock,
@@ -69,8 +80,10 @@ MAX_CASES = 64
 MAX_TOTAL_EVALUATION_SECONDS = MAX_ATTEMPT_SECONDS * MAX_CASES * MAX_MATRICES
 FRAMEWORK_MIT_LICENSE_HASH = "d25592caa5a6ea2534e6d3e38f84e9786650cdb634af57a0fd039e6ac5632462"
 SUPPORTED_ADAPTERS = frozenset({"codex-cli", "codex-desktop", "workbuddy-desktop"})
-CODEX_POLICY_TEMPLATE_SCHEMA_VERSION = 2
+CODEX_POLICY_TEMPLATE_SCHEMA_VERSION = 3
 CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION = 1
+CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION = 2
+CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION = 3
 CODEX_ALPHA11_VERSION = "0.163.0-alpha.11"
 CODEX_HOOK_TRUST_SCHEMA_VERSION = 2
 CODEX_HOOK_TRUST_MODE = "normal-project-and-hook-state-inheritance-v2"
@@ -88,6 +101,22 @@ CODEX_FIXED_PREPARATION_INSTRUCTIONS = (
     "Publish once as an independent step. Stop after the first error or after a successful publish."
 )
 CODEX_FIXED_PREPARATION_SUMMARY = "fixed-routing-read-and-native-managed-action-v1"
+CODEX_EXPLICIT_ROUTING_PREPARATION_INSTRUCTION_TEMPLATE = (
+    "SELC evaluation preparation instructions:\n"
+    "Read the installer-bound absolute routing entry with exactly this command: "
+    "{routing_command}. Do not choose an account bootstrap directory or search for another entry. "
+    "Do not add arguments, command chaining, redirection, substitution, environment prefixes, newline "
+    "composition, pwd, find, ls, or any input read.\n"
+    "Run the returned immutable routing entry's literal managed invoke exactly once. Use the immutable "
+    "business body returned by that invoke only when it declares the bound fixed-script managed action "
+    "with --request-source native. Do not write a scratch request; the runtime reads the action input.\n"
+    "Publish once as an independent step. Stop after the first error or after a successful publish."
+)
+CODEX_EXPLICIT_ROUTING_PREPARATION_SUMMARY = (
+    "explicit-installed-routing-read-and-native-managed-action-v2"
+)
+CODEX_EXPLICIT_ROUTING_PARAMETER = "installed-registered-routing-entry"
+CODEX_EXPLICIT_ROUTING_RENDERER = "exact-single-cat-command-v1"
 CODEX_KNOWN_DEVELOPER_CONTENT_KINDS = frozenset(
     {
         "host_skills.instructions",
@@ -181,7 +210,8 @@ def build_codex_policy_template(host_version: str, python_read_root: Path) -> di
         "policy": policy,
         "cli": _fixed_codex_cli_profile(CODEX_POLICY_TEMPLATE_SCHEMA_VERSION),
         "hook_trust": _fixed_codex_hook_trust_template(),
-        "preparation_guidance": _fixed_codex_preparation_guidance(),
+        "routing": _fixed_codex_routing_template(),
+        "preparation_guidance": _fixed_codex_explicit_routing_preparation_template(),
     }
 
 
@@ -438,7 +468,17 @@ def prepare_evaluation_attempt(
                 "the prepared evaluation installation differs from its bound snapshot",
                 "prepare a new isolated attempt",
             )
-        policy_binding = _prepare_policy_binding(matrix, project_root)
+        policy_binding = _prepare_policy_binding(
+            matrix,
+            project_root,
+            case=case,
+            suite_id=str(plan["suite_id"]),
+            expected_installation={
+                "suite_id": installation["suite_id"],
+                "version": installation["version"],
+                "digest": installation["digest"],
+            },
+        )
         state = {
             "schema_version": PLAN_SCHEMA_VERSION,
             "execution_type": REAL_EXECUTION_TYPE,
@@ -1266,8 +1306,10 @@ def _normalise_codex_policy_template(
     schema_version = value.get("schema_version")
     if schema_version == CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION:
         return _normalise_codex_policy_template_schema1(value, host_version)
-    if schema_version == CODEX_POLICY_TEMPLATE_SCHEMA_VERSION:
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
         return _normalise_codex_policy_template_schema2(value, host_version)
+    if schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        return _normalise_codex_policy_template_schema3(value, host_version)
     raise SelcError(
         "INVALID_EVALUATION_PLAN",
         "Codex policy template has an unsupported schema version",
@@ -1364,7 +1406,7 @@ def _normalise_codex_policy_template_schema2(
         )
     account_home = _trusted_posix_account_home()
     if (
-        value.get("schema_version") != CODEX_POLICY_TEMPLATE_SCHEMA_VERSION
+        value.get("schema_version") != CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION
         or value.get("host") != "codex"
         or value.get("host_version") != host_version
         or host_version != CODEX_ALPHA11_VERSION
@@ -1375,7 +1417,8 @@ def _normalise_codex_policy_template_schema2(
             "attempt_project": {"kind": "canonical-attempt-project"},
             "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
         }
-        or value.get("cli") != _fixed_codex_cli_profile(CODEX_POLICY_TEMPLATE_SCHEMA_VERSION)
+        or value.get("cli")
+        != _fixed_codex_cli_profile(CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION)
         or value.get("hook_trust") != _fixed_codex_hook_trust_template()
         or value.get("preparation_guidance") != _fixed_codex_preparation_guidance()
     ):
@@ -1393,7 +1436,7 @@ def _normalise_codex_policy_template_schema2(
         )
     normalized_policy = _normalise_template_policy(policy)
     return {
-        "schema_version": CODEX_POLICY_TEMPLATE_SCHEMA_VERSION,
+        "schema_version": CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION,
         "host": "codex",
         "host_version": host_version,
         "account_home": str(account_home),
@@ -1402,9 +1445,81 @@ def _normalise_codex_policy_template_schema2(
             "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
         },
         "policy": normalized_policy,
-        "cli": _fixed_codex_cli_profile(CODEX_POLICY_TEMPLATE_SCHEMA_VERSION),
+        "cli": _fixed_codex_cli_profile(CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION),
         "hook_trust": _fixed_codex_hook_trust_template(),
         "preparation_guidance": _fixed_codex_preparation_guidance(),
+    }
+
+
+def _normalise_codex_policy_template_schema3(
+    value: dict[str, object], host_version: str
+) -> dict[str, object]:
+    """Validate the explicit installed-routing template without changing prior schemas."""
+
+    required = {
+        "schema_version",
+        "host",
+        "host_version",
+        "account_home",
+        "parameters",
+        "policy",
+        "cli",
+        "hook_trust",
+        "routing",
+        "preparation_guidance",
+    }
+    if set(value) != required:
+        raise SelcError(
+            "INVALID_EVALUATION_PLAN",
+            "Codex schema 3 policy template has missing or unsupported fields",
+            "generate a new template with evolve policy-template",
+        )
+    account_home = _trusted_posix_account_home()
+    if (
+        value.get("schema_version") != CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION
+        or value.get("host") != "codex"
+        or value.get("host_version") != host_version
+        or host_version != CODEX_ALPHA11_VERSION
+        or account_home is None
+        or value.get("account_home") != str(account_home)
+        or value.get("parameters")
+        != {
+            "attempt_project": {"kind": "canonical-attempt-project"},
+            "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
+        }
+        or value.get("cli")
+        != _fixed_codex_cli_profile(CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION)
+        or value.get("hook_trust") != _fixed_codex_hook_trust_template()
+        or value.get("routing") != _fixed_codex_routing_template()
+        or value.get("preparation_guidance") != _fixed_codex_explicit_routing_preparation_template()
+    ):
+        raise SelcError(
+            "INVALID_EVALUATION_PLAN",
+            "Codex schema 3 policy template is not the fixed explicit-routing profile",
+            "regenerate the template on this supported account",
+        )
+    policy = value.get("policy")
+    if not isinstance(policy, dict):
+        raise SelcError(
+            "INVALID_EVALUATION_PLAN",
+            "Codex policy template has no structured policy",
+            "regenerate the template",
+        )
+    normalized_policy = _normalise_template_policy(policy)
+    return {
+        "schema_version": CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION,
+        "host": "codex",
+        "host_version": host_version,
+        "account_home": str(account_home),
+        "parameters": {
+            "attempt_project": {"kind": "canonical-attempt-project"},
+            "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
+        },
+        "policy": normalized_policy,
+        "cli": _fixed_codex_cli_profile(CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION),
+        "hook_trust": _fixed_codex_hook_trust_template(),
+        "routing": _fixed_codex_routing_template(),
+        "preparation_guidance": _fixed_codex_explicit_routing_preparation_template(),
     }
 
 
@@ -1618,17 +1733,101 @@ def _fixed_codex_cli_profile(
 
     if schema_version == CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION:
         return _fixed_codex_cli_profile_schema1()
-    if schema_version != CODEX_POLICY_TEMPLATE_SCHEMA_VERSION:
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
+        profile = _fixed_codex_cli_profile_schema1()
+        settings = dict(profile["settings"])
+        settings["developer_instructions"] = CODEX_FIXED_PREPARATION_INSTRUCTIONS
+        profile["settings"] = settings
+        return profile
+    if schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        return _fixed_codex_cli_profile_schema1()
+    raise SelcError(
+        "INVALID_EVALUATION_PLAN",
+        "Codex policy template has an unsupported schema version",
+        "regenerate the template on this supported account",
+    )
+
+
+def _fixed_codex_routing_template() -> dict[str, object]:
+    """Declare the only dynamic value that schema 3 may render into guidance."""
+
+    return {
+        "schema_version": 1,
+        "parameter": CODEX_EXPLICIT_ROUTING_PARAMETER,
+        "renderer": CODEX_EXPLICIT_ROUTING_RENDERER,
+    }
+
+
+def _fixed_codex_explicit_routing_preparation_template() -> dict[str, object]:
+    """Describe the schema-3 literal before an installed entry is available."""
+
+    return {
+        "schema_version": CODEX_PREPARATION_GUIDANCE_SCHEMA_VERSION,
+        "role": "developer",
+        "content_kind": CODEX_PREPARATION_GUIDANCE_CONTENT_KIND,
+        "instruction_template": CODEX_EXPLICIT_ROUTING_PREPARATION_INSTRUCTION_TEMPLATE,
+        "summary": CODEX_EXPLICIT_ROUTING_PREPARATION_SUMMARY,
+    }
+
+
+def _render_codex_explicit_routing_instructions(routing_command: str) -> str:
+    """Render one schema-3 developer fragment from a verified two-argument command."""
+
+    try:
+        argv = shlex.split(routing_command, posix=True)
+    except ValueError as error:
         raise SelcError(
-            "INVALID_EVALUATION_PLAN",
-            "Codex policy template has an unsupported schema version",
-            "regenerate the template on this supported account",
+            "ATTEMPT_TAMPERED",
+            "the installed routing command is not a literal shell argv",
+            "prepare a new evaluation attempt",
+        ) from error
+    if (
+        len(argv) != 2
+        or argv[0] != "/bin/cat"
+        or not Path(argv[1]).is_absolute()
+        or routing_command != shlex.join(argv)
+    ):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the installed routing command is not the one allowed cat invocation",
+            "prepare a new evaluation attempt",
         )
-    profile = _fixed_codex_cli_profile_schema1()
-    settings = dict(profile["settings"])
-    settings["developer_instructions"] = CODEX_FIXED_PREPARATION_INSTRUCTIONS
-    profile["settings"] = settings
-    return profile
+    return CODEX_EXPLICIT_ROUTING_PREPARATION_INSTRUCTION_TEMPLATE.format(
+        routing_command=routing_command
+    )
+
+
+def _bound_codex_explicit_routing_preparation_guidance(
+    template: dict[str, object], routing: object
+) -> dict[str, object]:
+    """Return the exact private schema-3 fragment summary for a routing binding."""
+
+    if (
+        template.get("routing") != _fixed_codex_routing_template()
+        or template.get("preparation_guidance")
+        != _fixed_codex_explicit_routing_preparation_template()
+        or not isinstance(routing, dict)
+    ):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the schema 3 routing template is incomplete",
+            "prepare a new evaluation attempt",
+        )
+    command = routing.get("command")
+    if not isinstance(command, str):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the schema 3 routing command is unavailable",
+            "prepare a new evaluation attempt",
+        )
+    instructions = _render_codex_explicit_routing_instructions(command)
+    return {
+        "schema_version": CODEX_PREPARATION_GUIDANCE_SCHEMA_VERSION,
+        "role": "developer",
+        "content_kind": CODEX_PREPARATION_GUIDANCE_CONTENT_KIND,
+        "digest": hashlib.sha256(instructions.encode("utf-8")).hexdigest(),
+        "summary": CODEX_EXPLICIT_ROUTING_PREPARATION_SUMMARY,
+    }
 
 
 def _fixed_codex_cli_profile_schema1() -> dict[str, object]:
@@ -1684,7 +1883,14 @@ def _fixed_codex_hook_trust_template() -> dict[str, object]:
     }
 
 
-def _prepare_policy_binding(matrix: dict[str, Any], project_root: Path) -> dict[str, object]:
+def _prepare_policy_binding(
+    matrix: dict[str, Any],
+    project_root: Path,
+    *,
+    case: dict[str, Any] | None = None,
+    suite_id: str | None = None,
+    expected_installation: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Bind the only runtime policy parameters before a host can start."""
 
     if _qualification_support(matrix) != "supported":
@@ -1722,14 +1928,182 @@ def _prepare_policy_binding(matrix: dict[str, Any], project_root: Path) -> dict[
         "cli": template["cli"],
         "hook_trust": template["hook_trust"],
     }
-    if template.get("schema_version") == CODEX_POLICY_TEMPLATE_SCHEMA_VERSION:
+    schema_version = template.get("schema_version")
+    bound_routing: dict[str, object] | None = None
+    bound_guidance: dict[str, object] | None = None
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
         configuration["preparation_guidance"] = template["preparation_guidance"]
-    return {
+    elif schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        bound_routing = _prepare_explicit_routing_binding(
+            project_root,
+            case=case,
+            suite_id=suite_id,
+            expected_installation=expected_installation,
+        )
+        bound_guidance = _bound_codex_explicit_routing_preparation_guidance(
+            template,
+            bound_routing,
+        )
+        configuration["routing"] = bound_routing
+        configuration["preparation_guidance"] = bound_guidance
+    binding = {
         "status": "bound",
         "template_hash": template_hash,
         "mapping": mapping,
         "cli_configuration": configuration,
         "cli_configuration_hash": json_hash(configuration),
+    }
+    if bound_routing is not None and bound_guidance is not None:
+        binding["routing"] = bound_routing
+        binding["preparation_guidance"] = bound_guidance
+    return binding
+
+
+def _prepare_explicit_routing_binding(
+    project_root: Path,
+    *,
+    case: dict[str, Any] | None,
+    suite_id: str | None,
+    expected_installation: dict[str, object] | None,
+) -> dict[str, object]:
+    """Derive one schema-3 routing command from frozen request and installation state.
+
+    The explicit developer instruction may contain an absolute route, but that
+    route is private attempt evidence. It is always reconstructed from the
+    frozen request and the current installer-owned registration; no request
+    state or caller argument can substitute the route or selected skill.
+    """
+
+    if not isinstance(case, dict) or not isinstance(suite_id, str) or not suite_id:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "schema 3 requires a frozen case and suite identity",
+            "prepare a new evaluation attempt",
+        )
+    try:
+        installation = current_installation(project_root, suite_id)
+        current_root = install_root(project_root) / suite_id / "current"
+        if not current_root.is_symlink() or portable_tree_hash(current_root) != installation.get(
+            "digest"
+        ):
+            raise SelcError(
+                "ATTEMPT_TAMPERED",
+                "the current installation does not match its registered contents",
+                "repair the isolated installation before launching",
+            )
+        if expected_installation is not None and (
+            expected_installation.get("suite_id") != suite_id
+            or expected_installation.get("version") != installation.get("version")
+            or expected_installation.get("digest") != installation.get("digest")
+        ):
+            raise SelcError(
+                "ATTEMPT_TAMPERED",
+                "the current installation differs from the prepared schema 3 binding",
+                "prepare a new evaluation attempt",
+            )
+        manifest = load_manifest(current_root)
+        declared_skills = {entry["name"] for entry in normalize_declared_skills(manifest["skills"])}
+        actions = managed_configuration(manifest, current_root)
+    except (KeyError, OSError, SelcError, TypeError) as error:
+        if isinstance(error, SelcError):
+            raise
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the installed schema 3 routing source is unavailable",
+            "repair the isolated installation before launching",
+        ) from error
+
+    request_text = case.get("request")
+    if not isinstance(request_text, str) or not request_text:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the frozen schema 3 request is unavailable",
+            "prepare a new evaluation attempt",
+        )
+    try:
+        request = _managed_prompt_request("codex", {"prompt": request_text})
+    except SelcError as error:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the frozen schema 3 request has an unsupported shape",
+            "prepare a new evaluation attempt",
+        ) from error
+    skill = request.get("skill")
+    business_input = request.get("input")
+    if (
+        set(request) != {"skill", "input", "raw_prompt_digest"}
+        or not isinstance(skill, str)
+        or skill not in declared_skills
+        or not isinstance(business_input, dict)
+    ):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "schema 3 requires one explicit declared skill and JSON input",
+            "use the frozen @skill JSON request without automatic selection",
+        )
+    selected_actions = [
+        (action_id, action) for action_id, action in actions.items() if action.get("skill") == skill
+    ]
+    if (
+        len(selected_actions) != 1
+        or selected_actions[0][1].get("kind") != "python-script-v1"
+        or not isinstance(selected_actions[0][1].get("script"), str)
+    ):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "schema 3 requires one declared fixed-script action for the selected skill",
+            "repair the frozen request or installed managed declaration",
+        )
+    action_id, action = selected_actions[0]
+    try:
+        _validate_action_request(action, business_input)
+    except SelcError as error:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the frozen schema 3 JSON input does not match the declared fixed action",
+            "repair the frozen request before preparing an attempt",
+        ) from error
+    if not _request_uses_attempt_input(business_input, project_root / "evaluation-input.json"):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the frozen schema 3 request does not select this attempt input",
+            "prepare a new evaluation attempt with the bound input path",
+        )
+
+    routing_path = project_root / ".agents" / "skills" / skill / "SKILL.md"
+    command = shlex.join(("/bin/cat", str(routing_path)))
+    discovery = _discovery_read_binding(project_root, suite_id, installation, command)
+    if discovery is None or discovery.get("skill") != skill:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the selected schema 3 routing entry is not installer-owned",
+            "repair the isolated installation before launching",
+        )
+    return {
+        "schema_version": 1,
+        "skill": skill,
+        "action": action_id,
+        "action_kind": action["kind"],
+        "action_script": action["script"],
+        "entry_path": str(routing_path),
+        "command": command,
+        "installation": {
+            "suite_id": suite_id,
+            "version": installation["version"],
+            "composite": installation["digest"],
+        },
+        "entry": {
+            "hash": discovery["entry_hash"],
+            "size": discovery["entry_size"],
+            "device": discovery["entry_device"],
+            "inode": discovery["entry_inode"],
+        },
+        "reader": {
+            "hash": discovery["reader_hash"],
+            "size": discovery["reader_size"],
+            "device": discovery["reader_device"],
+            "inode": discovery["reader_inode"],
+        },
     }
 
 
@@ -2347,7 +2721,13 @@ def _assert_attempt_identity(
             "attempt installation does not match the exact bound portable snapshot",
             "prepare a new attempt",
         )
-    expected_policy_binding = _prepare_policy_binding(matrix, Path(expected_paths["project_root"]))
+    expected_policy_binding = _prepare_policy_binding(
+        matrix,
+        Path(expected_paths["project_root"]),
+        case=case,
+        suite_id=str(plan["suite_id"]),
+        expected_installation=installation,
+    )
     if state.get("policy_binding") != expected_policy_binding:
         raise SelcError(
             "ATTEMPT_TAMPERED",
@@ -2718,7 +3098,17 @@ def _read_attempt_native_context(
     if project_root is None:
         return None
     try:
-        expected_binding = _prepare_policy_binding(matrix, project_root)
+        expected_binding = _prepare_policy_binding(
+            matrix,
+            project_root,
+            case=state.get("case") if isinstance(state.get("case"), dict) else None,
+            suite_id=str(state.get("installation", {}).get("suite_id", ""))
+            if isinstance(state.get("installation"), dict)
+            else None,
+            expected_installation=state.get("installation")
+            if isinstance(state.get("installation"), dict)
+            else None,
+        )
     except SelcError:
         return None
     policy_binding = state.get("policy_binding")
@@ -2733,6 +3123,7 @@ def _read_attempt_native_context(
         resolved_path,
         project_root,
         template,
+        expected_binding,
     )
     if parsed is None:
         return None
@@ -3525,6 +3916,7 @@ def _native_session_facts(
     raw_path: Path,
     project_root: Path,
     template: dict[str, object],
+    policy_binding: dict[str, object] | None = None,
 ) -> (
     tuple[
         str,
@@ -3602,6 +3994,7 @@ def _native_session_facts(
         turn_id,
         matching_user_indexes[0],
         template,
+        policy_binding,
     )
     if not preparation_verified:
         return None
@@ -3650,15 +4043,34 @@ def _codex_native_preparation_is_verified(
     turn_id: str,
     user_record_index: int,
     template: dict[str, object],
+    policy_binding: dict[str, object] | None,
 ) -> tuple[bool, dict[str, object] | None]:
-    """Bind the schema 2 fragment at its observed developer-vector index."""
+    """Bind the schema-specific developer fragment at its observed vector index."""
 
     schema_version = template.get("schema_version")
     if schema_version not in {
         CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION,
-        CODEX_POLICY_TEMPLATE_SCHEMA_VERSION,
+        CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION,
+        CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION,
     }:
         return False, None
+    expected_instructions: str | None = None
+    expected_guidance: dict[str, object] | None = None
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
+        expected_instructions = CODEX_FIXED_PREPARATION_INSTRUCTIONS
+        expected_guidance = _fixed_codex_preparation_guidance()
+    elif schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        try:
+            routing = policy_binding.get("routing") if isinstance(policy_binding, dict) else None
+            expected_guidance = _bound_codex_explicit_routing_preparation_guidance(
+                template, routing
+            )
+            command = routing.get("command") if isinstance(routing, dict) else None
+            if not isinstance(command, str):
+                return False, None
+            expected_instructions = _render_codex_explicit_routing_instructions(command)
+        except SelcError:
+            return False, None
     generic_fragments = 0
     for record_index, record in enumerate(records):
         if record.get("type") != "response_item":
@@ -3699,15 +4111,15 @@ def _codex_native_preparation_is_verified(
             if (
                 not isinstance(item, dict)
                 or item.get("type") != "input_text"
-                or item.get("text") != CODEX_FIXED_PREPARATION_INSTRUCTIONS
+                or item.get("text") != expected_instructions
             ):
                 return False, None
             generic_fragments += 1
     if schema_version == CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION:
         return True, None
-    if generic_fragments != 1:
+    if generic_fragments != 1 or expected_guidance is None:
         return False, None
-    return True, _fixed_codex_preparation_guidance()
+    return True, expected_guidance
 
 
 def _match_codex_native_policy(
@@ -4945,7 +5357,8 @@ def _fixed_codex_cli_command(
     schema_version = template.get("schema_version")
     if schema_version not in {
         CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION,
-        CODEX_POLICY_TEMPLATE_SCHEMA_VERSION,
+        CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION,
+        CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION,
     }:
         raise SelcError(
             "ATTEMPT_TAMPERED",
@@ -4967,8 +5380,31 @@ def _fixed_codex_cli_command(
         "cli": profile,
         "hook_trust": template.get("hook_trust"),
     }
-    if schema_version == CODEX_POLICY_TEMPLATE_SCHEMA_VERSION:
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
         expected_configuration["preparation_guidance"] = template.get("preparation_guidance")
+    elif schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        expected_binding = _prepare_policy_binding(
+            matrix,
+            Path(project_root),
+            case=state.get("case") if isinstance(state.get("case"), dict) else None,
+            suite_id=str(state.get("installation", {}).get("suite_id", ""))
+            if isinstance(state.get("installation"), dict)
+            else None,
+            expected_installation=state.get("installation")
+            if isinstance(state.get("installation"), dict)
+            else None,
+        )
+        if policy_binding != expected_binding:
+            raise SelcError(
+                "ATTEMPT_TAMPERED",
+                "the schema 3 routing binding changed before launch",
+                "prepare a new evaluation attempt",
+            )
+        routing = policy_binding.get("routing")
+        expected_configuration["routing"] = routing
+        expected_configuration["preparation_guidance"] = (
+            _bound_codex_explicit_routing_preparation_guidance(template, routing)
+        )
     if (
         not isinstance(mapping, dict)
         or mapping.get("attempt_project") != project_root
@@ -5010,13 +5446,23 @@ def _fixed_codex_cli_command(
         "-c",
         f"web_search={json.dumps(settings['web_search'])}",
     ]
-    if schema_version == CODEX_POLICY_TEMPLATE_SCHEMA_VERSION:
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
         command.extend(
             (
                 "-c",
                 f"developer_instructions={json.dumps(settings['developer_instructions'])}",
             )
         )
+    elif schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        routing = policy_binding.get("routing")
+        if not isinstance(routing, dict):
+            raise SelcError(
+                "ATTEMPT_TAMPERED",
+                "the schema 3 routing binding is unavailable",
+                "prepare a new evaluation attempt",
+            )
+        instructions = _render_codex_explicit_routing_instructions(str(routing.get("command", "")))
+        command.extend(("-c", f"developer_instructions={json.dumps(instructions)}"))
     command.extend(("--enable", "hooks"))
     disabled_features = profile.get("disable_features")
     if disabled_features != list(CODEX_DISABLED_FEATURES):
