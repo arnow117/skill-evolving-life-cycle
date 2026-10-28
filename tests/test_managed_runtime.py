@@ -493,7 +493,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                                 "item": {
                                     "type": "CommandExecution",
                                     "id": tool_use_id,
-                                    "command": ["/bin/zsh", "-lc", command],
+                                    "command": ["/bin/zsh", "-c", command],
                                     "cwd": str(self.project.resolve()),
                                     "status": "completed",
                                     "exit_code": 0,
@@ -903,7 +903,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                     "item": {
                         "type": "CommandExecution",
                         "id": tool_use_id,
-                        "command": ["/bin/zsh", "-lc", command],
+                        "command": ["/bin/zsh", "-c", command],
                         "cwd": self.project.resolve().as_uri(),
                         "status": "completed",
                         "exit_code": 0,
@@ -2264,7 +2264,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                                 "item": {
                                     "type": "CommandExecution",
                                     "id": "tool-automatic-publish",
-                                    "command": ["/bin/zsh", "-lc", shlex.join(publish_command)],
+                                    "command": ["/bin/zsh", "-c", shlex.join(publish_command)],
                                     "cwd": str(self.project.resolve()),
                                     "status": "completed",
                                     "exit_code": 0,
@@ -5536,6 +5536,12 @@ class ManagedRuntimeTests(unittest.TestCase):
             completed_item(cwd=file_uri + "\ud800"),
             completed_item(cwd=wrong_cwd.resolve().as_uri()),
             completed_item(cwd="https://example.test/project"),
+            completed_item(command=["/bin/zsh", "-l", command]),
+            completed_item(command=["/bin/zsh", "-ic", command]),
+            completed_item(command=["/bin/zsh", {"flag": "-c"}, command]),
+            completed_item(command=["/bin/zsh", ["-c"], command]),
+            completed_item(command=["/bin/zsh", "-c", command, "unexpected"]),
+            completed_item(command=["/bin/zsh", "-c", command + " --altered"]),
             completed_item(command=["/bin/zsh", "-lc", "printf wrong"]),
             completed_item(exit_code=1),
             completed_item(exit_code=False),
@@ -5562,7 +5568,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         )
 
     def test_codex_window_ignores_matching_items_before_the_pre_prefix(self) -> None:
-        """A result from a previous native window cannot close the current one."""
+        """A `-c` completion closes only the current native publication window."""
 
         command = "python selc-suite.py managed publish"
         completed = {
@@ -5574,7 +5580,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                 "item": {
                     "type": "CommandExecution",
                     "id": "tool-codex",
-                    "command": ["/bin/zsh", "-lc", command],
+                    "command": ["/bin/zsh", "-c", command],
                     "cwd": str(self.project.resolve()),
                     "status": "completed",
                     "exit_code": 0,
@@ -5601,8 +5607,28 @@ class ManagedRuntimeTests(unittest.TestCase):
         event["prefix"] = {"length": self.transcript.stat().st_size}
         self.assertTrue(managed_runtime._history_contains_publication_result(event, "tool-codex"))
 
+    def test_publication_assessment_reduction_cannot_clear_a_sticky_unknown_context(self) -> None:
+        """Publication reconciliation never turns an existing unknown into pass."""
+
+        activated = self._activate()
+        database = open_database(self.project)
+        try:
+            database.execute(
+                "UPDATE managed_contexts SET unknown_change = 1 WHERE task_id = ?",
+                (activated["task_id"],),
+            )
+            managed_runtime.reduce_managed_assessment(database, str(activated["task_id"]))
+            unknown_change = database.execute(
+                "SELECT unknown_change FROM managed_contexts WHERE task_id = ?",
+                (activated["task_id"],),
+            ).fetchone()[0]
+        finally:
+            database.close()
+
+        self.assertEqual(unknown_change, 1)
+
     def test_publication_window_rejects_a_mutated_or_truncated_cutoff(self) -> None:
-        """A frozen Stop cutoff cannot be replaced before later reconciliation."""
+        """A frozen Stop cutoff accepts only its exact `-c` completion."""
 
         command = "python selc-suite.py managed publish"
         history_path = self.root / "codex-window.jsonl"
@@ -5620,7 +5646,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                             "item": {
                                 "type": "CommandExecution",
                                 "id": "tool-codex",
-                                "command": ["/bin/zsh", "-lc", command],
+                                "command": ["/bin/zsh", "-c", command],
                                 "cwd": str(self.project.resolve()),
                                 "status": "completed",
                                 "exit_code": 0,
