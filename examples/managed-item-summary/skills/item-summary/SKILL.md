@@ -7,16 +7,28 @@ description: Publish a managed count-and-sum JSON report for an input items arra
 
 Use this skill for an input JSON DTO whose declared input has an `items` array of integer `value` fields. Repeated items each count; an empty array produces `{"count": 0, "sum": 0}`. Integers are the complete supported numeric scope: do not accept decimals, floats, missing values, or other numeric forms.
 
-## Managed native-request flow
+## Use the completed activation
 
-This is a new creator-authored instruction tree for the experimental managed native-request interface. The underlying count-and-sum implementation and the original user DTO are unchanged.
+This business body has already been returned by one successful `managed invoke`. Do not run `managed invoke` again. Reuse the exact interpreter, project root, host, expected version, and expected composite from that original literal routing command. Use only the returned `task_id`, `call_id`, and immutable `skill_body_path` for this activation.
 
-The installer-owned routing `SKILL.md` contains the one literal `managed invoke` command for frozen creator run `bba56ff804585ff607193ba818c1210e1da3d34b23cadae2b493cab93d69de52`. Execute that command once, exactly as installed. Do not alter it or perform discovery. From its result, retain its exact interpreter, project root, host, expected version, expected composite, `task_id`, `call_id`, and immutable `skill_body_path`. Derive the suite root from that returned immutable body path.
+Derive `SUITE_ROOT` by removing `/skills/item-summary/SKILL.md` from the returned `skill_body_path`. The angle-bracket names below are placeholders to replace with current literal values; they are not shell variables. Do not discover, guess, or register an identity.
 
-On Codex, do not create, read, or transform a scratch request file. Make exactly one separate managed action command for `item-summary`, with all identity and expected-version/composite arguments copied literally from the invoke result and with `--request-source native`. The managed runtime receives the unchanged structured user JSON and reads its declared input. Read `managed.artifact_path` from that action result.
+## Codex: run and publish
 
-Next, make exactly one separate managed publish command using that returned artifact path and target `reports/item-summary.json`; retain the same literal identity, host, expected-version, and expected-composite arguments. These are the only action and publication commands.
+Make exactly one native shell action call, replacing each placeholder with its current literal value:
 
-Do not invoke `resources/item_summary.py` directly; write an artifact or report outside the managed wrapper; register records manually; change hooks; retry a wrapper; add logging after publication; or use shell variables, environment prefixes, compound commands, or extra discovery. Stop at the first wrapper error, and stop after a successful publish.
+```sh
+<INVOKE_INTERPRETER> <SUITE_ROOT>/bin/selc-suite.py managed action --project-root <PROJECT_ROOT> --suite simple-item-reports --skill item-summary --task-id <TASK_ID> --call-id <CALL_ID> --action item-summary --request-source native --host <HOST> --expected-version <EXPECTED_VERSION> --expected-composite <EXPECTED_COMPOSITE>
+```
 
-On WorkBuddy, native request packets are unavailable. Use an explicit existing `--request <request.json>` path only when the caller has already supplied that file; do not claim native mode works there. When an automatic observed request has no supplied request file, recommend the ordinary BASIC entry instead.
+The runtime obtains the original structured user JSON unchanged and reads its declared input. Do not create a scratch request or read the business input yourself. Read `managed.artifact_path` from the successful action result, then make this one separate native shell publication call:
+
+```sh
+<INVOKE_INTERPRETER> <SUITE_ROOT>/bin/selc-suite.py managed publish --project-root <PROJECT_ROOT> --suite simple-item-reports --skill item-summary --task-id <TASK_ID> --call-id <CALL_ID> --artifact <ACTION_ARTIFACT_PATH> --target reports/item-summary.json --host <HOST> --expected-version <EXPECTED_VERSION> --expected-composite <EXPECTED_COMPOSITE>
+```
+
+Stop at the first wrapper error and after successful publication. Do not retry, call the resource script directly, write an artifact or report yourself, add post-publication logs, modify hooks or records, or manually register lifecycle data. Keep each wrapper command separate, with no shell variables, environment prefixes, command chaining, or extra discovery.
+
+## WorkBuddy observed use
+
+WorkBuddy does not provide native request packets. Only when the caller already supplied a request file, use the action template above with `--request <SUPPLIED_REQUEST_JSON>` in place of `--request-source native`, preserving all other current activation values; publish separately as above. If no request file was supplied, recommend the independent BASIC entry. BASIC has no managed activation, hook, receipt, or publication prerequisite.
