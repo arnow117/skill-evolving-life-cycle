@@ -9285,6 +9285,22 @@ def _file_uri_path_has_valid_percent_escapes(path: str) -> bool:
     return True
 
 
+def _codex_command_execution_has_expected_shell_command(
+    command: object, expected_command_digest: str
+) -> bool:
+    """Match the two observed exact ``/bin/zsh`` command serializations."""
+
+    return (
+        isinstance(command, list)
+        and len(command) == 3
+        and command[0] == "/bin/zsh"
+        and isinstance(command[1], str)
+        and command[1] in {"-lc", "-c"}
+        and isinstance(command[2], str)
+        and hashlib.sha256(command[2].encode("utf-8")).hexdigest() == expected_command_digest
+    )
+
+
 def _codex_history_contains_publication_result(
     history: list[object], event: dict[str, object], tool_use_id: str
 ) -> bool:
@@ -9293,7 +9309,8 @@ def _codex_history_contains_publication_result(
     The outer ``exec`` response item serializes JavaScript and uses a separate
     call-ID namespace.  Only the observed ``event_msg/item_completed`` record
     carries the hook tool ID, native turn, and shell command needed for a
-    publication window.
+    publication window.  The command is exactly a three-element ``/bin/zsh``
+    argv using one observed shell flag: ``-lc`` or ``-c``.
     """
 
     expected_session = event.get("session_id")
@@ -9326,13 +9343,8 @@ def _codex_history_contains_publication_result(
         if item.get("id") != tool_use_id:
             continue
         command = item.get("command")
-        is_exact_command = (
-            isinstance(command, list)
-            and len(command) == 3
-            and command[0] == "/bin/zsh"
-            and command[1] == "-lc"
-            and isinstance(command[2], str)
-            and hashlib.sha256(command[2].encode("utf-8")).hexdigest() == expected_command_digest
+        is_exact_command = _codex_command_execution_has_expected_shell_command(
+            command, expected_command_digest
         )
         is_exact_completion = (
             payload.get("thread_id") == expected_session
@@ -9648,12 +9660,9 @@ def _codex_discovery_read_status(
             and item.get("status") == "completed"
             and type(item.get("exit_code")) is int
             and item.get("exit_code") == 0
-            and isinstance(command, list)
-            and len(command) == 3
-            and command[0] == "/bin/zsh"
-            and command[1] == "-lc"
-            and isinstance(command[2], str)
-            and hashlib.sha256(command[2].encode("utf-8")).hexdigest() == expected_command_digest
+            and _codex_command_execution_has_expected_shell_command(
+                command, expected_command_digest
+            )
             and isinstance(output, str)
         )
         if not valid:
