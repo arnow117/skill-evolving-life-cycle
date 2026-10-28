@@ -39,6 +39,7 @@ from selc.evaluation import (
     _fixed_codex_cli_command,
     _fixed_codex_cli_profile,
     _fixed_codex_environment,
+    _fixed_codex_preparation_guidance,
     _match_codex_native_policy,
     _native_publication_result_failure,
     _native_session_facts,
@@ -50,6 +51,7 @@ from selc.evaluation import (
     _qualification_support,
     _read_attempt_native_context,
     _reconstruct_attempt,
+    _render_codex_explicit_routing_instructions,
     _workbuddy_session_diagnostics,
     bind_real_evaluation_candidate,
     build_codex_policy_template,
@@ -180,16 +182,31 @@ class RealEvaluationContractsTests(unittest.TestCase):
         return skill_creator, python_runtime
 
     def _add_supported_codex_policy_template(self, specification: Path, name: str) -> None:
+        """Keep pre-schema3 fixtures on their frozen schema-2 profile."""
+
         python_root = self.root / name
         python_root.mkdir()
         value = json.loads(specification.read_text(encoding="utf-8"))
         matrix = value["matrix"][0]
         matrix["host_version"] = "0.163.0-alpha.11"
         matrix.pop("tools_policy_digest", None)
-        matrix["tools_policy_template"] = build_codex_policy_template(
-            "0.163.0-alpha.11", python_root
-        )
+        template = build_codex_policy_template("0.163.0-alpha.11", python_root)
+        template["schema_version"] = 2
+        template.pop("routing")
+        template["cli"] = _fixed_codex_cli_profile(2)
+        template["preparation_guidance"] = _fixed_codex_preparation_guidance()
+        matrix["tools_policy_template"] = template
         specification.write_text(json.dumps(value), encoding="utf-8")
+
+    def _schema2_codex_policy_template(self, python_root: Path) -> dict[str, object]:
+        """Build the exact previous schema for frozen-plan compatibility tests."""
+
+        template = build_codex_policy_template("0.163.0-alpha.11", python_root)
+        template["schema_version"] = 2
+        template.pop("routing")
+        template["cli"] = _fixed_codex_cli_profile(2)
+        template["preparation_guidance"] = _fixed_codex_preparation_guidance()
+        return template
 
     def _prepared_hook_trust_attempt(
         self,
@@ -229,6 +246,87 @@ class RealEvaluationContractsTests(unittest.TestCase):
         state = json.loads((attempt_path / "attempt.json").read_text(encoding="utf-8"))
         plan = json.loads(Path(prepared["plan"]).read_text(encoding="utf-8"))
         return account_home, attempt_path, state, plan["matrix"][0]
+
+    def _prepared_schema3_routing_attempt(
+        self,
+        label: str = "first",
+    ) -> tuple[Path, dict[str, object], dict[str, object]]:
+        """Prepare one installed schema-3 attempt with a declared fixed action."""
+
+        suite_id = f"schema3-routing-{label}"
+        suite = self.root / f"{suite_id}-source"
+        create_suite(suite_id, "1.0.0", suite, ["text-report"])
+        manifest_path = suite / "suite.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["managed"]["native_hosts"] = {"codex": ["0.163.0-alpha.11"]}
+        manifest["managed"]["actions"]["text-report"] = {
+            "skill": "text-report",
+            "kind": "python-script-v1",
+            "script": "bin/schema3-summary.py",
+            "input": {"fields": {"input": {"type": "path"}}, "required": ["input"]},
+        }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        (suite / "bin" / "schema3-summary.py").write_text(
+            "from pathlib import Path\nPath('unused.json').write_text('{}', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        seal_suite(suite)
+
+        input_path = self.root / f"{suite_id}-input.json"
+        input_path.write_text('{"items": []}', encoding="utf-8")
+        plan_root = self.root / f"{suite_id}-plan"
+        attempt_path = plan_root / "attempts" / "first"
+        attempted_input = attempt_path / "project" / "evaluation-input.json"
+        python_root = self.root / f"{suite_id}-python"
+        python_root.mkdir()
+        template = build_codex_policy_template("0.163.0-alpha.11", python_root)
+        specification = self.root / f"{suite_id}-specification.json"
+        specification.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "cases": [
+                        {
+                            "id": "schema3-case",
+                            "collection": "regression",
+                            "input": str(input_path),
+                            "request": f'@text-report {{"input":{json.dumps(str(attempted_input))}}}',
+                            "checker": {
+                                "name": "json-item-summary",
+                                "version": "1",
+                                "rules": ["count"],
+                            },
+                        }
+                    ],
+                    "matrix": [
+                        {
+                            "id": "schema3-codex",
+                            "adapter": "codex-desktop",
+                            "host": "codex",
+                            "host_version": "0.163.0-alpha.11",
+                            "surface": "cli",
+                            "model": "synthetic-model",
+                            "tools_policy_template": template,
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        prepared = prepare_real_evaluation_plan(suite, specification, plan_root)
+        candidate = Path(prepare_candidate(suite, self.root / f"{suite_id}-candidate")["candidate"])
+        binding_path = self.root / f"{suite_id}-binding.json"
+        bind_real_evaluation_candidate(Path(prepared["plan"]), candidate, binding_path)
+        state = prepare_evaluation_attempt(
+            Path(prepared["plan"]),
+            binding_path,
+            "schema3-case",
+            "schema3-codex",
+            1,
+            attempt_path,
+        )
+        plan = json.loads(Path(prepared["plan"]).read_text(encoding="utf-8"))
+        return attempt_path, state, plan["matrix"][0]
 
     def _write_normal_hook_trust_state(
         self,
@@ -326,7 +424,7 @@ class RealEvaluationContractsTests(unittest.TestCase):
 
         template = build_codex_policy_template("0.163.0-alpha.11", python_root)
 
-        self.assertEqual(template["schema_version"], 2)
+        self.assertEqual(template["schema_version"], 3)
         self.assertEqual(template["host"], "codex")
         self.assertEqual(template["host_version"], "0.163.0-alpha.11")
         self.assertEqual(
@@ -338,17 +436,246 @@ class RealEvaluationContractsTests(unittest.TestCase):
         )
         self.assertTrue(template["cli"]["ignore_user_config"])
         self.assertEqual(
-            template["cli"]["settings"]["developer_instructions"],
-            CODEX_FIXED_PREPARATION_INSTRUCTIONS,
-        )
-        self.assertEqual(
             template["preparation_guidance"]["summary"],
-            "fixed-routing-read-and-native-managed-action-v1",
+            "explicit-installed-routing-read-and-native-managed-action-v2",
         )
+        self.assertNotIn("developer_instructions", template["cli"]["settings"])
         self.assertEqual(template["policy"]["approval_policy"], "never")
         self.assertEqual(
             template["hook_trust"]["mode"],
             "normal-project-and-hook-state-inheritance-v2",
+        )
+
+    def test_default_codex_policy_template_uses_explicit_routing_schema3(self) -> None:
+        """New plans bind an installed routing entry instead of a generic placeholder."""
+
+        python_root = self.root / "schema3-evaluation-python"
+        python_root.mkdir()
+
+        template = build_codex_policy_template("0.163.0-alpha.11", python_root)
+
+        self.assertEqual(template["schema_version"], 3)
+        self.assertEqual(
+            template["routing"],
+            {
+                "schema_version": 1,
+                "parameter": "installed-registered-routing-entry",
+                "renderer": "exact-single-cat-command-v1",
+            },
+        )
+        self.assertEqual(
+            template["preparation_guidance"]["summary"],
+            "explicit-installed-routing-read-and-native-managed-action-v2",
+        )
+
+    def test_schema3_binding_derives_one_installed_routing_command(self) -> None:
+        """A frozen explicit request selects one installer-owned routing entry."""
+
+        _attempt_path, state, matrix = self._prepared_schema3_routing_attempt()
+
+        policy_binding = state["policy_binding"]
+        routing = policy_binding["routing"]
+        project_root = Path(state["project_root"])
+        expected_path = project_root / ".agents" / "skills" / "text-report" / "SKILL.md"
+        expected_command = shlex.join(("/bin/cat", str(expected_path)))
+
+        self.assertEqual(routing["skill"], "text-report")
+        self.assertEqual(routing["action"], "text-report")
+        self.assertEqual(routing["entry_path"], str(expected_path))
+        self.assertEqual(routing["command"], expected_command)
+        self.assertEqual(
+            routing["installation"],
+            {
+                "suite_id": "schema3-routing-first",
+                "version": state["installation"]["version"],
+                "composite": state["installation"]["digest"],
+            },
+        )
+        self.assertEqual(
+            policy_binding["preparation_guidance"]["summary"],
+            "explicit-installed-routing-read-and-native-managed-action-v2",
+        )
+
+        command = _fixed_codex_cli_command(Path(sys.executable), matrix, state)
+        self.assertIn(
+            "developer_instructions="
+            + json.dumps(_render_codex_explicit_routing_instructions(expected_command)),
+            command,
+        )
+
+    def test_schema3_binding_rejects_ambiguous_selection_and_unowned_routes(self) -> None:
+        """Schema 3 accepts neither an automatic request nor a replaced registration."""
+
+        _attempt_path, state, matrix = self._prepared_schema3_routing_attempt()
+        project_root = Path(state["project_root"])
+        expected_installation = state["installation"]
+        suite_id = str(expected_installation["suite_id"])
+
+        for request in (
+            json.dumps({"input": str(project_root / "evaluation-input.json")}),
+            f'@not-declared {{"input":{json.dumps(str(project_root / "evaluation-input.json"))}}}',
+            f'@text-report {{"input":{json.dumps(str(project_root / "other-input.json"))}}}',
+            f'@text-report @another {{"input":{json.dumps(str(project_root / "evaluation-input.json"))}}}',
+        ):
+            case = dict(state["case"])
+            case["request"] = request
+            with self.subTest(request=request), self.assertRaises(SelcError) as rejected:
+                _prepare_policy_binding(
+                    matrix,
+                    project_root,
+                    case=case,
+                    suite_id=suite_id,
+                    expected_installation=expected_installation,
+                )
+            self.assertEqual(rejected.exception.code, "ATTEMPT_TAMPERED")
+
+        registration = project_root / ".agents" / "skills" / "text-report"
+        registration.unlink()
+        registration.mkdir()
+        (registration / "SKILL.md").write_text("# replacement\n", encoding="utf-8")
+        with self.assertRaises(SelcError) as rejected:
+            _prepare_policy_binding(
+                matrix,
+                project_root,
+                case=state["case"],
+                suite_id=suite_id,
+                expected_installation=expected_installation,
+            )
+        self.assertEqual(rejected.exception.code, "ATTEMPT_TAMPERED")
+
+    def test_schema3_binding_rechecks_entry_and_claim_before_launch(self) -> None:
+        """Entry drift and a changed routing command stop before the CLI starts."""
+
+        _attempt_path, state, matrix = self._prepared_schema3_routing_attempt()
+        routing_path = Path(state["policy_binding"]["routing"]["entry_path"])
+        entry = routing_path.resolve()
+        entry.write_text(entry.read_text(encoding="utf-8") + "drift\n", encoding="utf-8")
+
+        with self.assertRaises(SelcError) as drifted:
+            _fixed_codex_cli_command(Path(sys.executable), matrix, state)
+        self.assertEqual(drifted.exception.code, "ATTEMPT_TAMPERED")
+
+        _attempt_path, state, matrix = self._prepared_schema3_routing_attempt("claim")
+        tampered_state = json.loads(json.dumps(state))
+        tampered_state["policy_binding"]["routing"]["command"] += " && /bin/false"
+        with self.assertRaises(SelcError) as tampered:
+            _fixed_codex_cli_command(Path(sys.executable), matrix, tampered_state)
+        self.assertEqual(tampered.exception.code, "ATTEMPT_TAMPERED")
+
+    def test_schema3_native_fragment_requires_the_bound_rendered_command(self) -> None:
+        """Native collection rejects a changed schema-3 literal before qualification."""
+
+        _attempt_path, state, matrix = self._prepared_schema3_routing_attempt()
+        project_root = Path(state["project_root"])
+        template = matrix["tools_policy_template"]
+        prompt = state["case"]["request"]
+        routing_command = state["policy_binding"]["routing"]["command"]
+        instructions = _render_codex_explicit_routing_instructions(routing_command)
+        turn_id = "schema3-native-turn"
+        records = [
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": "schema3-native-session",
+                    "session_id": "schema3-native-session",
+                    "cwd": str(project_root),
+                    "cli_version": "0.163.0-alpha.11",
+                    "source": "exec",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {"type": "input_text", "text": "known host instructions"},
+                        {"type": "input_text", "text": instructions},
+                    ],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": turn_id,
+                        "content_item_kinds": [
+                            "host_skills.instructions",
+                            "generic.developer_instructions",
+                        ],
+                    },
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": turn_id,
+                        "content_item_kinds": ["user.text"],
+                    },
+                },
+            },
+            {
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": turn_id,
+                    "root_turn_id": turn_id,
+                    "cwd": str(project_root),
+                    "model": "synthetic-model",
+                    "permission_profile": {},
+                    "sandbox_policy": {},
+                    "approval_policy": "never",
+                    "file_system_sandbox_policy": {},
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "schema3-native-call",
+                    "id": "schema3-native-item",
+                    "status": "completed",
+                    "input": {},
+                    "internal_chat_message_metadata_passthrough": {"turn_id": turn_id},
+                },
+            },
+        ]
+
+        def parse(candidate_records: list[dict[str, object]]) -> object:
+            raw = b"".join(
+                (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+                for record in candidate_records
+            )
+            return _native_session_facts(
+                raw,
+                prompt,
+                self.root / "schema3-native.jsonl",
+                project_root,
+                template,
+                state["policy_binding"],
+            )
+
+        self.assertIsNotNone(parse(records))
+        tampered = json.loads(json.dumps(records))
+        tampered[1]["payload"]["content"][1]["text"] = instructions + "\n/bin/false"
+        self.assertIsNone(parse(tampered))
+
+    def test_schema3_bindings_use_one_rule_for_distinct_installed_attempts(self) -> None:
+        """Separate attempts bind their own route without changing schema-3 rendering rules."""
+
+        _first_path, first_state, first_matrix = self._prepared_schema3_routing_attempt()
+        _second_path, second_state, second_matrix = self._prepared_schema3_routing_attempt("second")
+
+        self.assertEqual(
+            first_matrix["tools_policy_template"]["routing"],
+            second_matrix["tools_policy_template"]["routing"],
+        )
+        self.assertEqual(
+            first_state["policy_binding"]["routing"]["schema_version"],
+            second_state["policy_binding"]["routing"]["schema_version"],
+        )
+        self.assertNotEqual(
+            first_state["policy_binding"]["routing"]["entry_path"],
+            second_state["policy_binding"]["routing"]["entry_path"],
         )
 
     def test_schema1_codex_policy_template_preserves_the_frozen_profile_and_argv(self) -> None:
@@ -357,7 +684,7 @@ class RealEvaluationContractsTests(unittest.TestCase):
         _account_home, _attempt_path, state, matrix = self._prepared_hook_trust_attempt()
         legacy_python = self.root / "legacy-python"
         legacy_python.mkdir()
-        legacy = build_codex_policy_template("0.163.0-alpha.11", legacy_python)
+        legacy = self._schema2_codex_policy_template(legacy_python)
         legacy["schema_version"] = 1
         legacy.pop("preparation_guidance")
         legacy["cli"] = _fixed_codex_cli_profile(1)
@@ -443,7 +770,7 @@ class RealEvaluationContractsTests(unittest.TestCase):
         prompt = '@text-report {"input":"items.json"}'
         guidance_python = self.root / "guidance-python"
         guidance_python.mkdir()
-        template = build_codex_policy_template("0.163.0-alpha.11", guidance_python)
+        template = self._schema2_codex_policy_template(guidance_python)
         base_records = [
             {
                 "type": "session_meta",
@@ -565,12 +892,17 @@ class RealEvaluationContractsTests(unittest.TestCase):
         wrong_vector[1]["payload"]["content"].pop()
         self.assertIsNone(parse(wrong_vector))
 
-    def test_generated_maintenance_describes_schema2_and_workbuddy_diagnostics(self) -> None:
+    def test_generated_maintenance_describes_schema3_and_workbuddy_diagnostics(self) -> None:
         suite = self.root / "maintenance-source"
         create_suite("maintenance-source", "1.0.0", suite, ["text-report"])
 
         maintenance = (suite / "MAINTENANCE.md").read_text(encoding="utf-8")
-        self.assertIn("Schema-2 Codex templates bind one fixed non-business", maintenance)
+        self.assertIn(
+            "Schema-3 Codex templates bind one explicit installer-owned routing entry", maintenance
+        )
+        self.assertIn(
+            "Schema-1 and schema-2 templates retain their original profiles and argv", maintenance
+        )
         self.assertIn("WorkBuddy has a bounded native-session diagnostic", maintenance)
         self.assertIn("its qualification remains unverified", maintenance)
 
@@ -2109,6 +2441,14 @@ class RealEvaluationContractsTests(unittest.TestCase):
             {"input": str(attempted_input)},
         )
         project_root = Path(state["project_root"])
+        expected_routing_path = project_root / ".agents" / "skills" / "text-report" / "SKILL.md"
+        routing = state["policy_binding"]["routing"]
+        routing_command = routing["command"]
+        self.assertEqual(
+            routing_command,
+            shlex.join(("/bin/cat", str(expected_routing_path))),
+        )
+        schema3_instructions = _render_codex_explicit_routing_instructions(routing_command)
         account_home = Path(str(policy_template["account_home"]))
         arg0_path = account_home / ".codex" / "tmp" / "arg0-macos" / "codex-arg0SyntheticA1"
         native_entries = [
@@ -2182,7 +2522,7 @@ class RealEvaluationContractsTests(unittest.TestCase):
                         {"type": "input_text", "text": "synthetic host instructions"},
                         {
                             "type": "input_text",
-                            "text": CODEX_FIXED_PREPARATION_INSTRUCTIONS,
+                            "text": schema3_instructions,
                         },
                     ],
                     "internal_chat_message_metadata_passthrough": {
@@ -2521,7 +2861,7 @@ class RealEvaluationContractsTests(unittest.TestCase):
             self.assertEqual(collected["evidence"]["status"], "pass", collected["evidence"])
             self.assertEqual(
                 collected["evidence"]["preparation_guidance"],
-                policy_template["preparation_guidance"],
+                state["policy_binding"]["preparation_guidance"],
             )
             self.assertNotIn("preparation_guidance", collected["evidence"]["native_policy"])
             report_path = self.root / "positive-report.json"
