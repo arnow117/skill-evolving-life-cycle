@@ -74,9 +74,23 @@ CURRENT_REQUEST_ANCHOR_RULE_VERSION = "current-request-v2"
 CODEX_ALPHA11_ARG0_ANCHOR_RULE_VERSION = "current-request-v3-codex-alpha11-arg0"
 WORKBUDDY_SKILL_PRE_ANCHOR_RULE_VERSION = "current-request-v3-workbuddy-skill-pre"
 WORKBUDDY_AUTOMATIC_SKILL_PRE_ANCHOR_RULE_VERSION = "current-request-v4-workbuddy-auto-skill-pre"
+CODEX_NATIVE_PACKET_P1_ANCHOR_RULE_VERSION = "native-request-packet-p1-v1"
 WORKBUDDY_SUPPORTED_CLIENT_VERSIONS = frozenset({"5.8.3", "5.9.2"})
 CODEX_ALPHA11_ARG0_VERSION = "0.163.0-alpha.11"
 BUSINESS_DTO_RULE_VERSION = "business-dto-v1"
+DISCOVERY_PENDING = "__discovery_pending__"
+NATIVE_REQUEST_PACKET_VERSION = "native-request-packet-v1"
+MAX_NATIVE_REQUEST_PACKET_BYTES = 64 * 1024
+MAX_NATIVE_REQUEST_PACKET_CLEANUP_BATCH = 64
+MAX_LIVE_NATIVE_REQUEST_PACKETS = 64
+MAX_DISCOVERY_READER_BYTES = 16 * 1024 * 1024
+_NATIVE_REQUEST_PACKET_TEMPORARY_RE = re.compile(
+    r"^\.(?P<receipt>[0-9a-f]{64})\.json\.(?P<nonce>[0-9a-f]{24})\.tmp$"
+)
+_NATIVE_REQUEST_PACKET_CURRENT_TEMPORARY_RE = re.compile(
+    r"^\.(?P<receipt>[0-9a-f]{64})\.json\.tmp$"
+)
+_NATIVE_REQUEST_PACKET_METADATA_MARKER = '%"native_request_packet":%'
 _SAME_PROJECT_CD_PREFIX = re.compile(r"""^cd (?P<directory>/[^\s"'`$;&|<>()\\*?\[\]{}]+) && """)
 
 
@@ -184,6 +198,7 @@ def parse_installed_managed_command(
         "--skill",
         "--action",
         "--request",
+        "--request-source",
         "--artifact-bytes",
         "--checker-input",
         "--artifact",
@@ -224,7 +239,15 @@ def parse_installed_managed_command(
         return None
     if operation == "action" and "--action" not in arguments:
         return None
-    if operation == "action" and not {"--task-id", "--call-id", "--request"}.issubset(arguments):
+    if operation == "action":
+        if not {"--task-id", "--call-id"}.issubset(arguments):
+            return None
+        request_sources = {"--request", "--request-source"}.intersection(arguments)
+        if len(request_sources) != 1:
+            return None
+        if arguments.get("--request-source") not in {None, "native"}:
+            return None
+    elif "--request-source" in arguments:
         return None
     if operation == "stage" and not {
         "--skill",
@@ -332,15 +355,16 @@ def observe_request_boundary(
             "managed native observations require the installed collector or an explicit fixture",
             "invoke the installed collector instead of supplying a native DTO",
         )
-    normalized = _normalize_native_payload(
-        project_root,
-        suite_id,
-        payload,
-        trusted_producer=trusted_producer,
-        fixture=fixture,
-    )
     with _locked_database(project_root, suite_id) as (database, installation):
         _assert_active_installation(project_root, suite_id, installation)
+        normalized = _normalize_native_payload(
+            project_root,
+            suite_id,
+            payload,
+            trusted_producer=trusted_producer,
+            fixture=fixture,
+            installation=installation,
+        )
         # Raw native identity is a durable fact before any derived context,
         # receipt, or assessment projection.  A failed projection can therefore
         # be retried after reopen without re-running business work.
@@ -657,7 +681,8 @@ def run_action(
     call_id: str,
     action_id: str,
     receipt: str | None,
-    request: dict[str, object],
+    request: dict[str, object] | None,
+    request_source: str | None = None,
     host: str | None = None,
     expected_version: str | None = None,
     expected_composite: str | None = None,
@@ -676,6 +701,7 @@ def run_action(
             action_id=action_id,
             receipt=receipt,
             request=request,
+            request_source=request_source,
             host=host,
             expected_version=expected_version,
             expected_composite=expected_composite,
@@ -694,7 +720,8 @@ def _run_action_locked(
     call_id: str,
     action_id: str,
     receipt: str | None,
-    request: dict[str, object],
+    request: dict[str, object] | None,
+    request_source: str | None = None,
     host: str | None = None,
     expected_version: str | None = None,
     expected_composite: str | None = None,
@@ -703,6 +730,25 @@ def _run_action_locked(
     execution_lock_held: bool = False,
 ) -> dict[str, object]:
     """Run a manifest-declared installed script with bounded staged inputs."""
+
+    if request_source not in {None, "native"}:
+        raise SelcError(
+            "MANAGED_INPUT_INVALID",
+            "managed action has an unsupported request source",
+            "use --request or the exact native request source",
+        )
+    if request_source == "native" and request is not None:
+        raise SelcError(
+            "MANAGED_INPUT_INVALID",
+            "managed action cannot mix a native request with a request file",
+            "choose exactly one declared action input source",
+        )
+    if request_source is None and request is None:
+        raise SelcError(
+            "MANAGED_INPUT_INVALID",
+            "managed action needs a declared request object",
+            "supply the declared managed input object",
+        )
 
     with _locked_database(project_root, suite_id, locks_held=execution_lock_held) as (
         database,
@@ -733,9 +779,6 @@ def _run_action_locked(
                 "action is not declared for the selected skill",
                 "use one fixed action from the active suite manifest",
             )
-        normalized_request = _validate_action_request(action, request)
-        request_digest = _digest({"skill": skill, "input": normalized_request})
-        frozen_inputs = _freeze_declared_action_inputs(action, normalized_request)
         with records.projection_transaction(database):
             _assert_managed_call(database, task_id, call_id, suite_id, skill, installation)
             _assert_no_pending_action(database, task_id)
@@ -779,6 +822,21 @@ def _run_action_locked(
             context = _assert_receipt_subject(database, receipt_row, task_id, call_id)
             _assert_correction_binding_current(database, context, installation)
             _assert_context_selected_skill(context, skill)
+            if request_source == "native":
+                request = _read_native_request_packet(
+                    database,
+                    project_root=project_root,
+                    receipt=receipt_row,
+                    context=context,
+                    installation=installation,
+                    skill=skill,
+                    action_id=action_id,
+                )
+            if request is None:
+                raise SelcError("MANAGED_INPUT_INVALID", "managed action request is unavailable")
+            normalized_request = _validate_action_request(action, request)
+            request_digest = _digest({"skill": skill, "input": normalized_request})
+            frozen_inputs = _freeze_declared_action_inputs(action, normalized_request)
             _assert_context_action_business_dto(context, normalized_request)
             _assert_correction_request_input(
                 database,
@@ -1708,6 +1766,7 @@ def _normalize_native_payload(
     *,
     trusted_producer: bool,
     fixture: bool,
+    installation: dict[str, Any] | None = None,
 ) -> dict[str, object]:
     required = {
         "host",
@@ -1756,6 +1815,7 @@ def _normalize_native_payload(
     technical_skill_valid = False
     technical_skill_args_digest = ""
     business_dto_digest: str | None = None
+    discovery: dict[str, object] | None = None
     if phase == USER_PROMPT_PHASE:
         request = payload["request"]
         if not isinstance(request, dict):
@@ -1865,12 +1925,26 @@ def _normalize_native_payload(
                         "NATIVE_COLLECTOR_INVALID",
                         "native tool is not the fixed installed managed wrapper",
                     )
-                action = "unmanaged"
-                skill = ""
-                command_value = {
-                    "action": action,
-                    "command_digest": hashlib.sha256(command.encode("utf-8")).hexdigest(),
-                }
+                discovery = (
+                    _discovery_read_binding(project_root, suite_id, installation, command)
+                    if host == "codex" and installation is not None
+                    else None
+                )
+                if discovery is None:
+                    action = "unmanaged"
+                    skill = ""
+                    command_value = {
+                        "action": action,
+                        "command_digest": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+                    }
+                else:
+                    action = "discovery"
+                    skill = str(discovery["skill"])
+                    command_value = {
+                        "action": action,
+                        "skill": skill,
+                        "entry_hash": discovery["entry_hash"],
+                    }
                 command_digest = _digest(command_value)
                 operation_digest = ""
             else:
@@ -1969,6 +2043,8 @@ def _normalize_native_payload(
             "valid": technical_skill_valid,
             "args_digest": technical_skill_args_digest,
         }
+    if discovery is not None:
+        payload_digest_input["discovery"] = _stored_discovery_binding(discovery)
 
     return {
         "event_id": f"native-{secrets.token_hex(16)}",
@@ -1986,6 +2062,9 @@ def _normalize_native_payload(
                 "technical_skill_pre": technical_skill_pre,
                 "technical_skill_valid": technical_skill_valid,
                 "technical_skill_args_digest": technical_skill_args_digest or None,
+                "discovery": _stored_discovery_binding(discovery)
+                if discovery is not None
+                else None,
                 "request_digest": request_digest or None,
                 "business_dto_digest": business_dto_digest,
                 "business_dto_rule_version": (
@@ -2029,6 +2108,7 @@ def _normalize_native_payload(
         "technical_skill_pre": technical_skill_pre,
         "technical_skill_valid": technical_skill_valid,
         "technical_skill_args_digest": technical_skill_args_digest,
+        "discovery": _stored_discovery_binding(discovery) if discovery is not None else None,
         "request_digest": request_digest,
         "business_dto_digest": business_dto_digest,
         "business_dto_rule_version": (
@@ -2237,6 +2317,7 @@ def _codex_root_prefix_is_verified(
         "permissions.instructions",
         "multi_agent.usage_hint",
         "multi_agent.mode_instructions",
+        "generic.developer_instructions",
     }
     user_prompts = 0
     for record in history[1:]:
@@ -2384,6 +2465,7 @@ def _codex_initialization_prefix_is_verified(
         "permissions.instructions",
         "multi_agent.usage_hint",
         "multi_agent.mode_instructions",
+        "generic.developer_instructions",
     }
     found_world_state = False
     found_turn_context = False
@@ -2551,6 +2633,7 @@ def _projection_event(
             "technical_skill_pre": payload.get("technical_skill_pre") is True,
             "technical_skill_valid": payload.get("technical_skill_valid") is True,
             "technical_skill_args_digest": payload.get("technical_skill_args_digest") or "",
+            "discovery": payload.get("discovery"),
             "request_digest": payload.get("request_digest") or "",
             "business_dto_digest": payload.get("business_dto_digest"),
             "business_dto_rule_version": payload.get("business_dto_rule_version"),
@@ -2595,17 +2678,32 @@ def _project_native_event(
         return {"status": "technical_recorded"}
     if event["phase"] == STOP_PHASE:
         _close_pending_windows_on_stop(database, event, event_id)
+        _close_pending_discovery_reads_on_stop(database, event)
         _close_execution_activity(database, event)
         _close_idle_managed_task(database, event)
         _close_correction_binding(database, event)
+        _cleanup_terminal_native_request_packets(
+            database,
+            project_root=Path(str(event["cwd"])),
+            suite_id=str(event["suite_id"]),
+            terminal_event=event,
+        )
+        _cleanup_expired_native_request_packets(
+            database,
+            Path(str(event["cwd"])),
+            str(event["suite_id"]),
+            installation,
+        )
         return {"status": "stop_recorded"}
     if event["phase"] in {PERMISSION_PHASE, PERMISSION_DENIED_PHASE}:
         _record_permission_context(database, event)
         return {"status": "permission_recorded"}
     if event["phase"] == POST_PHASE:
-        _close_matching_window(database, event)
-        return {"status": "post_recorded"}
+        status = _close_matching_window(database, event)
+        return {"status": status or "post_recorded"}
     receipt = _issue_receipt(database, installation, event, event_id)
+    if receipt == DISCOVERY_PENDING:
+        return {"status": "discovery_pending"}
     if receipt is None:
         return {"status": "recorded_unusable"}
     return {"status": "recorded", "receipt": receipt}
@@ -2634,7 +2732,9 @@ def _store_native_event(database: Any, event: dict[str, object]) -> dict[str, st
         "SELECT * FROM managed_native_events WHERE stable_identity = ?", (event["stable_identity"],)
     ).fetchone()
     if existing is not None:
-        if existing["payload_digest"] == event["payload_digest"]:
+        if existing["payload_digest"] == event[
+            "payload_digest"
+        ] or _legacy_unmanaged_discovery_replay_matches(existing, event):
             return {
                 "status": "replayed",
                 "event_id": str(existing["event_id"]),
@@ -2707,6 +2807,52 @@ def _store_native_event(database: Any, event: dict[str, object]) -> dict[str, st
         "event_id": str(event["event_id"]),
         "projection_status": "pending",
     }
+
+
+def _legacy_unmanaged_discovery_replay_matches(existing: Any, event: dict[str, object]) -> bool:
+    """Replay a pre-discovery exact-cat row under its original digest family.
+
+    The discovery classification was added after unmanaged rows already became
+    durable.  An identical callback must replay those rows without changing
+    their action or projection, while every changed raw fact remains a normal
+    conflict.
+    """
+
+    if event.get("action") != "discovery" or not isinstance(event.get("discovery"), dict):
+        return False
+    try:
+        payload = json.loads(str(existing["payload_json"]))
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict) or payload.get("action") != "unmanaged":
+        return False
+    if "discovery" in payload and payload["discovery"] is not None:
+        return False
+    command_digest = event.get("tool_command_digest")
+    raw_request_digest = event.get("raw_request_digest") or "prompt-context"
+    source = "fixture" if event.get("fixture") else "native-collector"
+    if (
+        not _is_sha256_digest(command_digest)
+        or payload.get("skill") != ""
+        or payload.get("operation_digest") != ""
+        or payload.get("raw_request_digest") not in {None, raw_request_digest}
+        or payload.get("source") != source
+    ):
+        return False
+    legacy_command = {"action": "unmanaged", "command_digest": command_digest}
+    legacy_digest = _digest(
+        {
+            "identity": existing["stable_identity"],
+            "command": legacy_command,
+            "raw_request": raw_request_digest,
+            "source": source,
+        }
+    )
+    legacy_command_digest = _digest(legacy_command)
+    return (
+        existing["payload_digest"] == legacy_digest
+        and payload.get("command_digest") == legacy_command_digest
+    )
 
 
 def _context_key(event: dict[str, object]) -> str:
@@ -2892,6 +3038,29 @@ def _promote_codex_prompt_root(
         "UPDATE managed_contexts SET root_valid = 1 WHERE context_key = ?",
         (context["context_key"],),
     )
+    if event["action"] == "discovery":
+        anchor_rule_version = _codex_current_turn_anchor_rule_version(
+            p0_history,
+            session_id=str(event["session_id"]),
+            cwd=Path(str(event["cwd"])),
+            generation_id=str(event["generation_id"]),
+            prompt_version=root_payload.get("client_version"),
+            pre_version=pre_payload.get("client_version"),
+        )
+        if anchor_rule_version is None:
+            anchor_rule_version = CODEX_NATIVE_PACKET_P1_ANCHOR_RULE_VERSION
+        database.execute(
+            """INSERT INTO managed_request_anchors(
+            context_key, p0_event_id, pre_event_id, rule_version, created_at)
+            VALUES (?, ?, ?, ?, ?)""",
+            (
+                context["context_key"],
+                root_event_id,
+                event_id,
+                anchor_rule_version,
+                records.utc_now(),
+            ),
+        )
     return True
 
 
@@ -3024,6 +3193,196 @@ def _codex_appended_prompt_is_verified(
     return True
 
 
+def _codex_native_packet_suffix_is_verified(
+    history: list[dict[str, object]],
+    *,
+    session_id: str,
+    cwd: Path,
+    generation_id: str,
+) -> bool:
+    """Accept only same-turn technical records after the frozen P1 prompt.
+
+    The P1 proof remains the only source of business DTO text.  Later native
+    completions may exist before the action callback, but cannot add a user
+    message, alter the turn identity, or introduce a fork/compaction base.
+    """
+
+    unresolved_history_base = {
+        "history_base",
+        "historyBase",
+        "forked_from",
+        "forkedFrom",
+        "compacted_from",
+        "compactedFrom",
+    }
+    has_current_turn_evidence = False
+    for record in history:
+        if _contains_unresolved_history_base(
+            record, unresolved_history_base
+        ) or not _codex_record_cwd_is_current(
+            record,
+            cwd,
+            allow_command_execution_uri=True,
+        ):
+            return False
+        record_type = record.get("type")
+        if record_type == "event_msg":
+            payload = record.get("payload")
+            if isinstance(payload, dict) and payload.get("type") == "token_count":
+                if has_current_turn_evidence and _codex_token_count_is_verified(record, payload):
+                    continue
+                return False
+            if (
+                not isinstance(payload, dict)
+                or payload.get("type") != "item_completed"
+                or payload.get("thread_id") != session_id
+                or payload.get("turn_id") != generation_id
+            ):
+                return False
+            item = payload.get("item")
+            if not isinstance(item, dict):
+                return False
+            item_type = item.get("type")
+            if item_type == "UserMessage":
+                return False
+            if item_type == "Reasoning":
+                has_current_turn_evidence = True
+                continue
+            if item_type == "AgentMessage":
+                if not _codex_commentary_item_is_verified(item):
+                    return False
+                has_current_turn_evidence = True
+                continue
+            if item_type != "CommandExecution":
+                return False
+            if (
+                not isinstance(item.get("id"), str)
+                or not item["id"]
+                or not _codex_command_execution_cwd_is_current(item.get("cwd"), str(cwd))
+            ):
+                return False
+            has_current_turn_evidence = True
+            continue
+        if record_type == "response_item":
+            payload = record.get("payload")
+            if isinstance(payload, dict) and payload.get("type") == "custom_tool_call_output":
+                if _codex_custom_tool_call_output_is_verified(record, payload, generation_id):
+                    has_current_turn_evidence = True
+                    continue
+                return False
+            metadata = (
+                payload.get("internal_chat_message_metadata_passthrough")
+                if isinstance(payload, dict)
+                else None
+            )
+            if (
+                isinstance(payload, dict)
+                and payload.get("type") == "message"
+                and payload.get("role") == "assistant"
+            ):
+                if _codex_assistant_commentary_is_verified(payload, generation_id):
+                    has_current_turn_evidence = True
+                    continue
+                return False
+            if (
+                not isinstance(payload, dict)
+                or payload.get("type") not in {"reasoning", "custom_tool_call"}
+                or not isinstance(metadata, dict)
+                or metadata.get("turn_id") != generation_id
+            ):
+                return False
+            has_current_turn_evidence = True
+            continue
+        if record_type == "token_usage_record":
+            payload = record.get("payload")
+            if (
+                not isinstance(payload, dict)
+                or payload.get("session_id") != session_id
+                or payload.get("thread_id") != session_id
+                or payload.get("turn_id") != generation_id
+                or payload.get("root_turn_id") != generation_id
+            ):
+                return False
+            has_current_turn_evidence = True
+            continue
+        return False
+    return True
+
+
+def _codex_custom_tool_call_output_is_verified(
+    record: dict[str, object],
+    payload: dict[str, object],
+    generation_id: str,
+) -> bool:
+    """Accept the observed non-business custom-tool completion serializer only."""
+
+    metadata = payload.get("internal_chat_message_metadata_passthrough")
+    output = payload.get("output")
+    if (
+        set(record) != {"type", "timestamp", "ordinal", "metadata", "payload"}
+        or not isinstance(record.get("timestamp"), str)
+        or not isinstance(record.get("ordinal"), int)
+        or isinstance(record.get("ordinal"), bool)
+        or not isinstance(record.get("metadata"), dict)
+        or set(payload)
+        != {
+            "type",
+            "id",
+            "call_id",
+            "output",
+            "internal_chat_message_metadata_passthrough",
+        }
+        or not isinstance(payload.get("id"), str)
+        or not payload["id"]
+        or not isinstance(payload.get("call_id"), str)
+        or not payload["call_id"]
+        or not isinstance(metadata, dict)
+        or set(metadata) != {"turn_id", "create_time"}
+        or metadata.get("turn_id") != generation_id
+        or not isinstance(metadata.get("create_time"), (int, float))
+        or isinstance(metadata.get("create_time"), bool)
+        or not isinstance(output, list)
+        or not output
+    ):
+        return False
+    return all(
+        isinstance(item, dict)
+        and set(item) == {"type", "text"}
+        and isinstance(item.get("type"), str)
+        and bool(item["type"])
+        and isinstance(item.get("text"), str)
+        for item in output
+    )
+
+
+def _codex_token_count_is_verified(
+    record: dict[str, object],
+    payload: dict[str, object],
+) -> bool:
+    """Accept technical token telemetry without treating it as request proof."""
+
+    info = payload.get("info")
+    return not (
+        set(record) != {"type", "timestamp", "ordinal", "payload"}
+        or not isinstance(record.get("timestamp"), str)
+        or not isinstance(record.get("ordinal"), int)
+        or isinstance(record.get("ordinal"), bool)
+        or set(payload) != {"type", "info", "rate_limits"}
+        or not isinstance(info, dict)
+        or set(info)
+        != {
+            "total_token_usage",
+            "last_token_usage",
+            "model_context_window",
+        }
+        or not isinstance(info.get("total_token_usage"), dict)
+        or not isinstance(info.get("last_token_usage"), dict)
+        or not isinstance(info.get("model_context_window"), int)
+        or isinstance(info.get("model_context_window"), bool)
+        or not isinstance(payload.get("rate_limits"), dict)
+    )
+
+
 def _context_raw_prompt_matches_business_dto(
     context: Any,
     prompt_payload: dict[str, object],
@@ -3096,18 +3455,43 @@ def _codex_commentary_content_is_verified(content: object, content_type: str) ->
     )
 
 
-def _codex_record_cwd_is_current(record: object, cwd: Path) -> bool:
+def _codex_record_cwd_is_current(
+    record: object,
+    cwd: Path,
+    *,
+    allow_command_execution_uri: bool = False,
+) -> bool:
     """Reject any later explicit workspace claim that disagrees with P0."""
 
     expected = str(cwd)
     if isinstance(record, dict):
+        command_execution = record.get("type") == "CommandExecution"
         for key, value in record.items():
-            if key == "cwd" and value != expected:
+            if key == "cwd":
+                if value == expected:
+                    continue
+                if (
+                    allow_command_execution_uri
+                    and command_execution
+                    and _codex_command_execution_cwd_is_current(value, expected)
+                ):
+                    continue
                 return False
-            if not _codex_record_cwd_is_current(value, cwd):
+            if not _codex_record_cwd_is_current(
+                value,
+                cwd,
+                allow_command_execution_uri=allow_command_execution_uri,
+            ):
                 return False
     elif isinstance(record, list):
-        return all(_codex_record_cwd_is_current(value, cwd) for value in record)
+        return all(
+            _codex_record_cwd_is_current(
+                value,
+                cwd,
+                allow_command_execution_uri=allow_command_execution_uri,
+            )
+            for value in record
+        )
     return True
 
 
@@ -3474,6 +3858,8 @@ def _current_request_anchor_rule_is_supported(host: str, rule_version: object) -
     if rule_version == CURRENT_REQUEST_ANCHOR_RULE_VERSION:
         return host in {"codex", "workbuddy"}
     if rule_version == CODEX_ALPHA11_ARG0_ANCHOR_RULE_VERSION:
+        return host == "codex"
+    if rule_version == CODEX_NATIVE_PACKET_P1_ANCHOR_RULE_VERSION:
         return host == "codex"
     return host == "workbuddy" and rule_version in {
         WORKBUDDY_SKILL_PRE_ANCHOR_RULE_VERSION,
@@ -5514,7 +5900,7 @@ def _issue_receipt(
             return None
     elif event["request_from_prompt"]:
         correction = _context_correction_declaration(database, context)
-        if event["action"] != "unmanaged" and not _context_accepts_receipt_skill(
+        if event["action"] not in {"unmanaged", "discovery"} and not _context_accepts_receipt_skill(
             database, context, event
         ):
             database.execute(
@@ -5619,6 +6005,8 @@ def _issue_receipt(
         return None
     elif effective_causation in {"input_preparation", "automatic_retry", "permission"}:
         _link_explicit_followup_context(database, context_key, event)
+    if event["action"] == "discovery":
+        return DISCOVERY_PENDING
     if event["action"] == "unmanaged":
         if effective_causation in {"unknown", "business_correction", "correction_candidate"}:
             database.execute(
@@ -5688,6 +6076,21 @@ def _issue_receipt(
             call_id,
         ),
     )
+    if _native_request_packet_is_requested(event):
+        receipt_row = database.execute(
+            "SELECT * FROM managed_receipts WHERE receipt_digest = ?", (receipt_digest,)
+        ).fetchone()
+        if receipt_row is None:
+            raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native action receipt was not retained")
+        _create_native_request_packet(
+            database,
+            project_root=Path(str(event["cwd"])),
+            installation=installation,
+            event=event,
+            event_id=event_id,
+            context=context,
+            receipt=receipt_row,
+        )
     return raw_receipt
 
 
@@ -5747,6 +6150,1002 @@ def _operation_subject(event: dict[str, object]) -> tuple[str, str] | None:
     if isinstance(task_id, str) and task_id and isinstance(call_id, str) and call_id:
         return task_id, call_id
     return None
+
+
+def _native_request_packet_is_requested(event: dict[str, object]) -> bool:
+    """Recognize the one collector-owned action DTO transfer declaration."""
+
+    arguments = event.get("operation_arguments")
+    return (
+        event.get("phase") == PRE_PHASE
+        and isinstance(event.get("action"), str)
+        and bool(event["action"])
+        and isinstance(arguments, dict)
+        and arguments.get("--request-source") == "native"
+    )
+
+
+def _create_native_request_packet(
+    database: Any,
+    *,
+    project_root: Path,
+    installation: dict[str, Any],
+    event: dict[str, object],
+    event_id: str,
+    context: Any,
+    receipt: Any,
+) -> None:
+    """Write one receipt-bound DTO packet while the trusted Pre callback owns the lock.
+
+    The packet is deliberately an owned, short-lived transport object.  Its
+    metadata is recorded by digest in the native event; neither the original
+    prompt nor the host transcript location becomes durable SELC state.
+    """
+
+    if event["host"] != "codex" or event["fixture"] or not event["request_from_prompt"]:
+        raise SelcError(
+            "NATIVE_REQUEST_UNAVAILABLE",
+            "native request packets require a verified Codex Pre callback",
+        )
+    if not bool(context["root_valid"]):
+        raise SelcError(
+            "ROOT_PROOF_UNAVAILABLE",
+            "native request packet has no verified current prompt root",
+        )
+    operation_subject = _operation_subject(event)
+    if operation_subject != (str(receipt["task_id"]), str(receipt["call_id"])):
+        raise SelcError(
+            "RECEIPT_ARGUMENT_MISMATCH",
+            "native request packet subject differs from the action receipt",
+        )
+    action_id = _packet_action_id(event)
+    suite_root = _current_root(project_root, str(event["suite_id"]))
+    manifest = load_manifest(suite_root)
+    action = managed_configuration(manifest, suite_root).get(action_id)
+    if action is None or action["skill"] != event["skill"]:
+        raise SelcError(
+            "MANAGED_ACTION_UNDECLARED",
+            "native request packet action is not declared for this skill",
+        )
+    request = _native_packet_request_from_verified_prompt(database, context, event, event_id)
+    normalized_request = _validate_action_request(action, request)
+    request_digest = _digest({"skill": event["skill"], "input": normalized_request})
+    packet = {
+        "version": NATIVE_REQUEST_PACKET_VERSION,
+        "receipt_digest": receipt["receipt_digest"],
+        "native_event_id": event_id,
+        "installation_digest": installation["digest"],
+        "installation_version": installation["version"],
+        "suite_id": event["suite_id"],
+        "host": event["host"],
+        "session_id": event["session_id"],
+        "generation_id": event["generation_id"],
+        "request_id": event["request_id"],
+        "tool_use_id": event["tool_use_id"],
+        "task_id": receipt["task_id"],
+        "call_id": receipt["call_id"],
+        "skill": event["skill"],
+        "action": action_id,
+        "request_digest": request_digest,
+        "expires_at": receipt["expires_at"],
+        "request": normalized_request,
+    }
+    packet_bytes = canonical_json(packet).encode("utf-8")
+    if len(packet_bytes) > MAX_NATIVE_REQUEST_PACKET_BYTES:
+        raise SelcError(
+            "NATIVE_REQUEST_UNAVAILABLE",
+            "native request packet exceeds the bounded transport size",
+        )
+    packet_digest = hashlib.sha256(packet_bytes).hexdigest()
+    _assert_native_request_packet_capacity(
+        database,
+        project_root=project_root,
+        suite_id=str(event["suite_id"]),
+        pending_receipt_digest=str(receipt["receipt_digest"]),
+    )
+    _cleanup_expired_native_request_packets(
+        database,
+        project_root,
+        str(event["suite_id"]),
+        installation,
+    )
+    packet_path = _native_request_packet_path(
+        project_root,
+        str(event["suite_id"]),
+        str(receipt["receipt_digest"]),
+    )
+    _write_native_request_packet(packet_path, packet_bytes, packet_digest)
+
+    native_event = database.execute(
+        "SELECT payload_json FROM managed_native_events WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    if native_event is None:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet event is unavailable")
+    try:
+        payload = json.loads(str(native_event["payload_json"]))
+    except json.JSONDecodeError as error:
+        raise SelcError(
+            "NATIVE_REQUEST_UNAVAILABLE", "native packet event is unreadable"
+        ) from error
+    if not isinstance(payload, dict):
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet event is malformed")
+    existing = payload.get("native_request_packet")
+    metadata = {"version": NATIVE_REQUEST_PACKET_VERSION, "digest": packet_digest}
+    if existing is not None and existing != metadata:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet metadata already differs")
+    payload["native_request_packet"] = metadata
+    database.execute(
+        "UPDATE managed_native_events SET payload_json = ? WHERE event_id = ?",
+        (_encoded(payload), event_id),
+    )
+
+
+def _packet_action_id(event: dict[str, object]) -> str:
+    arguments = event.get("operation_arguments")
+    action_id = arguments.get("--action") if isinstance(arguments, dict) else None
+    if not isinstance(action_id, str) or not action_id:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet action is missing")
+    return action_id
+
+
+def _native_packet_request_from_verified_prompt(
+    database: Any,
+    context: Any,
+    event: dict[str, object],
+    event_id: str,
+) -> dict[str, object]:
+    """Extract one DTO from the durable first P1 proof, never a later Pre."""
+
+    root_event_id = context["root_event_id"]
+    if not isinstance(root_event_id, str) or not root_event_id:
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet root event is missing")
+    anchor = database.execute(
+        """SELECT p0_event_id, pre_event_id, rule_version
+        FROM managed_request_anchors WHERE context_key = ?""",
+        (context["context_key"],),
+    ).fetchone()
+    if (
+        anchor is None
+        or anchor["p0_event_id"] != root_event_id
+        or not isinstance(anchor["pre_event_id"], str)
+        or not anchor["pre_event_id"]
+        or not _current_request_anchor_rule_is_supported(
+            str(context["host"]), anchor["rule_version"]
+        )
+    ):
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet P1 anchor is unavailable")
+    root_row = database.execute(
+        """SELECT payload_json, host, session_id, generation_id, request_id, phase
+        FROM managed_native_events WHERE event_id = ?""",
+        (root_event_id,),
+    ).fetchone()
+    anchor_pre_row = database.execute(
+        """SELECT payload_json, host, session_id, generation_id, request_id, phase
+        FROM managed_native_events WHERE event_id = ?""",
+        (anchor["pre_event_id"],),
+    ).fetchone()
+    action_pre_row = database.execute(
+        """SELECT payload_json, host, session_id, generation_id, request_id, phase
+        FROM managed_native_events WHERE event_id = ?""",
+        (event_id,),
+    ).fetchone()
+    if (
+        root_row is None
+        or anchor_pre_row is None
+        or action_pre_row is None
+        or root_row["phase"] != USER_PROMPT_PHASE
+        or anchor_pre_row["phase"] != PRE_PHASE
+        or action_pre_row["phase"] != PRE_PHASE
+    ):
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet P0/P1 evidence is unavailable")
+    identity = (
+        event["host"],
+        event["session_id"],
+        event["generation_id"],
+        event["request_id"],
+    )
+    if any(
+        tuple(row[key] for key in ("host", "session_id", "generation_id", "request_id")) != identity
+        for row in (root_row, anchor_pre_row, action_pre_row)
+    ):
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet P0/P1 identities differ")
+    try:
+        root_payload = json.loads(str(root_row["payload_json"]))
+        anchor_pre_payload = json.loads(str(anchor_pre_row["payload_json"]))
+        action_pre_payload = json.loads(str(action_pre_row["payload_json"]))
+    except json.JSONDecodeError as error:
+        raise SelcError(
+            "ROOT_PROOF_UNAVAILABLE", "native packet P0/P1 evidence is unreadable"
+        ) from error
+    if (
+        not isinstance(root_payload, dict)
+        or not isinstance(anchor_pre_payload, dict)
+        or not isinstance(action_pre_payload, dict)
+    ):
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet P0/P1 evidence is malformed")
+    raw_prompt_digest = root_payload.get("raw_request_digest")
+    p0_fields = _frozen_prefix_fields(root_payload.get("prefix"))
+    p1_fields = _frozen_prefix_fields(anchor_pre_payload.get("prefix"))
+    action_fields = _frozen_prefix_fields(action_pre_payload.get("prefix"))
+    current_fields = _frozen_prefix_fields(event.get("prefix"))
+    if (
+        not isinstance(raw_prompt_digest, str)
+        or len(raw_prompt_digest) != 64
+        or p0_fields is None
+        or p1_fields is None
+        or action_fields is None
+        or current_fields is None
+        or action_fields != current_fields
+        or root_payload.get("source") != "native-collector"
+        or anchor_pre_payload.get("source") != "native-collector"
+        or action_pre_payload.get("source") != "native-collector"
+        or anchor_pre_payload.get("request_from_prompt") is not True
+    ):
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet P0/P1 proof is incomplete")
+    p0_hash, p0_length, p0_path_hash, p0_device, p0_inode = p0_fields
+    p1_hash, p1_length, p1_path_hash, p1_device, p1_inode = p1_fields
+    current_hash, current_length, current_path_hash, current_device, current_inode = current_fields
+    if (
+        p1_length <= p0_length
+        or p0_path_hash != p1_path_hash
+        or p0_device != p1_device
+        or p0_inode != p1_inode
+        or current_length < p1_length
+        or current_path_hash != p1_path_hash
+        or current_device != p1_device
+        or current_inode != p1_inode
+    ):
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet P0/P1 prefix differs")
+    p1_raw = _read_frozen_prefix_buffer(event, p1_fields)
+    if p1_raw is None or hashlib.sha256(p1_raw).hexdigest() != p1_hash:
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet P1 bytes changed")
+    if hashlib.sha256(p1_raw[:p0_length]).hexdigest() != p0_hash:
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet P0 bytes changed")
+    current_raw = _read_frozen_prefix_buffer(event, current_fields)
+    if current_raw is None or hashlib.sha256(current_raw).hexdigest() != current_hash:
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet action Pre bytes changed")
+    if current_raw[:p1_length] != p1_raw:
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet P1 bytes differ from action Pre")
+    try:
+        p0_history = _parse_native_history(p1_raw[:p0_length])
+        p1_history = _parse_native_history(p1_raw)
+        current_history = _parse_native_history(current_raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet history is invalid") from error
+    if any(
+        _contains_unresolved_history_base(
+            record,
+            {
+                "history_base",
+                "historyBase",
+                "forked_from",
+                "forkedFrom",
+                "compacted_from",
+                "compactedFrom",
+            },
+        )
+        for record in p1_history
+    ):
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet history is incomplete")
+    if not _codex_initialization_prefix_is_verified(
+        p0_history,
+        session_id=str(event["session_id"]),
+        cwd=Path(str(event["cwd"])),
+        generation_id=str(event["generation_id"]),
+    ):
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet initialization is invalid")
+    appended_history = p1_history[len(p0_history) :]
+    if not _codex_appended_prompt_is_verified(
+        appended_history,
+        session_id=str(event["session_id"]),
+        cwd=Path(str(event["cwd"])),
+        generation_id=str(event["generation_id"]),
+        raw_prompt_digest=raw_prompt_digest,
+    ) or not _codex_native_packet_suffix_is_verified(
+        current_history[len(p1_history) :],
+        session_id=str(event["session_id"]),
+        cwd=Path(str(event["cwd"])),
+        generation_id=str(event["generation_id"]),
+    ):
+        raise SelcError("ROOT_PROOF_UNAVAILABLE", "native packet prompt is unverified")
+    raw_prompt = _codex_raw_prompt_from_appended_history(appended_history)
+    return _native_packet_dto_from_prompt(raw_prompt, context, str(event["skill"]))
+
+
+def _native_packet_dto_from_prompt(
+    raw_prompt: str,
+    context: Any,
+    skill: str,
+) -> dict[str, object]:
+    """Accept only the existing explicit or automatic structured prompt form."""
+
+    selector = ""
+    encoded_input = raw_prompt
+    if raw_prompt.startswith("@"):
+        prefix, separator, encoded_input = raw_prompt.partition(" ")
+        selector = prefix[1:]
+        if not selector or not separator:
+            raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet prompt is not structured")
+    try:
+        supplied_input = json.loads(encoded_input)
+    except json.JSONDecodeError as error:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet prompt is not JSON") from error
+    if not isinstance(supplied_input, dict):
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet prompt is not an object")
+    request = dict(supplied_input)
+    request.pop("selc", None)
+    if context["input_skill"]:
+        if selector != context["input_skill"] or selector != skill:
+            raise SelcError("RECEIPT_ARGUMENT_MISMATCH", "native packet skill differs from prompt")
+        if _digest({"skill": skill, "input": request}) != context["request_digest"]:
+            raise SelcError("RECEIPT_ARGUMENT_MISMATCH", "native packet DTO differs from prompt")
+    else:
+        if selector or not _context_uses_automatic_selection(context):
+            raise SelcError(
+                "RECEIPT_ARGUMENT_MISMATCH", "native packet selector differs from prompt"
+            )
+        if _business_dto_goal_digest(request) != context["business_dto_digest"]:
+            raise SelcError("RECEIPT_ARGUMENT_MISMATCH", "native packet DTO differs from prompt")
+    return request
+
+
+def _native_request_packet_path(project_root: Path, suite_id: str, receipt_digest: str) -> Path:
+    if not _is_sha256_digest(receipt_digest):
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet receipt identity is invalid")
+    return project_root / ".selc" / "managed-request-packets" / suite_id / f"{receipt_digest}.json"
+
+
+def _write_native_request_packet(path: Path, contents: bytes, expected_digest: str) -> None:
+    """Create one no-clobber packet after fully syncing its private bytes."""
+
+    parent = path.parent
+    parent.mkdir(parents=True, mode=0o700, exist_ok=True)
+    _assert_owned_packet_directory_chain(parent)
+    try:
+        existing = _read_native_request_packet_file(path)
+    except FileNotFoundError:
+        existing = None
+    if existing is not None:
+        if hashlib.sha256(existing).hexdigest() != expected_digest:
+            raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet already differs")
+        return
+
+    temporary = _native_request_packet_temporary_path(path)
+    temporary_created = False
+    try:
+        _write_private_fsynced(temporary, contents)
+        temporary_created = True
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            existing = _read_native_request_packet_file(path)
+            if hashlib.sha256(existing).hexdigest() != expected_digest:
+                raise SelcError(
+                    "NATIVE_REQUEST_UNAVAILABLE", "native packet already differs"
+                ) from None
+        _fsync_directory(parent)
+    finally:
+        if temporary_created:
+            with suppress(FileNotFoundError):
+                temporary.unlink()
+            _fsync_directory(parent)
+
+
+def _native_request_packet_temporary_path(packet_path: Path) -> Path:
+    receipt_digest = _native_request_packet_receipt_digest(packet_path)
+    if receipt_digest is None:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet receipt identity is invalid")
+    return packet_path.with_name(f".{receipt_digest}.json.tmp")
+
+
+def _read_native_request_packet_file(path: Path) -> bytes:
+    raw, _metadata = _read_native_request_packet_artifact(path, allowed_links={1})
+    return raw
+
+
+def _read_native_request_packet_artifact(
+    path: Path,
+    *,
+    allowed_links: set[int],
+) -> tuple[bytes, os.stat_result]:
+    """Read one private packet artifact while retaining its stable inode facts."""
+
+    _assert_owned_packet_directory_chain(path.parent)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet reader cannot disable links")
+    descriptor = os.open(path, flags)
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or metadata.st_nlink not in allowed_links
+        ):
+            raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet is not one private file")
+        if metadata.st_size < 1 or metadata.st_size > MAX_NATIVE_REQUEST_PACKET_BYTES:
+            raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet size is invalid")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, remaining)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if len(raw) != metadata.st_size:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet changed while reading")
+    try:
+        current = path.lstat()
+    except OSError as error:
+        raise SelcError(
+            "NATIVE_REQUEST_UNAVAILABLE", "native packet changed while reading"
+        ) from error
+    if current.st_dev != metadata.st_dev or current.st_ino != metadata.st_ino:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet changed while reading")
+    return raw, metadata
+
+
+def _write_private_fsynced(path: Path, contents: bytes) -> None:
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet writer cannot disable links")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        view = memoryview(contents)
+        while view:
+            written = os.write(descriptor, view)
+            view = view[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _assert_owned_packet_directory(path: Path) -> None:
+    metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or stat.S_ISLNK(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    ):
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet directory is not private")
+
+
+def _assert_owned_packet_directory_chain(path: Path) -> None:
+    _assert_owned_packet_directory(path)
+    _assert_owned_packet_directory(path.parent)
+
+
+def _cleanup_expired_native_request_packets(
+    database: Any,
+    project_root: Path,
+    suite_id: str,
+    installation: dict[str, Any],
+) -> None:
+    """Recover or remove one bounded batch of this suite's packet artifacts."""
+
+    root = project_root / ".selc" / "managed-request-packets" / suite_id
+    if not root.exists():
+        return
+    _assert_owned_packet_directory_chain(root)
+    candidates = _native_request_packet_directory_entries(
+        root,
+        limit=MAX_NATIVE_REQUEST_PACKET_CLEANUP_BATCH,
+    )
+    packet_paths = {
+        receipt_digest: candidate
+        for candidate in candidates
+        if (receipt_digest := _native_request_packet_receipt_digest(candidate)) is not None
+    }
+    temporary_paths: dict[str, list[Path]] = {}
+    for candidate in candidates:
+        receipt_digest = _native_request_packet_temporary_receipt_digest(candidate)
+        if receipt_digest is not None:
+            temporary_paths.setdefault(receipt_digest, []).append(candidate)
+
+    for receipt_digest, packet_path in packet_paths.items():
+        receipt = database.execute(
+            "SELECT * FROM managed_receipts WHERE receipt_digest = ?",
+            (receipt_digest,),
+        ).fetchone()
+        receipt_temporaries = temporary_paths.get(receipt_digest, [])
+        if (
+            receipt is None
+            or receipt["status"] != "ready"
+            or receipt["expires_at"] < records.utc_now()
+        ):
+            _discard_native_request_packet_artifact(packet_path, allowed_links={1, 2})
+            for temporary_path in receipt_temporaries:
+                _discard_native_request_packet_artifact(temporary_path, allowed_links={1, 2})
+            continue
+        _recover_native_request_packet_artifact(
+            database,
+            packet_path=packet_path,
+            temporary_paths=receipt_temporaries,
+            receipt=receipt,
+            installation=installation,
+        )
+        for temporary_path in receipt_temporaries:
+            _discard_native_request_packet_artifact(temporary_path, allowed_links={1})
+
+    for receipt_digest, receipt_temporaries in temporary_paths.items():
+        if receipt_digest in packet_paths:
+            continue
+        for temporary_path in receipt_temporaries:
+            _discard_native_request_packet_artifact(temporary_path, allowed_links={1})
+
+
+def _native_request_packet_directory_entries(root: Path, *, limit: int) -> list[Path]:
+    """Read at most one finite directory batch without inspecting later entries."""
+
+    candidates: list[Path] = []
+    try:
+        with os.scandir(root) as entries:
+            while len(candidates) < limit:
+                try:
+                    entry = next(entries)
+                except StopIteration:
+                    break
+                candidates.append(Path(entry.path))
+    except OSError as error:
+        raise SelcError(
+            "NATIVE_REQUEST_UNAVAILABLE", "native packet directory is unreadable"
+        ) from error
+    return candidates
+
+
+def _native_request_packet_receipt_digest(path: Path) -> str | None:
+    receipt_digest = path.stem
+    if path.name != f"{receipt_digest}.json" or not _is_sha256_digest(receipt_digest):
+        return None
+    return receipt_digest
+
+
+def _native_request_packet_temporary_receipt_digest(path: Path) -> str | None:
+    match = _NATIVE_REQUEST_PACKET_CURRENT_TEMPORARY_RE.fullmatch(path.name)
+    if match is None:
+        match = _NATIVE_REQUEST_PACKET_TEMPORARY_RE.fullmatch(path.name)
+    return match.group("receipt") if match is not None else None
+
+
+def _live_native_request_packet_receipts(
+    database: Any,
+    *,
+    suite_id: str,
+    limit: int,
+    terminal_event: dict[str, object] | None = None,
+    include_expired: bool = False,
+    expired_only: bool = False,
+    pending_receipt_digest: str | None = None,
+) -> list[Any]:
+    """Read a bounded set of ready packet receipts from durable metadata."""
+
+    if include_expired and expired_only:
+        raise ValueError("native packet receipt selector cannot include and require expired rows")
+    clauses = [
+        "receipts.suite_id = ?",
+        "receipts.status = 'ready'",
+    ]
+    values: list[object] = [suite_id]
+    if expired_only:
+        clauses.append("receipts.expires_at < ?")
+        values.append(records.utc_now())
+    elif not include_expired:
+        clauses.append("receipts.expires_at >= ?")
+        values.append(records.utc_now())
+    if pending_receipt_digest is None:
+        clauses.append("events.payload_json LIKE ?")
+        values.append(_NATIVE_REQUEST_PACKET_METADATA_MARKER)
+    else:
+        clauses.append("(events.payload_json LIKE ? OR receipts.receipt_digest = ?)")
+        values.extend((_NATIVE_REQUEST_PACKET_METADATA_MARKER, pending_receipt_digest))
+    if terminal_event is not None:
+        for field in ("host", "session_id", "generation_id", "request_id"):
+            clauses.append(f"receipts.{field} = ?")
+            values.append(terminal_event[field])
+    values.append(limit)
+    return database.execute(
+        """SELECT receipts.* FROM managed_receipts AS receipts
+        JOIN managed_native_events AS events ON events.event_id = receipts.native_event_id
+        WHERE """
+        + " AND ".join(clauses)
+        + " ORDER BY receipts.receipt_digest LIMIT ?",
+        values,
+    ).fetchall()
+
+
+def _assert_native_request_packet_capacity(
+    database: Any,
+    *,
+    project_root: Path,
+    suite_id: str,
+    pending_receipt_digest: str,
+) -> None:
+    """Fail closed before business work when live packet transport reaches its cap."""
+
+    _cleanup_expired_native_request_packet_receipts(
+        database,
+        project_root=project_root,
+        suite_id=suite_id,
+    )
+    receipts = _live_native_request_packet_receipts(
+        database,
+        suite_id=suite_id,
+        limit=MAX_LIVE_NATIVE_REQUEST_PACKETS + 1,
+        include_expired=True,
+        pending_receipt_digest=pending_receipt_digest,
+    )
+    # The current Pre receipt has already been inserted and carries the
+    # native-source operation marker before its packet metadata is projected.
+    # A result of 64 therefore reserves the final permitted packet; 65 would
+    # exceed the suite cap once this callback publishes its packet.
+    if len(receipts) > MAX_LIVE_NATIVE_REQUEST_PACKETS:
+        raise SelcError(
+            "NATIVE_REQUEST_UNAVAILABLE",
+            "too many live native request packets",
+            "wait for an existing native action to consume or terminate its packet",
+        )
+
+
+def _cleanup_expired_native_request_packet_receipts(
+    database: Any,
+    *,
+    project_root: Path,
+    suite_id: str,
+) -> None:
+    """Terminalize one bounded set of expired packet receipts after pair cleanup."""
+
+    receipts = _live_native_request_packet_receipts(
+        database,
+        suite_id=suite_id,
+        limit=MAX_LIVE_NATIVE_REQUEST_PACKETS + 1,
+        expired_only=True,
+    )
+    for receipt in receipts:
+        _cleanup_native_request_packet_receipt_pair(
+            database,
+            project_root=project_root,
+            suite_id=suite_id,
+            receipt=receipt,
+        )
+
+
+def _recover_current_native_request_packet_artifact(
+    database: Any,
+    *,
+    project_root: Path,
+    receipt: Any,
+    installation: dict[str, Any],
+) -> None:
+    """Recover only the receipt-derived current packet pair without enumeration."""
+
+    packet_path = _native_request_packet_path(
+        project_root,
+        str(receipt["suite_id"]),
+        str(receipt["receipt_digest"]),
+    )
+    _recover_native_request_packet_artifact(
+        database,
+        packet_path=packet_path,
+        temporary_paths=[_native_request_packet_temporary_path(packet_path)],
+        receipt=receipt,
+        installation=installation,
+    )
+
+
+def _cleanup_terminal_native_request_packets(
+    database: Any,
+    *,
+    project_root: Path,
+    suite_id: str,
+    terminal_event: dict[str, object],
+) -> None:
+    """Remove the exact terminated request's packet pairs without enumeration."""
+
+    receipts = _live_native_request_packet_receipts(
+        database,
+        suite_id=suite_id,
+        limit=MAX_LIVE_NATIVE_REQUEST_PACKETS,
+        terminal_event=terminal_event,
+        include_expired=True,
+    )
+    for receipt in receipts:
+        _cleanup_native_request_packet_receipt_pair(
+            database,
+            project_root=project_root,
+            suite_id=suite_id,
+            receipt=receipt,
+        )
+
+
+def _cleanup_native_request_packet_receipt_pair(
+    database: Any,
+    *,
+    project_root: Path,
+    suite_id: str,
+    receipt: Any,
+) -> None:
+    """Remove one receipt-owned pair and terminalize only after it is absent."""
+
+    packet_path = _native_request_packet_path(
+        project_root,
+        suite_id,
+        str(receipt["receipt_digest"]),
+    )
+    temporary_path = _native_request_packet_temporary_path(packet_path)
+    _discard_native_request_packet_artifact(packet_path, allowed_links={1, 2})
+    _discard_native_request_packet_artifact(temporary_path, allowed_links={1, 2})
+    if not _native_request_packet_artifact_is_absent(
+        packet_path
+    ) or not _native_request_packet_artifact_is_absent(temporary_path):
+        return
+
+    now = records.utc_now()
+    status = "expired" if str(receipt["expires_at"]) < now else "invalid"
+    database.execute(
+        """UPDATE managed_receipts SET status = ?, invalidated_at = ?
+        WHERE receipt_digest = ? AND status = 'ready'""",
+        (status, now, receipt["receipt_digest"]),
+    )
+
+
+def _native_request_packet_artifact_is_absent(path: Path) -> bool:
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
+def _recover_native_request_packet_artifact(
+    database: Any,
+    *,
+    packet_path: Path,
+    temporary_paths: list[Path],
+    receipt: Any,
+    installation: dict[str, Any],
+) -> None:
+    """Repair one interrupted hard-link publication only after full binding checks."""
+
+    try:
+        packet_raw, packet_metadata = _read_native_request_packet_artifact(
+            packet_path,
+            allowed_links={1, 2},
+        )
+    except (FileNotFoundError, SelcError):
+        return
+    if packet_metadata.st_nlink == 2:
+        matching_temporaries: list[Path] = []
+        for temporary_path in temporary_paths:
+            try:
+                _temporary_raw, temporary_metadata = _read_native_request_packet_artifact(
+                    temporary_path,
+                    allowed_links={2},
+                )
+            except (FileNotFoundError, SelcError):
+                continue
+            if (
+                temporary_metadata.st_dev == packet_metadata.st_dev
+                and temporary_metadata.st_ino == packet_metadata.st_ino
+                and temporary_metadata.st_nlink == 2
+            ):
+                matching_temporaries.append(temporary_path)
+        if len(matching_temporaries) != 1:
+            return
+        if not _native_request_packet_artifact_matches_receipt(
+            database,
+            packet_raw,
+            receipt,
+            installation,
+        ):
+            return
+        _discard_native_request_packet_artifact(matching_temporaries[0], allowed_links={2})
+        return
+    if packet_metadata.st_nlink != 1:
+        return
+    _native_request_packet_artifact_matches_receipt(
+        database,
+        packet_raw,
+        receipt,
+        installation,
+    )
+
+
+def _native_request_packet_artifact_matches_receipt(
+    database: Any,
+    packet_raw: bytes,
+    receipt: Any,
+    installation: dict[str, Any],
+) -> bool:
+    """Validate the durable receipt metadata before recovering one packet link."""
+
+    packet_digest = hashlib.sha256(packet_raw).hexdigest()
+    try:
+        packet = json.loads(packet_raw)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(packet, dict) or canonical_json(packet).encode("utf-8") != packet_raw:
+        return False
+    expected = {
+        "version": NATIVE_REQUEST_PACKET_VERSION,
+        "receipt_digest": receipt["receipt_digest"],
+        "native_event_id": receipt["native_event_id"],
+        "installation_digest": receipt["installation_digest"],
+        "installation_version": installation["version"],
+        "suite_id": receipt["suite_id"],
+        "host": receipt["host"],
+        "session_id": receipt["session_id"],
+        "generation_id": receipt["generation_id"],
+        "request_id": receipt["request_id"],
+        "tool_use_id": receipt["tool_use_id"],
+        "task_id": receipt["task_id"],
+        "call_id": receipt["call_id"],
+        "skill": receipt["skill"],
+        "action": receipt["action"],
+        "expires_at": receipt["expires_at"],
+    }
+    if any(packet.get(key) != value for key, value in expected.items()):
+        return False
+    request = packet.get("request")
+    if not isinstance(request, dict) or packet.get("request_digest") != _digest(
+        {"skill": receipt["skill"], "input": request}
+    ):
+        return False
+    event_row = database.execute(
+        "SELECT payload_json FROM managed_native_events WHERE event_id = ?",
+        (receipt["native_event_id"],),
+    ).fetchone()
+    if event_row is None:
+        return False
+    try:
+        event_payload = json.loads(str(event_row["payload_json"]))
+    except json.JSONDecodeError:
+        return False
+    operation_arguments = (
+        event_payload.get("operation_arguments") if isinstance(event_payload, dict) else None
+    )
+    if (
+        not isinstance(event_payload, dict)
+        or not isinstance(operation_arguments, dict)
+        or operation_arguments.get("--request-source") != "native"
+    ):
+        return False
+    expected_metadata = {"version": NATIVE_REQUEST_PACKET_VERSION, "digest": packet_digest}
+    existing_metadata = event_payload.get("native_request_packet")
+    return existing_metadata == expected_metadata
+
+
+def _discard_native_request_packet_artifact(path: Path, *, allowed_links: set[int]) -> None:
+    try:
+        _raw, metadata = _read_native_request_packet_artifact(path, allowed_links=allowed_links)
+    except (FileNotFoundError, SelcError):
+        return
+    try:
+        current = path.lstat()
+    except OSError:
+        return
+    if current.st_dev != metadata.st_dev or current.st_ino != metadata.st_ino:
+        return
+    path.unlink()
+    _fsync_directory(path.parent)
+
+
+def _read_native_request_packet(
+    database: Any,
+    *,
+    project_root: Path,
+    receipt: Any,
+    context: Any,
+    installation: dict[str, Any],
+    skill: str,
+    action_id: str,
+) -> dict[str, object]:
+    """Load, bind, and consume the collector-created DTO packet exactly once."""
+
+    event_row = database.execute(
+        "SELECT payload_json FROM managed_native_events WHERE event_id = ?",
+        (receipt["native_event_id"],),
+    ).fetchone()
+    if event_row is None:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet event is unavailable")
+    try:
+        event_payload = json.loads(str(event_row["payload_json"]))
+    except json.JSONDecodeError as error:
+        raise SelcError(
+            "NATIVE_REQUEST_UNAVAILABLE", "native packet event is unreadable"
+        ) from error
+    metadata = (
+        event_payload.get("native_request_packet") if isinstance(event_payload, dict) else None
+    )
+    if (
+        not isinstance(metadata, dict)
+        or metadata.get("version") != NATIVE_REQUEST_PACKET_VERSION
+        or not isinstance(metadata.get("digest"), str)
+        or not _is_sha256_digest(metadata["digest"])
+    ):
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet metadata is unavailable")
+    path = _native_request_packet_path(
+        project_root, str(receipt["suite_id"]), str(receipt["receipt_digest"])
+    )
+    _recover_current_native_request_packet_artifact(
+        database,
+        project_root=project_root,
+        receipt=receipt,
+        installation=installation,
+    )
+    try:
+        raw = _read_native_request_packet_file(path)
+    except FileNotFoundError as error:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet is unavailable") from error
+    if hashlib.sha256(raw).hexdigest() != metadata["digest"]:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet bytes differ from its receipt")
+    try:
+        packet = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet is not JSON") from error
+    if not isinstance(packet, dict) or canonical_json(packet).encode("utf-8") != raw:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet is not canonical")
+    expected = {
+        "version": NATIVE_REQUEST_PACKET_VERSION,
+        "receipt_digest": receipt["receipt_digest"],
+        "native_event_id": receipt["native_event_id"],
+        "installation_digest": installation["digest"],
+        "installation_version": installation["version"],
+        "suite_id": receipt["suite_id"],
+        "host": receipt["host"],
+        "session_id": receipt["session_id"],
+        "generation_id": receipt["generation_id"],
+        "request_id": receipt["request_id"],
+        "tool_use_id": receipt["tool_use_id"],
+        "task_id": receipt["task_id"],
+        "call_id": receipt["call_id"],
+        "skill": skill,
+        "action": action_id,
+        "expires_at": receipt["expires_at"],
+    }
+    if any(packet.get(key) != value for key, value in expected.items()):
+        raise SelcError(
+            "NATIVE_REQUEST_UNAVAILABLE", "native packet binding differs from its receipt"
+        )
+    request = packet.get("request")
+    if not isinstance(request, dict):
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet request is invalid")
+    request_digest = _digest({"skill": skill, "input": request})
+    if packet.get("request_digest") != request_digest:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet request digest differs")
+    if context["input_skill"] and context["request_digest"] != request_digest:
+        raise SelcError("RECEIPT_ARGUMENT_MISMATCH", "native packet DTO differs from its prompt")
+    if (
+        not context["input_skill"]
+        and _business_dto_goal_digest(request) != context["business_dto_digest"]
+    ):
+        raise SelcError("RECEIPT_ARGUMENT_MISMATCH", "native packet DTO differs from its prompt")
+    if receipt["expires_at"] < records.utc_now():
+        raise SelcError("RECEIPT_EXPIRED", "native packet receipt has expired")
+    _delete_native_request_packet(path, metadata["digest"])
+    return request
+
+
+def _delete_native_request_packet(path: Path, expected_digest: str | None) -> None:
+    try:
+        raw = _read_native_request_packet_file(path)
+    except FileNotFoundError:
+        return
+    if expected_digest is not None and hashlib.sha256(raw).hexdigest() != expected_digest:
+        raise SelcError("NATIVE_REQUEST_UNAVAILABLE", "native packet changed before cleanup")
+    path.unlink()
+    _fsync_directory(path.parent)
+    _discard_native_request_packet_artifact(
+        _native_request_packet_temporary_path(path),
+        allowed_links={1},
+    )
 
 
 def _link_explicit_followup_context(
@@ -7348,7 +8747,7 @@ def _open_publication_window(
     )
 
 
-def _close_matching_window(database: Any, event: dict[str, object]) -> None:
+def _close_matching_window(database: Any, event: dict[str, object]) -> str | None:
     pre_event = database.execute(
         """SELECT event_id, payload_json FROM managed_native_events
         WHERE host = ? AND suite_id = ? AND session_id = ? AND generation_id = ?
@@ -7364,7 +8763,19 @@ def _close_matching_window(database: Any, event: dict[str, object]) -> None:
         ),
     ).fetchone()
     if pre_event is None:
-        return
+        return None
+    try:
+        pre_payload = json.loads(str(pre_event["payload_json"]))
+    except json.JSONDecodeError:
+        pre_payload = None
+    if isinstance(pre_payload, dict) and pre_payload.get("action") == "discovery":
+        status = _discovery_read_window_status(pre_payload, event, str(event["tool_use_id"]))
+        if status == "closed":
+            return "discovery_verified"
+        if status == "invalid":
+            _mark_discovery_unknown(database, event)
+            return "discovery_unknown"
+        return "discovery_pending"
     windows = database.execute(
         "SELECT * FROM managed_windows WHERE pre_event_id = ? AND status = 'open'",
         (pre_event["event_id"],),
@@ -7385,6 +8796,7 @@ def _close_matching_window(database: Any, event: dict[str, object]) -> None:
             (event["event_id"], records.utc_now(), window["window_id"]),
         )
         reduce_managed_assessment(database, str(window["task_id"]))
+    return None
 
 
 def _close_pending_windows_on_stop(database: Any, event: dict[str, object], event_id: str) -> None:
@@ -7416,6 +8828,138 @@ def _close_pending_windows_on_stop(database: Any, event: dict[str, object], even
                 (window["task_id"],),
             )
         reduce_managed_assessment(database, str(window["task_id"]))
+
+
+def _close_pending_discovery_reads_on_stop(database: Any, event: dict[str, object]) -> None:
+    """Require every routing-read Pre to have one valid Post by native Stop."""
+
+    pre_rows = database.execute(
+        """SELECT event_id, payload_json, tool_use_id FROM managed_native_events
+        WHERE suite_id = ? AND host = ? AND session_id = ? AND generation_id = ?
+          AND request_id = ? AND phase = ?""",
+        (
+            event["suite_id"],
+            event["host"],
+            event["session_id"],
+            event["generation_id"],
+            event["request_id"],
+            PRE_PHASE,
+        ),
+    ).fetchall()
+    for pre_row in pre_rows:
+        try:
+            pre_payload = json.loads(str(pre_row["payload_json"]))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(pre_payload, dict) or pre_payload.get("action") != "discovery":
+            continue
+        post_rows = database.execute(
+            """SELECT event_id FROM managed_native_events
+            WHERE suite_id = ? AND host = ? AND session_id = ? AND generation_id = ?
+              AND request_id = ? AND tool_use_id = ? AND phase = ?""",
+            (
+                event["suite_id"],
+                event["host"],
+                event["session_id"],
+                event["generation_id"],
+                event["request_id"],
+                pre_row["tool_use_id"],
+                POST_PHASE,
+            ),
+        ).fetchall()
+        if len(post_rows) != 1:
+            _mark_discovery_unknown(database, event)
+            continue
+        if (
+            _discovery_read_window_status(pre_payload, event, str(pre_row["tool_use_id"]))
+            != "closed"
+        ):
+            _mark_discovery_unknown(database, event)
+
+
+def _mark_discovery_unknown(database: Any, event: dict[str, object]) -> None:
+    """Preserve the ordinary unknown outcome for an incomplete discovery read."""
+
+    context_key = _context_key(event)
+    context = database.execute(
+        "SELECT task_id FROM managed_contexts WHERE context_key = ?", (context_key,)
+    ).fetchone()
+    database.execute(
+        "UPDATE managed_contexts SET unknown_change = 1 WHERE context_key = ?", (context_key,)
+    )
+    if context is not None and context["task_id"] is not None:
+        reduce_managed_assessment(database, str(context["task_id"]))
+
+
+def _discovery_read_window_status(
+    pre_payload: dict[str, object],
+    event: dict[str, object],
+    tool_use_id: str,
+) -> str:
+    """Reconcile a discovery Post or Stop against its immutable Pre cutoff."""
+
+    try:
+        pre_fields = _frozen_prefix_fields(pre_payload.get("prefix"))
+        cutoff_fields = _frozen_prefix_fields(event.get("prefix"))
+        if pre_fields is None or cutoff_fields is None:
+            return "invalid"
+        pre_hash, pre_length, pre_path_hash, pre_device, pre_inode = pre_fields
+        cutoff_hash, cutoff_length, cutoff_path_hash, cutoff_device, cutoff_inode = cutoff_fields
+        if (
+            cutoff_length < pre_length
+            or cutoff_path_hash != pre_path_hash
+            or cutoff_device != pre_device
+            or cutoff_inode != pre_inode
+        ):
+            return "invalid"
+        transcript_path = Path(str(event["transcript_path"]))
+        resolved = transcript_path.resolve(strict=True)
+        if hashlib.sha256(str(resolved).encode("utf-8")).hexdigest() != pre_path_hash:
+            return "invalid"
+        with resolved.open("rb") as stream:
+            opened = os.fstat(stream.fileno())
+            if opened.st_dev != pre_device or opened.st_ino != pre_inode:
+                return "invalid"
+            cutoff = stream.read(cutoff_length)
+        if not (
+            len(cutoff) == cutoff_length
+            and hashlib.sha256(cutoff).hexdigest() == cutoff_hash
+            and hashlib.sha256(cutoff[:pre_length]).hexdigest() == pre_hash
+        ):
+            return "invalid"
+        if pre_length and cutoff[pre_length - 1 : pre_length] != b"\n":
+            return "invalid"
+        history = [json.loads(line) for line in cutoff[pre_length:].splitlines() if line.strip()]
+        if not all(isinstance(record, dict) for record in history):
+            return "invalid"
+        if any(
+            _contains_unresolved_history_base(
+                record,
+                {
+                    "history_base",
+                    "historyBase",
+                    "forked_from",
+                    "forkedFrom",
+                    "compacted_from",
+                    "compactedFrom",
+                },
+            )
+            for record in history
+        ):
+            return "invalid"
+        reconciliation_event = dict(event)
+        command_digest = pre_payload.get("tool_command_digest")
+        if not isinstance(command_digest, str) or not command_digest:
+            return "invalid"
+        reconciliation_event["tool_command_digest"] = command_digest
+        return _codex_discovery_read_status(
+            history,
+            reconciliation_event,
+            tool_use_id,
+            pre_payload.get("discovery"),
+        )
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError):
+        return "invalid"
 
 
 def _publication_window_status(pre_event: Any, window: Any, event: dict[str, object]) -> str:
@@ -7849,6 +9393,281 @@ def _assert_active_installation(
 
 def _current_root(project_root: Path, suite_id: str) -> Path:
     return install_root(project_root) / suite_id / "current"
+
+
+def _protected_discovery_reader_identity() -> dict[str, object] | None:
+    """Freeze the protected ``/bin/cat`` reader by opened-file identity and bytes."""
+
+    if not hasattr(os, "O_NOFOLLOW"):
+        return None
+    try:
+        descriptor = os.open("/bin/cat", os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != 0
+            or metadata.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or metadata.st_size < 1
+            or metadata.st_size > MAX_DISCOVERY_READER_BYTES
+        ):
+            return None
+        digest = hashlib.sha256()
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 64 * 1024))
+            if not chunk:
+                return None
+            digest.update(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        current = os.stat("/bin/cat")
+    except OSError:
+        return None
+    if current.st_dev != metadata.st_dev or current.st_ino != metadata.st_ino:
+        return None
+    return {
+        "reader_hash": digest.hexdigest(),
+        "reader_size": metadata.st_size,
+        "reader_device": metadata.st_dev,
+        "reader_inode": metadata.st_ino,
+    }
+
+
+def _discovery_read_binding(
+    project_root: Path,
+    suite_id: str,
+    installation: dict[str, Any],
+    command: str,
+) -> dict[str, object] | None:
+    """Bind the one installer-owned Codex routing read before it is allowed.
+
+    Discovery does not establish a managed operation.  It is a narrow
+    prerequisite for a normal installed entry to route to ``managed invoke``.
+    The binding therefore records the immutable entry identity needed to
+    compare the later native ``CommandExecution`` output without treating an
+    arbitrary shell read as business input.
+    """
+
+    reader_identity = _protected_discovery_reader_identity()
+    if reader_identity is None:
+        return None
+
+    try:
+        argv = shlex.split(command, posix=True)
+    except ValueError:
+        return None
+    if len(argv) != 2 or argv[0] != "/bin/cat" or command != shlex.join(argv):
+        return None
+
+    entries = installation.get("managed_entries")
+    registrations = installation.get("registrations")
+    codex_entries = entries.get("codex") if isinstance(entries, dict) else None
+    codex_registrations = registrations.get("codex") if isinstance(registrations, dict) else None
+    if not isinstance(codex_entries, dict) or not isinstance(codex_registrations, list):
+        return None
+
+    root = install_root(project_root) / suite_id
+    for skill, expected_hash in codex_entries.items():
+        if not isinstance(skill, str) or not isinstance(expected_hash, str):
+            continue
+        if skill not in codex_registrations:
+            continue
+        entry = root / "entries" / "codex" / skill / "SKILL.md"
+        registration = project_root / ".agents" / "skills" / skill
+        expected_link = os.path.relpath(entry.parent, start=registration.parent)
+        expected_command = shlex.join(("/bin/cat", str(registration / "SKILL.md")))
+        if command != expected_command:
+            continue
+        try:
+            if (
+                not registration.is_symlink()
+                or os.readlink(registration) != expected_link
+                or registration.resolve(strict=True) != entry.parent.resolve(strict=True)
+                or entry.is_symlink()
+            ):
+                continue
+            entry_stat = entry.stat()
+            if not stat.S_ISREG(entry_stat.st_mode):
+                continue
+            entry_bytes = entry.read_bytes()
+        except OSError:
+            continue
+        if hashlib.sha256(entry_bytes).hexdigest() != expected_hash:
+            continue
+        return {
+            "suite_id": suite_id,
+            "skill": skill,
+            "entry_hash": expected_hash,
+            "entry_size": len(entry_bytes),
+            "entry_device": entry_stat.st_dev,
+            "entry_inode": entry_stat.st_ino,
+            "entry_bytes": entry_bytes,
+            **reader_identity,
+        }
+    return None
+
+
+def _stored_discovery_binding(binding: dict[str, object]) -> dict[str, object]:
+    """Keep routing identity, never installer entry content, in the raw event."""
+
+    return {
+        key: binding[key]
+        for key in (
+            "suite_id",
+            "skill",
+            "entry_hash",
+            "entry_size",
+            "entry_device",
+            "entry_inode",
+            "reader_hash",
+            "reader_size",
+            "reader_device",
+            "reader_inode",
+        )
+    }
+
+
+def _frozen_discovery_entry_bytes(event: dict[str, object], binding: object) -> bytes | None:
+    """Re-read a routing entry only when its pre-read installer identity survives."""
+
+    if not isinstance(binding, dict):
+        return None
+    suite_id = binding.get("suite_id")
+    skill = binding.get("skill")
+    entry_hash = binding.get("entry_hash")
+    entry_size = binding.get("entry_size")
+    entry_device = binding.get("entry_device")
+    entry_inode = binding.get("entry_inode")
+    reader_hash = binding.get("reader_hash")
+    reader_size = binding.get("reader_size")
+    reader_device = binding.get("reader_device")
+    reader_inode = binding.get("reader_inode")
+    cwd = event.get("cwd")
+    if (
+        not isinstance(suite_id, str)
+        or not isinstance(skill, str)
+        or not _is_sha256_digest(entry_hash)
+        or type(entry_size) is not int
+        or type(entry_device) is not int
+        or type(entry_inode) is not int
+        or not _is_sha256_digest(reader_hash)
+        or type(reader_size) is not int
+        or type(reader_device) is not int
+        or type(reader_inode) is not int
+        or not isinstance(cwd, str)
+    ):
+        return None
+    project_root = Path(cwd)
+    try:
+        installation = current_installation(project_root, suite_id)
+        command = shlex.join(
+            ("/bin/cat", str(project_root / ".agents" / "skills" / skill / "SKILL.md"))
+        )
+        current_binding = _discovery_read_binding(
+            project_root,
+            suite_id,
+            installation,
+            command,
+        )
+    except (OSError, SelcError):
+        return None
+    if current_binding is None:
+        return None
+    frozen_identity = {
+        key: binding.get(key)
+        for key in (
+            "suite_id",
+            "skill",
+            "entry_hash",
+            "entry_size",
+            "entry_device",
+            "entry_inode",
+            "reader_hash",
+            "reader_size",
+            "reader_device",
+            "reader_inode",
+        )
+    }
+    current_identity = _stored_discovery_binding(current_binding)
+    if frozen_identity != current_identity:
+        return None
+    entry_bytes = current_binding.get("entry_bytes")
+    return entry_bytes if isinstance(entry_bytes, bytes) else None
+
+
+def _codex_discovery_read_status(
+    history: list[object],
+    event: dict[str, object],
+    tool_use_id: str,
+    binding: object,
+) -> str:
+    """Return the closed-world state of one installer routing read.
+
+    A Post hook can arrive before Codex appends the native completion.  That
+    is ``pending`` until Stop supplies the final frozen cutoff.  Any duplicate,
+    wrong scope, output change, or entry replacement is invalid.
+    """
+
+    expected_bytes = _frozen_discovery_entry_bytes(event, binding)
+    expected_session = event.get("session_id")
+    expected_turn = event.get("generation_id")
+    expected_cwd = event.get("cwd")
+    expected_command_digest = event.get("tool_command_digest")
+    if (
+        expected_bytes is None
+        or not isinstance(expected_session, str)
+        or not isinstance(expected_turn, str)
+        or not isinstance(expected_cwd, str)
+        or not _is_sha256_digest(expected_command_digest)
+    ):
+        return "invalid"
+
+    matches = 0
+    for record in history:
+        if not isinstance(record, dict) or record.get("type") != "event_msg":
+            continue
+        payload = record.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "item_completed":
+            continue
+        item = payload.get("item")
+        if not isinstance(item, dict) or item.get("type") != "CommandExecution":
+            continue
+        if item.get("id") != tool_use_id:
+            continue
+        command = item.get("command")
+        output = item.get("aggregated_output")
+        valid = (
+            payload.get("thread_id") == expected_session
+            and payload.get("turn_id") == expected_turn
+            and _codex_command_execution_cwd_is_current(item.get("cwd"), expected_cwd)
+            and item.get("status") == "completed"
+            and type(item.get("exit_code")) is int
+            and item.get("exit_code") == 0
+            and isinstance(command, list)
+            and len(command) == 3
+            and command[0] == "/bin/zsh"
+            and command[1] == "-lc"
+            and isinstance(command[2], str)
+            and hashlib.sha256(command[2].encode("utf-8")).hexdigest() == expected_command_digest
+            and isinstance(output, str)
+        )
+        if not valid:
+            return "invalid"
+        try:
+            output_bytes = output.encode("utf-8")
+        except UnicodeEncodeError:
+            return "invalid"
+        if output_bytes != expected_bytes:
+            return "invalid"
+        matches += 1
+    if matches == 1:
+        return "closed"
+    return "pending" if matches == 0 else "invalid"
 
 
 def _write_fsynced(path: Path, contents: bytes) -> None:

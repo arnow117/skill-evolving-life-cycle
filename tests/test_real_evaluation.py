@@ -29,20 +29,28 @@ from selc.creator import prepare_creator_request, verify_creator_result
 from selc.errors import SelcError
 from selc.evaluation import (
     CODEX_ALPHA11_VERSION,
+    CODEX_FIXED_PREPARATION_INSTRUCTIONS,
     _action_request_from_prompt,
+    _attempt_id,
     _codex_cli_launch_trust_failure,
     _codex_cli_prompt,
     _codex_hook_trust_changed,
     _codex_installed_hook_definitions,
     _fixed_codex_cli_command,
+    _fixed_codex_cli_profile,
     _fixed_codex_environment,
     _match_codex_native_policy,
     _native_publication_result_failure,
+    _native_session_facts,
     _native_window_failure,
+    _normalise_codex_policy_template,
     _prepare_codex_hook_trust_binding,
+    _prepare_policy_binding,
     _project_trust_cli_configuration,
     _qualification_support,
     _read_attempt_native_context,
+    _reconstruct_attempt,
+    _workbuddy_session_diagnostics,
     bind_real_evaluation_candidate,
     build_codex_policy_template,
     collect_evaluation_attempt,
@@ -318,7 +326,7 @@ class RealEvaluationContractsTests(unittest.TestCase):
 
         template = build_codex_policy_template("0.163.0-alpha.11", python_root)
 
-        self.assertEqual(template["schema_version"], 1)
+        self.assertEqual(template["schema_version"], 2)
         self.assertEqual(template["host"], "codex")
         self.assertEqual(template["host_version"], "0.163.0-alpha.11")
         self.assertEqual(
@@ -329,11 +337,242 @@ class RealEvaluationContractsTests(unittest.TestCase):
             },
         )
         self.assertTrue(template["cli"]["ignore_user_config"])
+        self.assertEqual(
+            template["cli"]["settings"]["developer_instructions"],
+            CODEX_FIXED_PREPARATION_INSTRUCTIONS,
+        )
+        self.assertEqual(
+            template["preparation_guidance"]["summary"],
+            "fixed-routing-read-and-native-managed-action-v1",
+        )
         self.assertEqual(template["policy"]["approval_policy"], "never")
         self.assertEqual(
             template["hook_trust"]["mode"],
             "normal-project-and-hook-state-inheritance-v2",
         )
+
+    def test_schema1_codex_policy_template_preserves_the_frozen_profile_and_argv(self) -> None:
+        """Schema 1 normalizes and renders without schema 2 guidance."""
+
+        _account_home, _attempt_path, state, matrix = self._prepared_hook_trust_attempt()
+        legacy_python = self.root / "legacy-python"
+        legacy_python.mkdir()
+        legacy = build_codex_policy_template("0.163.0-alpha.11", legacy_python)
+        legacy["schema_version"] = 1
+        legacy.pop("preparation_guidance")
+        legacy["cli"] = _fixed_codex_cli_profile(1)
+        matrix["tools_policy_template"] = legacy
+        matrix["tools_policy_template_hash"] = hashlib.sha256(
+            json.dumps(legacy, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        state["policy_binding"] = _prepare_policy_binding(
+            matrix,
+            Path(str(state["project_root"])),
+        )
+
+        self.assertEqual(
+            _normalise_codex_policy_template(legacy, "0.163.0-alpha.11"),
+            legacy,
+        )
+        command = _fixed_codex_cli_command(Path(sys.executable).resolve(), matrix, state)
+        project_root = str(Path(str(state["project_root"])).resolve())
+        python_root = str(legacy_python.resolve())
+        expected_permissions = (
+            'permissions.selc-evaluation.filesystem={":minimal"="read",'
+            f'{json.dumps(python_root)}="read",'
+            f'{json.dumps(project_root)}="write"}}'
+        )
+        self.assertEqual(
+            command,
+            [
+                str(Path(sys.executable).resolve()),
+                "-a",
+                "never",
+                "exec",
+                "--ignore-user-config",
+                "--skip-git-repo-check",
+                "--strict-config",
+                "--json",
+                "--color",
+                "never",
+                "-m",
+                str(matrix["model"]),
+                "-c",
+                'model_provider="openai"',
+                "-c",
+                'web_search="disabled"',
+                "--enable",
+                "hooks",
+                *[
+                    option
+                    for feature in (
+                        "apps",
+                        "plugins",
+                        "remote_plugin",
+                        "skill_search",
+                        "multi_agent",
+                        "computer_use",
+                        "browser_use",
+                        "image_generation",
+                    )
+                    for option in ("--disable", feature)
+                ],
+                "-C",
+                project_root,
+                "-c",
+                'default_permissions="selc-evaluation"',
+                "-c",
+                expected_permissions,
+                "-c",
+                "permissions.selc-evaluation.network.enabled=false",
+                "-c",
+                "project_doc_max_bytes=0",
+                "-c",
+                "project_root_markers=[]",
+                "-",
+            ],
+        )
+        self.assertNotIn("developer_instructions", " ".join(command))
+
+    def test_schema2_native_preparation_fragment_requires_exact_initial_literal(self) -> None:
+        """A schema 2 fragment is one indexed developer item before the request."""
+
+        project_root = self.root / "native-guidance-project"
+        project_root.mkdir()
+        raw_path = self.root / ".codex" / "sessions" / "2026" / "native-guidance.jsonl"
+        prompt = '@text-report {"input":"items.json"}'
+        guidance_python = self.root / "guidance-python"
+        guidance_python.mkdir()
+        template = build_codex_policy_template("0.163.0-alpha.11", guidance_python)
+        base_records = [
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": "native-guidance",
+                    "session_id": "native-guidance",
+                    "cwd": str(project_root),
+                    "cli_version": "0.163.0-alpha.11",
+                    "source": "exec",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "content": [
+                        {"type": "input_text", "text": "known host instructions"},
+                        {"type": "input_text", "text": CODEX_FIXED_PREPARATION_INSTRUCTIONS},
+                    ],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "native-guidance-turn",
+                        "content_item_kinds": [
+                            "host_skills.instructions",
+                            "generic.developer_instructions",
+                        ],
+                    },
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "native-guidance-turn",
+                        "content_item_kinds": ["user.text"],
+                    },
+                },
+            },
+            {
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": "native-guidance-turn",
+                    "root_turn_id": "native-guidance-turn",
+                    "cwd": str(project_root),
+                    "model": "synthetic-model",
+                    "permission_profile": {},
+                    "sandbox_policy": {},
+                    "approval_policy": "never",
+                    "file_system_sandbox_policy": {},
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "custom_tool_call",
+                    "name": "exec",
+                    "call_id": "native-guidance-call",
+                    "id": "native-guidance-item",
+                    "status": "completed",
+                    "input": {},
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "native-guidance-turn",
+                    },
+                },
+            },
+        ]
+
+        def parse(
+            records: list[dict[str, object]],
+            policy_template: dict[str, object] = template,
+        ) -> object:
+            raw = b"".join(
+                (json.dumps(record, separators=(",", ":")) + "\n").encode("utf-8")
+                for record in records
+            )
+            return _native_session_facts(raw, prompt, raw_path, project_root, policy_template)
+
+        parsed = parse(base_records)
+        self.assertIsNotNone(parsed)
+        assert parsed is not None
+        self.assertEqual(parsed[-1], template["preparation_guidance"])
+
+        legacy_template = json.loads(json.dumps(template))
+        legacy_template["schema_version"] = 1
+        legacy_template.pop("preparation_guidance")
+        legacy_template["cli"] = _fixed_codex_cli_profile(1)
+        legacy_records = json.loads(json.dumps(base_records))
+        legacy_records[1]["payload"].pop("content")
+        legacy_records[1]["payload"]["internal_chat_message_metadata_passthrough"][
+            "content_item_kinds"
+        ] = ["host_skills.instructions"]
+        self.assertIsNotNone(parse(legacy_records, legacy_template))
+        self.assertIsNone(parse(base_records, legacy_template))
+
+        duplicate = [*base_records]
+        duplicate.insert(2, json.loads(json.dumps(base_records[1])))
+        self.assertIsNone(parse(duplicate))
+
+        wrong_turn = json.loads(json.dumps(base_records))
+        wrong_turn[1]["payload"]["internal_chat_message_metadata_passthrough"]["turn_id"] = (
+            "another-turn"
+        )
+        self.assertIsNone(parse(wrong_turn))
+
+        late = [base_records[0], *base_records[2:], base_records[1]]
+        self.assertIsNone(parse(late))
+
+        unknown_kind = json.loads(json.dumps(base_records))
+        unknown_kind[1]["payload"]["content"].append({"type": "input_text", "text": "unsupported"})
+        unknown_kind[1]["payload"]["internal_chat_message_metadata_passthrough"][
+            "content_item_kinds"
+        ].append("unknown.developer.instructions")
+        self.assertIsNone(parse(unknown_kind))
+
+        wrong_vector = json.loads(json.dumps(base_records))
+        wrong_vector[1]["payload"]["content"].pop()
+        self.assertIsNone(parse(wrong_vector))
+
+    def test_generated_maintenance_describes_schema2_and_workbuddy_diagnostics(self) -> None:
+        suite = self.root / "maintenance-source"
+        create_suite("maintenance-source", "1.0.0", suite, ["text-report"])
+
+        maintenance = (suite / "MAINTENANCE.md").read_text(encoding="utf-8")
+        self.assertIn("Schema-2 Codex templates bind one fixed non-business", maintenance)
+        self.assertIn("WorkBuddy has a bounded native-session diagnostic", maintenance)
+        self.assertIn("its qualification remains unverified", maintenance)
 
     def test_codex_template_without_normal_hook_trust_remains_unverified(self) -> None:
         python_root = self.root / "legacy-template-python"
@@ -396,7 +635,16 @@ class RealEvaluationContractsTests(unittest.TestCase):
         )
         parsed_configuration = tomllib.loads(trust_configuration)
         parsed_project_configuration = tomllib.loads(project_configuration)
-        self.assertEqual(command.count("-c"), 9)
+        developer_instructions = next(
+            command[index + 1]
+            for index, argument in enumerate(command)
+            if argument == "-c" and command[index + 1].startswith("developer_instructions=")
+        )
+        self.assertEqual(command.count("-c"), 10)
+        self.assertEqual(
+            developer_instructions,
+            f"developer_instructions={json.dumps(CODEX_FIXED_PREPARATION_INSTRUCTIONS)}",
+        )
         self.assertEqual(
             parsed_configuration["hooks"]["state"],
             {
@@ -1233,6 +1481,471 @@ class RealEvaluationContractsTests(unittest.TestCase):
             input_path.read_bytes(),
         )
 
+    def _workbuddy_diagnostic_attempt(
+        self,
+    ) -> tuple[dict[str, object], list[dict[str, object]], Path]:
+        """Build the observed 5.9.2 JSONL shape without treating it as host acceptance."""
+
+        suite = self.root / "workbuddy-diagnostic-source"
+        create_suite("workbuddy-diagnostic-source", "1.0.0", suite, ["text-report"])
+        input_path = self.root / "workbuddy-diagnostic-input.json"
+        input_path.write_text('{"items": []}', encoding="utf-8")
+        specification = self._real_plan_specification(input_path)
+        value = json.loads(specification.read_text(encoding="utf-8"))
+        value["matrix"][0].update(
+            {
+                "adapter": "workbuddy-desktop",
+                "host": "workbuddy",
+                "host_version": "5.9.2",
+                "surface": "desktop",
+                "model": "workbuddy-model",
+            }
+        )
+        specification.write_text(json.dumps(value), encoding="utf-8")
+        prepared = prepare_real_evaluation_plan(
+            suite,
+            specification,
+            self.root / "workbuddy-diagnostic-plan",
+        )
+        candidate = Path(
+            prepare_candidate(suite, self.root / "workbuddy-diagnostic-candidate")["candidate"]
+        )
+        binding_path = self.root / "workbuddy-diagnostic-binding.json"
+        bind_real_evaluation_candidate(Path(prepared["plan"]), candidate, binding_path)
+        attempt_path = self.root / "workbuddy-diagnostic-plan" / "attempts" / "first"
+        state = prepare_evaluation_attempt(
+            Path(prepared["plan"]),
+            binding_path,
+            "synthetic-case",
+            "synthetic-matrix",
+            1,
+            attempt_path,
+        )
+        project_root = Path(str(state["project_root"])).resolve()
+        session_id = "workbuddy-diagnostic-session"
+        request_id = "workbuddy-diagnostic-request"
+        request = json.loads(Path(str(state["request_path"])).read_text(encoding="utf-8"))[
+            "request"
+        ]
+        self.assertIsInstance(request, str)
+        raw_prompt = str(request)
+        native_user_text = (
+            '<system-reminder data-role="user-context">\n'
+            "fixture context\n"
+            "</system-reminder>\n"
+            '<system-reminder data-role="additional-data">\n'
+            "fixture additional data\n"
+            f"</system-reminder>\n<user_query>{raw_prompt}</user_query>"
+        )
+        records: list[dict[str, object]] = [
+            {
+                "type": "session-meta",
+                "sessionId": session_id,
+                "meta": {"codebuddy.ai/hostKind": "unopted"},
+                "hostKind": "untrusted-top-level-host-kind",
+                "appVersion": "untrusted-top-level-version",
+            },
+            {
+                "id": "workbuddy-diagnostic-user",
+                "type": "message",
+                "role": "user",
+                "sessionId": session_id,
+                "cwd": str(project_root),
+                "providerData": {
+                    "startsNewUserRequest": True,
+                    "conversationRequestId": request_id,
+                },
+                "content": [{"type": "input_text", "text": native_user_text}],
+            },
+            {
+                "id": "workbuddy-diagnostic-reasoning",
+                "type": "reasoning",
+                "parentId": "workbuddy-diagnostic-user",
+                "sessionId": session_id,
+                "cwd": str(project_root),
+                "providerData": {
+                    "conversationRequestId": request_id,
+                    "messageId": "workbuddy-diagnostic-model-message-one",
+                    "model": "workbuddy-model",
+                    "stepSeq": 1,
+                },
+            },
+            {
+                "id": "workbuddy-diagnostic-first-call",
+                "type": "function_call",
+                "name": "Read",
+                "callId": "workbuddy-diagnostic-first-call-id",
+                "parentId": "workbuddy-diagnostic-reasoning",
+                "sessionId": session_id,
+                "cwd": str(project_root),
+                "providerData": {
+                    "conversationRequestId": request_id,
+                    "messageId": "workbuddy-diagnostic-model-message-one",
+                    "model": "workbuddy-model",
+                    "stepSeq": 1,
+                },
+                "arguments": '{"path":"resources/items.json"}',
+            },
+            {
+                "id": "workbuddy-diagnostic-first-result",
+                "type": "function_call_result",
+                "callId": "workbuddy-diagnostic-first-call-id",
+                "parentId": "workbuddy-diagnostic-first-call",
+                "status": "completed",
+                "sessionId": session_id,
+                "cwd": str(project_root),
+                "providerData": {"conversationRequestId": request_id},
+                "output": [],
+            },
+            {
+                "id": "workbuddy-diagnostic-second-assistant",
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "parentId": "workbuddy-diagnostic-first-result",
+                "sessionId": session_id,
+                "cwd": str(project_root),
+                "timestamp": 1_769_000_000,
+                "_meta": {
+                    "baggage": "fixture-baggage",
+                    "traceparent": "fixture-traceparent",
+                },
+                "providerData": {
+                    "agent": "fixture-agent",
+                    "conversationRequestId": request_id,
+                    "messageId": "workbuddy-diagnostic-model-message-two",
+                    "model": "workbuddy-model",
+                    "requestModelId": "workbuddy-request-model",
+                    "requestModelName": "WorkBuddy Fixture Model",
+                    "stepSeq": 2,
+                    "traceId": "fixture-trace",
+                },
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": "fixture assistant response",
+                        "providerData": {"annotations": []},
+                    }
+                ],
+            },
+            {
+                "id": "workbuddy-diagnostic-second-call",
+                "type": "function_call",
+                "name": "Skill",
+                "callId": "workbuddy-diagnostic-second-call-id",
+                "parentId": "workbuddy-diagnostic-second-assistant",
+                "sessionId": session_id,
+                "cwd": str(project_root),
+                "providerData": {
+                    "conversationRequestId": request_id,
+                    "messageId": "workbuddy-diagnostic-model-message-two",
+                    "model": "workbuddy-model",
+                    "stepSeq": 2,
+                },
+                "arguments": '{"skill":"text-report","args":"{}"}',
+            },
+            {
+                "id": "workbuddy-diagnostic-second-result",
+                "type": "function_call_result",
+                "callId": "workbuddy-diagnostic-second-call-id",
+                "parentId": "workbuddy-diagnostic-second-call",
+                "status": "completed",
+                "sessionId": session_id,
+                "cwd": str(project_root),
+                "providerData": {"conversationRequestId": request_id},
+                "output": {"status": "ok"},
+            },
+            {
+                "id": "workbuddy-diagnostic-third-call",
+                "type": "function_call",
+                "name": "Write",
+                "callId": "workbuddy-diagnostic-third-call-id",
+                "parentId": "workbuddy-diagnostic-second-result",
+                "sessionId": session_id,
+                "cwd": str(project_root),
+                "providerData": {
+                    "conversationRequestId": request_id,
+                    "messageId": "workbuddy-diagnostic-model-message-three",
+                    "model": "workbuddy-model",
+                    "stepSeq": 3,
+                },
+                "arguments": '{"path":"reports/output.json"}',
+            },
+            {
+                "id": "workbuddy-diagnostic-third-result",
+                "type": "function_call_result",
+                "callId": "workbuddy-diagnostic-third-call-id",
+                "parentId": "workbuddy-diagnostic-third-call",
+                "status": "completed",
+                "sessionId": session_id,
+                "cwd": str(project_root),
+                "providerData": {"conversationRequestId": request_id},
+                "output": {"status": "ok"},
+            },
+            {
+                "id": "workbuddy-diagnostic-other-request-call",
+                "type": "function_call",
+                "name": "OtherTool",
+                "callId": "workbuddy-diagnostic-other-request-call-id",
+                "parentId": "workbuddy-diagnostic-other-request-parent",
+                "sessionId": session_id,
+                "cwd": str(project_root),
+                "providerData": {
+                    "conversationRequestId": "other-workbuddy-request",
+                    "messageId": "other-workbuddy-model-message",
+                    "model": "other-workbuddy-model",
+                    "stepSeq": 1,
+                },
+                "arguments": "{}",
+            },
+            {
+                "id": "workbuddy-diagnostic-other-request-result",
+                "type": "function_call_result",
+                "callId": "workbuddy-diagnostic-other-request-call-id",
+                "parentId": "workbuddy-diagnostic-other-request-call",
+                "status": "completed",
+                "sessionId": session_id,
+                "cwd": str(project_root),
+                "providerData": {"conversationRequestId": "other-workbuddy-request"},
+                "output": {"status": "ok"},
+            },
+        ]
+        compressed_cwd = str(project_root).lstrip("/").replace("/", "-")
+        raw_path = (
+            self.root.resolve() / ".codebuddy" / "projects" / compressed_cwd / f"{session_id}.jsonl"
+        )
+        raw_path.parent.mkdir(parents=True)
+        return state, records, raw_path
+
+    def _write_workbuddy_diagnostic_evidence(
+        self,
+        state: dict[str, object],
+        records: list[dict[str, object]],
+        raw_path: Path,
+        *,
+        evidence_overrides: dict[str, object] | None = None,
+    ) -> None:
+        raw = b"".join(
+            (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+            for record in records
+        )
+        raw_path.write_bytes(raw)
+        raw_stat = raw_path.stat()
+        evidence = {
+            "attempt_id": _attempt_id(state),
+            "raw_session_path": str(raw_path),
+            "raw_session_sha256": hashlib.sha256(raw).hexdigest(),
+            "raw_session_cutoff_bytes": len(raw),
+            "raw_session_path_hash": hashlib.sha256(
+                str(raw_path.resolve()).encode("utf-8")
+            ).hexdigest(),
+            "raw_session_device": raw_stat.st_dev,
+            "raw_session_inode": raw_stat.st_ino,
+        }
+        if evidence_overrides:
+            evidence.update(evidence_overrides)
+        evidence_path = Path(str(state["session_root"])) / "native-evidence.json"
+        evidence_path.write_text(json.dumps(evidence), encoding="utf-8")
+
+    def test_workbuddy_session_diagnostics_reads_the_observed_serializer_as_unverified(
+        self,
+    ) -> None:
+        state, records, raw_path = self._workbuddy_diagnostic_attempt()
+        self._write_workbuddy_diagnostic_evidence(state, records, raw_path)
+
+        with (
+            patch("selc.evaluation.Path.home", return_value=self.root),
+            patch("selc.managed_runtime.Path.home", return_value=self.root),
+        ):
+            diagnostics = _workbuddy_session_diagnostics(state, state["matrix"])
+            reconstructed = _reconstruct_attempt(state)
+
+        self.assertEqual(diagnostics["schema_version"], 1)
+        self.assertEqual(diagnostics["parser"], "workbuddy-session-diagnostics-v1")
+        self.assertEqual(diagnostics["model"], "workbuddy-model")
+        self.assertEqual(diagnostics["request_model_id"], "workbuddy-request-model")
+        self.assertEqual(diagnostics["request_model_name"], "WorkBuddy Fixture Model")
+        self.assertEqual(diagnostics["session_id"], "workbuddy-diagnostic-session")
+        self.assertEqual(diagnostics["request_id"], "workbuddy-diagnostic-request")
+        self.assertEqual(diagnostics["host_kind"], "unopted")
+        self.assertEqual(diagnostics["host_kind_source"], "session-meta.meta.codebuddy.ai/hostKind")
+        self.assertEqual(diagnostics["app_version"], "5.9.2")
+        self.assertEqual(diagnostics["app_version_source"], "matrix.host_version")
+        self.assertIsNone(diagnostics["surface"])
+        self.assertEqual(diagnostics["surface_source"], "unavailable")
+        self.assertTrue(diagnostics["model_attribution_verified"])
+        self.assertTrue(diagnostics["parent_chain_verified"])
+        self.assertEqual(diagnostics["observed_tool_names"], ["Read", "Skill", "Write"])
+        self.assertEqual(
+            diagnostics["observed_tools"],
+            [
+                {"name": "Read", "scope": "current-request", "source": "function_call"},
+                {"name": "Skill", "scope": "current-request", "source": "function_call"},
+                {"name": "Write", "scope": "current-request", "source": "function_call"},
+            ],
+        )
+        self.assertIsNone(diagnostics["permission_mode"])
+        self.assertIsNone(diagnostics["initial_tool_names"])
+        self.assertEqual(diagnostics["qualification_support"], "unverified")
+        self.assertEqual(diagnostics["reason"], "workbuddy-effective-policy-unavailable")
+        self.assertEqual(
+            diagnostics["unavailable_reasons"], ["workbuddy-effective-policy-unavailable"]
+        )
+        self.assertNotIn("raw_tools_policy_hash", diagnostics)
+        self.assertEqual(reconstructed["status"], "unknown")
+        self.assertEqual(
+            reconstructed["reason"], "qualification-native-attribution-unverified-workbuddy"
+        )
+        self.assertEqual(reconstructed["diagnostics"], diagnostics)
+        self.assertIsNone(_read_attempt_native_context(state, state["matrix"]))
+
+    def test_workbuddy_session_diagnostics_rejects_locator_and_unknown_serializer(self) -> None:
+        state, records, raw_path = self._workbuddy_diagnostic_attempt()
+        cases = {
+            "wrong-locator-hash": {"raw_session_path_hash": "0" * 64},
+            "wrong-device": {"raw_session_device": -1},
+        }
+
+        with (
+            patch("selc.evaluation.Path.home", return_value=self.root),
+            patch("selc.managed_runtime.Path.home", return_value=self.root),
+        ):
+            for name, evidence_overrides in cases.items():
+                with self.subTest(name=name):
+                    self._write_workbuddy_diagnostic_evidence(
+                        state,
+                        records,
+                        raw_path,
+                        evidence_overrides=evidence_overrides,
+                    )
+                    diagnostics = _workbuddy_session_diagnostics(state, state["matrix"])
+                    self.assertFalse(diagnostics["model_attribution_verified"])
+                    self.assertIn("native-evidence-invalid", diagnostics["unavailable_reasons"])
+
+            self._write_workbuddy_diagnostic_evidence(state, records, raw_path)
+            unknown_matrix = {**state["matrix"], "host_version": "5.9.3"}
+            diagnostics = _workbuddy_session_diagnostics(state, unknown_matrix)
+            self.assertFalse(diagnostics["model_attribution_verified"])
+            self.assertIn("workbuddy-serializer-unavailable", diagnostics["unavailable_reasons"])
+
+    def test_workbuddy_session_diagnostics_rejects_request_model_parent_and_duplicates(
+        self,
+    ) -> None:
+        state, records, raw_path = self._workbuddy_diagnostic_attempt()
+        mutations: dict[str, list[dict[str, object]]] = {}
+
+        def record_by_id(
+            candidate_records: list[dict[str, object]], record_id: str
+        ) -> dict[str, object]:
+            return next(record for record in candidate_records if record.get("id") == record_id)
+
+        wrong_request = json.loads(json.dumps(records))
+        wrong_request[1]["content"][0]["text"] = (
+            '<system-reminder data-role="user-context">\nfixture\n</system-reminder>\n'
+            '<system-reminder data-role="additional-data">\nfixture\n</system-reminder>\n'
+            "<user_query>wrong request</user_query>"
+        )
+        mutations["wrong-request"] = wrong_request
+
+        wrong_model = json.loads(json.dumps(records))
+        record_by_id(wrong_model, "workbuddy-diagnostic-reasoning")["providerData"]["model"] = (
+            "other-model"
+        )
+        mutations["wrong-model"] = wrong_model
+
+        broken_parent = json.loads(json.dumps(records))
+        record_by_id(broken_parent, "workbuddy-diagnostic-first-call")["parentId"] = (
+            "missing-parent"
+        )
+        mutations["broken-parent"] = broken_parent
+
+        result_transition_broken_parent = json.loads(json.dumps(records))
+        record_by_id(
+            result_transition_broken_parent,
+            "workbuddy-diagnostic-second-assistant",
+        )["parentId"] = "missing-result-parent"
+        mutations["result-transition-broken-parent"] = result_transition_broken_parent
+
+        result_transition_step_reversal = json.loads(json.dumps(records))
+        record_by_id(
+            result_transition_step_reversal,
+            "workbuddy-diagnostic-third-call",
+        )["providerData"]["stepSeq"] = 2
+        mutations["result-transition-step-reversal"] = result_transition_step_reversal
+
+        result_transition_wrong_request = json.loads(json.dumps(records))
+        record_by_id(
+            result_transition_wrong_request,
+            "workbuddy-diagnostic-second-assistant",
+        )["providerData"]["conversationRequestId"] = "other-workbuddy-request"
+        mutations["result-transition-wrong-request"] = result_transition_wrong_request
+
+        duplicate_record_id = json.loads(json.dumps(records))
+        record_by_id(duplicate_record_id, "workbuddy-diagnostic-second-result")["id"] = (
+            "workbuddy-diagnostic-second-call"
+        )
+        mutations["duplicate-record-id"] = duplicate_record_id
+
+        duplicate_call_id = json.loads(json.dumps(records))
+        duplicate_call = json.loads(
+            json.dumps(record_by_id(duplicate_call_id, "workbuddy-diagnostic-first-call"))
+        )
+        duplicate_call["id"] = "workbuddy-diagnostic-duplicate-call"
+        duplicate_call_id.append(duplicate_call)
+        mutations["duplicate-call-id"] = duplicate_call_id
+
+        duplicate_result_id = json.loads(json.dumps(records))
+        duplicate_result = json.loads(
+            json.dumps(record_by_id(duplicate_result_id, "workbuddy-diagnostic-first-result"))
+        )
+        duplicate_result["id"] = "workbuddy-diagnostic-duplicate-result"
+        duplicate_result_id.append(duplicate_result)
+        mutations["duplicate-result-call-id"] = duplicate_result_id
+
+        missing_call_id = json.loads(json.dumps(records))
+        record_by_id(missing_call_id, "workbuddy-diagnostic-first-call").pop("id")
+        mutations["missing-call-id"] = missing_call_id
+
+        missing_result_id = json.loads(json.dumps(records))
+        record_by_id(missing_result_id, "workbuddy-diagnostic-first-result").pop("id")
+        mutations["missing-result-id"] = missing_result_id
+
+        pending_result = json.loads(json.dumps(records))
+        record_by_id(pending_result, "workbuddy-diagnostic-first-result")["status"] = "pending"
+        mutations["pending-result"] = pending_result
+
+        unsupported_result = json.loads(json.dumps(records))
+        record_by_id(unsupported_result, "workbuddy-diagnostic-first-result")["output"] = "text"
+        mutations["unsupported-result-shape"] = unsupported_result
+
+        invalid_metadata = json.loads(json.dumps(records))
+        invalid_metadata[0]["meta"]["codebuddy.ai/hostKind"] = []
+        mutations["invalid-metadata-type"] = invalid_metadata
+
+        conflicting_metadata = json.loads(json.dumps(records))
+        conflicting_metadata.insert(
+            1,
+            {
+                "type": "session-meta",
+                "sessionId": "workbuddy-diagnostic-session",
+                "meta": {"codebuddy.ai/hostKind": "other"},
+            },
+        )
+        mutations["conflicting-metadata"] = conflicting_metadata
+
+        with (
+            patch("selc.evaluation.Path.home", return_value=self.root),
+            patch("selc.managed_runtime.Path.home", return_value=self.root),
+        ):
+            for name, candidate_records in mutations.items():
+                with self.subTest(name=name):
+                    self._write_workbuddy_diagnostic_evidence(state, candidate_records, raw_path)
+                    diagnostics = _workbuddy_session_diagnostics(state, state["matrix"])
+                    self.assertFalse(diagnostics["model_attribution_verified"])
+                    self.assertIn(
+                        "native-session-records-unverified", diagnostics["unavailable_reasons"]
+                    )
+
     def test_workbuddy_attempt_installs_the_workbuddy_collector(self) -> None:
         suite = self.root / "workbuddy-source"
         create_suite("workbuddy-source", "1.0.0", suite, ["text-report"])
@@ -1465,9 +2178,19 @@ class RealEvaluationContractsTests(unittest.TestCase):
                 "payload": {
                     "type": "message",
                     "role": "developer",
+                    "content": [
+                        {"type": "input_text", "text": "synthetic host instructions"},
+                        {
+                            "type": "input_text",
+                            "text": CODEX_FIXED_PREPARATION_INSTRUCTIONS,
+                        },
+                    ],
                     "internal_chat_message_metadata_passthrough": {
                         "turn_id": turn_id,
-                        "content_item_kinds": ["host_skills.instructions"],
+                        "content_item_kinds": [
+                            "host_skills.instructions",
+                            "generic.developer_instructions",
+                        ],
                     },
                 },
             },
@@ -1796,6 +2519,11 @@ class RealEvaluationContractsTests(unittest.TestCase):
         with patch("selc.evaluation.Path.home", return_value=self.root):
             collected = collect_evaluation_attempt(attempt_path)
             self.assertEqual(collected["evidence"]["status"], "pass", collected["evidence"])
+            self.assertEqual(
+                collected["evidence"]["preparation_guidance"],
+                policy_template["preparation_guidance"],
+            )
+            self.assertNotIn("preparation_guidance", collected["evidence"]["native_policy"])
             report_path = self.root / "positive-report.json"
             report = finalize_real_evaluation(
                 Path(prepared["plan"]),

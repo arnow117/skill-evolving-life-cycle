@@ -151,7 +151,15 @@ def receive_native_hook(
         payload=collector_payload,
         trusted_producer=True,
     )
-    if managed_command is not None and phase == PRE_PHASE and result.get("status") != "recorded":
+    if (
+        managed_command is not None
+        and phase == PRE_PHASE
+        and result.get("status")
+        not in {
+            "recorded",
+            "replayed",
+        }
+    ):
         raise SelcError(
             "NATIVE_REQUEST_UNAVAILABLE",
             "managed tool callback has no usable native request boundary",

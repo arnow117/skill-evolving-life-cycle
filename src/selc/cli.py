@@ -563,7 +563,9 @@ def _parser() -> argparse.ArgumentParser:
     managed_action.add_argument("--task-id", required=True)
     managed_action.add_argument("--call-id", required=True)
     managed_action.add_argument("--action", required=True)
-    managed_action.add_argument("--request", type=_path, required=True)
+    managed_action_source = managed_action.add_mutually_exclusive_group(required=True)
+    managed_action_source.add_argument("--request", type=_path)
+    managed_action_source.add_argument("--request-source", choices=["native"])
     managed_action.add_argument("--host", choices=["codex", "workbuddy"], required=True)
     managed_action.add_argument("--expected-version", required=True)
     managed_action.add_argument("--expected-composite", required=True)
@@ -771,20 +773,22 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
                 )
             }
         if arguments.managed_command == "action":
-            try:
-                request = json.loads(arguments.request.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                raise SelcError(
-                    "MANAGED_INPUT_INVALID",
-                    "managed action request is not a readable JSON object",
-                    "supply the declared managed input object",
-                ) from error
-            if not isinstance(request, dict):
-                raise SelcError(
-                    "MANAGED_INPUT_INVALID",
-                    "managed action request must be an object",
-                    "supply the declared managed input object",
-                )
+            request: dict[str, object] | None = None
+            if arguments.request is not None:
+                try:
+                    request = json.loads(arguments.request.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as error:
+                    raise SelcError(
+                        "MANAGED_INPUT_INVALID",
+                        "managed action request is not a readable JSON object",
+                        "supply the declared managed input object",
+                    ) from error
+                if not isinstance(request, dict):
+                    raise SelcError(
+                        "MANAGED_INPUT_INVALID",
+                        "managed action request must be an object",
+                        "supply the declared managed input object",
+                    )
             return {
                 "managed": run_managed_action(
                     project_root=arguments.project_root,
@@ -795,6 +799,7 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
                     action_id=arguments.action,
                     receipt=None,
                     request=request,
+                    request_source=arguments.request_source,
                     host=arguments.host,
                     expected_version=arguments.expected_version,
                     expected_composite=arguments.expected_composite,
@@ -806,7 +811,11 @@ def _dispatch(arguments: argparse.Namespace, default_suite_root: Path | None) ->
                         "--task-id": arguments.task_id,
                         "--call-id": arguments.call_id,
                         "--action": arguments.action,
-                        "--request": str(arguments.request),
+                        **(
+                            {"--request": str(arguments.request)}
+                            if arguments.request is not None
+                            else {"--request-source": arguments.request_source}
+                        ),
                         "--host": arguments.host,
                         "--expected-version": arguments.expected_version,
                         "--expected-composite": arguments.expected_composite,
