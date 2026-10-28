@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "suite_id": "simple-item-reports",
+  "version": "1.0.0",
+  "framework_version": "0.3.0",
+  "runtime_protocol": 1,
+  "skills": [
+    {
+      "name": "item-summary",
+      "path": "skills/item-summary",
+      "basic_path": "skills/item-summary-basic",
+      "artifact_check": "item-summary"
+    }
+  ],
+  "source": {
+    "kind": "created",
+    "repo": null,
+    "subdir": ".",
+    "commit": null,
+    "base": null
+  },
+  "managed": {
+    "protocol": 1,
+    "native_hosts": {
+      "codex": [
+        "0.163.0-alpha.11"
+      ],
+      "workbuddy": [
+        "5.9.2"
+      ]
+    },
+    "actions": {
+      "item-summary": {
+        "skill": "item-summary",
+        "kind": "python-script-v1",
+        "script": "resources/item_summary.py",
+        "input": {
+          "fields": {
+            "input": {
+              "type": "path"
+            }
+          },
+          "required": [
+            "input"
+          ]
+        }
+      }
+    }
+  },
+  "artifact_checks": {
+    "item-summary": {
+      "checker": {
+        "name": "json-item-summary",
+        "version": "1"
+      },
+      "rule_version": "summary-v1",
+      "required_rule_ids": [
+        "count",
+        "sum"
+      ],
+      "configuration": {
+        "duplicate_ids_count_once": false
+      }
+    }
+  },
+  "content_hash": "25eb5ae0f89b53b50c17b62125faf5086259923799307c6ea0cc4b8986c9d08e"
+}
