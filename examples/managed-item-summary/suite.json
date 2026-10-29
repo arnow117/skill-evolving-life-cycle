@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "suite_id": "simple-item-reports",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "framework_version": "0.3.0",
   "runtime_protocol": 1,
   "skills": [
@@ -63,5 +63,5 @@
       }
     }
   },
-  "content_hash": "724ad819d786414903f5e2013d726d3f8f96bc7095589f6ed1a733efe897be80"
+  "content_hash": "d3c987a6e8004671352a574f7df629a22d6b6d264b4eca6738f4bc659b299d48"
 }

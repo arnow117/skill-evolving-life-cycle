@@ -1,14 +1,16 @@
 ---
 name: "item-summary"
-description: item-summary ordinary-use entry from the simple-item-reports suite.
+description: Run the simple-item-reports item summary locally from an already supplied request file.
 ---
 
-# item-summary
+# Item summary — BASIC
 
-Use this independent BASIC entry for ordinary local execution. It has no managed hook or receipt prerequisite. With a Python 3.11+ interpreter and an already supplied request file, run the installed Python script's ordinary managed-run interface:
+Use this independent BASIC entry for ordinary local execution, including WorkBuddy when an observed automatic request has no explicit request file. It has no managed hook or receipt prerequisite.
+
+With Python 3.11 or newer and an already supplied request file, use the installed script's ordinary interface:
 
 ```sh
 <python3.11-or-newer> <suite-root>/resources/item_summary.py managed-run --request <request.json> --output <artifact>
 ```
 
-Keep the caller's request JSON unchanged. The declared input supports an `items` array whose `value` fields are integers only; repeated items count separately, and an empty array returns `{"count": 0, "sum": 0}`. Do not broaden this to decimals, floats, missing values, or other numeric forms.
+Keep the request JSON unchanged. The implementation handles an `items` array with finite JSON-numeric `value` fields, counts repeated items separately, preserves exact JSON-decimal arithmetic (including integers and numeric cancellation), and emits `{"count": 0, "sum": 0}` for an empty array. Do not add managed invocation, hooks, receipts, or publication steps to this BASIC path.

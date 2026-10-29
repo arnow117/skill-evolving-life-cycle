@@ -1,11 +1,11 @@
 ---
 name: item-summary
-description: Publish a managed count-and-sum JSON report for an input items array with integer values.
+description: Publish a managed count-and-sum JSON report for an input items array with exact JSON numeric values.
 ---
 
 # Item summary
 
-Use this skill for an input JSON DTO whose declared input has an `items` array of integer `value` fields. Repeated items each count; an empty array produces `{"count": 0, "sum": 0}`. Integers are the complete supported numeric scope: do not accept decimals, floats, missing values, or other numeric forms.
+Use this observed managed entry to publish the report for a request DTO whose declared `input` identifies the source JSON. The installed implementation is authoritative: it counts every item (including repeated identifiers) and sums finite JSON-decimal `value` fields exactly. It preserves integer results, returns `{"count": 0, "sum": 0}` for an empty array, and avoids binary-floating-point loss during large decimal cancellation. Invalid or non-finite values are reported by the managed action; do not construct a report yourself.
 
 ## Use the completed activation
 
