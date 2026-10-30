@@ -1,16 +1,16 @@
 # SELC 换机开发交接
 
-更新日期：2026-10-29。继续开发请使用 `codex/auto-observation`，其中包含当前框架源码、测试和完整 SDLC 记录。
+更新日期：2026-10-30。默认主干 `codex/design` 已整合当前框架源码、已发布业务示例、测试和完整 SDLC 记录。新电脑可以直接克隆默认分支。
 
 ## 获取开发源码
 
 ```sh
-git clone --branch codex/auto-observation https://github.com/arnow117/skill-evolving-life-cycle.git selc
+git clone https://github.com/arnow117/skill-evolving-life-cycle.git selc
 cd selc
 python3.11 scripts/selc.py doctor
 ```
 
-需要 Python 3.11 或更新版本、Git；运行时只使用 Python 标准库。也可从 Gitee 的同名开发分支克隆：`https://gitee.com/arnow117/skill-evolving-life-cycle.git`。`doctor` 应返回 `runtime_version: 0.3.0`、`stdlib_only: true`。
+需要 Python 3.11 或更新版本、Git；运行时只使用 Python 标准库。也可从 Gitee 的默认分支克隆：`https://gitee.com/arnow117/skill-evolving-life-cycle.git`。`doctor` 应返回 `runtime_version: 0.3.0`、`stdlib_only: true`。
 
 先读本文件、`.sdlc-v1/project.md`、`.sdlc-v1/state.json` 和 `.sdlc-v1/context/F-002.engineering.md`。后者从上往下保留当前方案、已接受实现、旧失败与消耗。新电脑的路径、宿主版本、登录及 hook 信任需要根据实际环境重新核对，不能直接继承旧机器的运行身份。
 
@@ -18,13 +18,14 @@ python3.11 scripts/selc.py doctor
 
 | 用途 | Ref / 入口 | 说明 |
 | --- | --- | --- |
-| 当前框架开发 | `codex/auto-observation` | 0.3.0 开发候选；含最新修复和交接记录 |
+| 主干集成源码 | `codex/design` | 0.3.0 开发候选；包含已接受修复、业务示例和交接记录 |
+| F-002 登记开发分支 | `codex/auto-observation` | 继续该 Feature 的 Build 时使用已登记分支，或先按 SDLC 完成受控分支登记迁移 |
 | SELC 基础安装版 | [v0.2.0](https://github.com/arnow117/skill-evolving-life-cycle/releases/tag/v0.2.0) | 仍为框架稳定 Latest；含 BASIC 和离线统计报告 |
 | 业务示例初版 | [v1.0.0](https://github.com/arnow117/skill-evolving-life-cycle/releases/tag/v1.0.0) | `simple-item-reports` 1.0.0，整数、空数组 |
 | 业务示例改进版 | [v1.1.0](https://github.com/arnow117/skill-evolving-life-cycle/releases/tag/v1.1.0) | `simple-item-reports` 1.1.0，精确小数、大数抵消 |
 | 业务示例维护 | `codex/item-summary-native-v1` | `examples/managed-item-summary`；[PR #3](https://github.com/arnow117/skill-evolving-life-cycle/pull/3) 已合并 |
 
-业务标签 v1.x 不是 SELC 框架 v1.x。其完整 suite 内嵌 0.3.0 运行时，自动统计仍属实验功能。默认分支 `codex/design` 未调整；从默认分支克隆不能取得全部开发增量。
+业务标签 v1.x 不是 SELC 框架 v1.x。其完整 suite 内嵌 0.3.0 运行时，自动统计仍属实验功能。默认分支仍为 `codex/design`，已经包含 `codex/auto-observation` 的已交付增量和 `examples/managed-item-summary` 的已发布 1.1.0 完整源码。
 
 两个业务发布目标分别为 `e75bca730fa51a24bc42808675e2ef8388cf6095`、`ee3428d31e99a8d879fb8e9f3a7d159deb500c27`；PR 合并提交是 `fce520171957436e3f0dc6a66752d15dfa0d680c`，其整棵树与后者相同。GitHub Release 的实际 ZIP 已下载验证，业务分支与原标签同步 Gitee。
 
