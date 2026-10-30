@@ -24,7 +24,7 @@ from unittest import mock
 from selc import managed_runtime, records
 from selc.errors import SelcError
 from selc.execution_lease import ProcessIdentity, assert_no_live_execution, process_group_is_live
-from selc.install import install_suite
+from selc.install import current_installation, install_suite
 from selc.manifest import create_suite, seal_suite
 from selc.native_adapter import (
     _managed_prompt_request,
@@ -234,6 +234,1483 @@ class ManagedRuntimeTests(unittest.TestCase):
                 project_root=self.project,
             )
         )
+
+    def test_codex_discovery_read_requires_native_output_and_frozen_entry_identity(self) -> None:
+        """Only one installed routing entry may be read before managed activation."""
+
+        entry = self.project / ".agents" / "skills" / "text-report" / "SKILL.md"
+        command = shlex.join(("/bin/cat", str(entry)))
+        binding = managed_runtime._discovery_read_binding(
+            self.project,
+            "managed-reports",
+            current_installation(self.project, "managed-reports"),
+            command,
+        )
+        self.assertIsNotNone(binding)
+        assert binding is not None
+
+        event = {
+            "session_id": "discovery-session",
+            "generation_id": "discovery-turn",
+            "cwd": str(self.project.resolve()),
+            "tool_command_digest": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+        }
+        completion = {
+            "type": "event_msg",
+            "payload": {
+                "type": "item_completed",
+                "thread_id": "discovery-session",
+                "turn_id": "discovery-turn",
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "discovery-tool",
+                    "command": ["/bin/zsh", "-lc", command],
+                    "cwd": str(self.project.resolve()),
+                    "status": "completed",
+                    "exit_code": 0,
+                    "aggregated_output": entry.read_text(encoding="utf-8"),
+                },
+            },
+        }
+        self.assertEqual(
+            managed_runtime._codex_discovery_read_status(
+                [completion], event, "discovery-tool", binding
+            ),
+            "closed",
+        )
+        original_stat = os.stat
+        reader_values = list(original_stat("/bin/cat"))
+        reader_values[1] += 1
+        replacement_reader_stat = os.stat_result(reader_values)
+
+        def replaced_reader_stat(
+            path: str | os.PathLike[str],
+            *arguments: object,
+            **keyword_arguments: object,
+        ) -> os.stat_result:
+            if os.fspath(path) == "/bin/cat":
+                return replacement_reader_stat
+            return original_stat(path, *arguments, **keyword_arguments)
+
+        with mock.patch("selc.managed_runtime.os.stat", side_effect=replaced_reader_stat):
+            self.assertEqual(
+                managed_runtime._codex_discovery_read_status(
+                    [completion], event, "discovery-tool", binding
+                ),
+                "invalid",
+            )
+        self.assertIsNone(
+            managed_runtime._discovery_read_binding(
+                self.project,
+                "managed-reports",
+                current_installation(self.project, "managed-reports"),
+                f"{command} && printf injected",
+            )
+        )
+
+        output_mismatch = json.loads(json.dumps(completion))
+        output_mismatch["payload"]["item"]["aggregated_output"] = "wrong entry\n"
+        self.assertEqual(
+            managed_runtime._codex_discovery_read_status(
+                [output_mismatch], event, "discovery-tool", binding
+            ),
+            "invalid",
+        )
+        self.assertEqual(
+            managed_runtime._codex_discovery_read_status([], event, "discovery-tool", binding),
+            "pending",
+        )
+
+        original_bytes = entry.read_bytes()
+        try:
+            entry.write_bytes(b"replaced entry\n")
+            self.assertEqual(
+                managed_runtime._codex_discovery_read_status(
+                    [completion], event, "discovery-tool", binding
+                ),
+                "invalid",
+            )
+        finally:
+            entry.write_bytes(original_bytes)
+
+    def test_codex_verified_discovery_read_keeps_the_prompt_context_usable(self) -> None:
+        """A native completion makes the one installed routing read non-business."""
+
+        session_id = "verified-discovery-session"
+        turn_id = "verified-discovery-turn"
+        prompt_text = "@text-report " + json.dumps({"input": str(self.input_path)})
+        history = self.root / ".codex" / "sessions" / "2026" / "verified-discovery.jsonl"
+        history.parent.mkdir(parents=True)
+        initial_history = [
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "session_id": session_id,
+                    "cwd": str(self.project.resolve()),
+                    "cli_version": "0.163.0-alpha.10.2",
+                    "source": "exec",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": turn_id,
+                    "root_turn_id": turn_id,
+                    "turn_attribution": {
+                        "turn_id": turn_id,
+                        "root_turn_id": turn_id,
+                        "parent_turn_id": None,
+                    },
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": turn_id,
+                        "content_item_kinds": ["host_skills.instructions"],
+                    },
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "injected context"}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": turn_id,
+                        "content_item_kinds": ["agents_md.instructions"],
+                    },
+                },
+            },
+            {"type": "world_state", "payload": {"full": True, "state": {}}},
+            {
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": turn_id,
+                    "root_turn_id": turn_id,
+                    "cwd": str(self.project.resolve()),
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "thread_settings_applied", "thread_id": session_id},
+            },
+        ]
+        history.write_bytes(
+            b"".join((json.dumps(record) + "\n").encode("utf-8") for record in initial_history)
+        )
+
+        base_environment = {
+            **os.environ,
+            "CODEX_SESSION_ID": session_id,
+            "CODEX_THREAD_ID": session_id,
+            "CODEX_VERSION": "0.163.0-alpha.10.2",
+        }
+
+        def receive(payload: dict[str, object], tool_use_id: str = "") -> dict[str, object]:
+            environment = dict(base_environment)
+            if tool_use_id:
+                environment["CODEX_TOOL_CALL_ID"] = tool_use_id
+            with (
+                mock.patch("selc.managed_runtime.Path.home", return_value=self.root),
+                mock.patch("selc.native_adapter.Path.home", return_value=self.root),
+            ):
+                return receive_native_hook(
+                    project_root=self.project,
+                    suite_id="managed-reports",
+                    host="codex",
+                    payload=payload,
+                    environment=environment,
+                )
+
+        prompt = {
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": str(self.project),
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "prompt": prompt_text,
+            "transcript_path": str(history),
+            "prefix_length": history.stat().st_size,
+        }
+        self.assertEqual(receive(prompt)["status"], "prompt_recorded")
+        with history.open("ab") as stream:
+            stream.write(
+                (
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": prompt_text}],
+                                "internal_chat_message_metadata_passthrough": {
+                                    "turn_id": turn_id,
+                                    "content_item_kinds": ["user.text"],
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+
+        entry = self.project / ".agents" / "skills" / "text-report" / "SKILL.md"
+        command = shlex.join(("/bin/cat", str(entry)))
+        tool_use_id = "verified-discovery-tool"
+
+        def tool_callback(event_name: str) -> dict[str, object]:
+            return {
+                "hook_event_name": event_name,
+                "cwd": str(self.project),
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "tool_call_id": tool_use_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "transcript_path": str(history),
+                "prefix_length": history.stat().st_size,
+            }
+
+        self.assertEqual(
+            receive(tool_callback("PreToolUse"), tool_use_id)["status"], "discovery_pending"
+        )
+        with history.open("ab") as stream:
+            stream.write(
+                (
+                    json.dumps(
+                        {
+                            "type": "event_msg",
+                            "payload": {
+                                "type": "item_completed",
+                                "thread_id": session_id,
+                                "turn_id": turn_id,
+                                "item": {
+                                    "type": "CommandExecution",
+                                    "id": tool_use_id,
+                                    "command": ["/bin/zsh", "-c", command],
+                                    "cwd": str(self.project.resolve()),
+                                    "status": "completed",
+                                    "exit_code": 0,
+                                    "aggregated_output": entry.read_text(encoding="utf-8"),
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+        self.assertEqual(
+            receive(tool_callback("PostToolUse"), tool_use_id)["status"], "discovery_verified"
+        )
+
+        database = open_database(self.project)
+        try:
+            context = database.execute(
+                "SELECT root_valid, unknown_change FROM managed_contexts"
+            ).fetchone()
+            counts = tuple(
+                database.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                for table in ("managed_receipts", "tasks", "calls")
+            )
+        finally:
+            database.close()
+        self.assertEqual(tuple(context), (1, 0))
+        self.assertEqual(counts, (0, 0, 0))
+
+        database = open_database(self.project)
+        try:
+            row = database.execute(
+                "SELECT event_id, stable_identity, payload_json FROM managed_native_events "
+                "WHERE tool_use_id = ? AND phase = 'PreToolUse'",
+                (tool_use_id,),
+            ).fetchone()
+            assert row is not None
+            legacy_payload = json.loads(row["payload_json"])
+            command_digest = hashlib.sha256(command.encode("utf-8")).hexdigest()
+            legacy_payload.update(
+                {
+                    "action": "unmanaged",
+                    "skill": "",
+                    "command_digest": managed_runtime._digest(
+                        {"action": "unmanaged", "command_digest": command_digest}
+                    ),
+                    "operation_digest": "",
+                    "discovery": None,
+                }
+            )
+            legacy_digest = managed_runtime._digest(
+                {
+                    "identity": row["stable_identity"],
+                    "command": {"action": "unmanaged", "command_digest": command_digest},
+                    "raw_request": "prompt-context",
+                    "source": "native-collector",
+                }
+            )
+            database.execute(
+                "UPDATE managed_native_events SET payload_digest = ?, payload_json = ? WHERE event_id = ?",
+                (legacy_digest, json.dumps(legacy_payload, sort_keys=True), row["event_id"]),
+            )
+            database.execute("UPDATE managed_contexts SET unknown_change = 1")
+            database.commit()
+        finally:
+            database.close()
+
+        self.assertEqual(receive(tool_callback("PreToolUse"), tool_use_id)["status"], "replayed")
+        database = open_database(self.project)
+        try:
+            replayed = database.execute(
+                "SELECT payload_json FROM managed_native_events WHERE tool_use_id = ? "
+                "AND phase = 'PreToolUse'",
+                (tool_use_id,),
+            ).fetchone()
+            conflicts = database.execute(
+                "SELECT COUNT(*) FROM managed_native_conflicts"
+            ).fetchone()[0]
+            unknown_change = database.execute(
+                "SELECT unknown_change FROM managed_contexts"
+            ).fetchone()[0]
+        finally:
+            database.close()
+        assert replayed is not None
+        self.assertEqual(json.loads(replayed["payload_json"])["action"], "unmanaged")
+        self.assertEqual(conflicts, 0)
+        self.assertEqual(unknown_change, 1)
+
+    def test_codex_native_packet_suffix_uses_observed_completion_serializers(self) -> None:
+        """Only redacted same-turn completion records may follow the frozen P1."""
+
+        session_id = "suffix-session"
+        turn_id = "suffix-turn"
+        command_completion = {
+            "type": "event_msg",
+            "timestamp": "1970-01-01T00:00:00Z",
+            "ordinal": 1,
+            "payload": {
+                "type": "item_completed",
+                "thread_id": session_id,
+                "turn_id": turn_id,
+                "started_at_ms": 0,
+                "completed_at_ms": 1,
+                "item": {
+                    "type": "CommandExecution",
+                    "id": "suffix-command",
+                    "command": ["/bin/zsh", "-lc", "/bin/true"],
+                    "cwd": self.project.resolve().as_uri(),
+                    "status": "completed",
+                    "exit_code": 0,
+                    "aggregated_output": "",
+                    "duration": 1,
+                    "parsed_cmd": "read",
+                    "process_id": 1,
+                    "source": "shell",
+                },
+            },
+        }
+        reasoning = {
+            "type": "event_msg",
+            "timestamp": "1970-01-01T00:00:00Z",
+            "ordinal": 2,
+            "payload": {
+                "type": "item_completed",
+                "thread_id": session_id,
+                "turn_id": turn_id,
+                "started_at_ms": 0,
+                "completed_at_ms": 1,
+                "item": {"type": "Reasoning"},
+            },
+        }
+        custom_tool_output = {
+            "type": "response_item",
+            "timestamp": "1970-01-01T00:00:00Z",
+            "ordinal": 3,
+            "metadata": {},
+            "payload": {
+                "type": "custom_tool_call_output",
+                "id": "suffix-output",
+                "call_id": "different-tool-call-id",
+                "output": [
+                    {"type": "input_text", "text": "<redacted>"},
+                    {"type": "input_text", "text": "<redacted>"},
+                ],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "create_time": 0.0,
+                },
+            },
+        }
+        token_count = {
+            "type": "event_msg",
+            "timestamp": "1970-01-01T00:00:00Z",
+            "ordinal": 4,
+            "payload": {
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": {},
+                    "last_token_usage": {},
+                    "model_context_window": 0,
+                },
+                "rate_limits": {},
+            },
+        }
+        verified_suffix = [command_completion, reasoning, custom_tool_output, token_count]
+        self.assertTrue(
+            managed_runtime._codex_native_packet_suffix_is_verified(
+                verified_suffix,
+                session_id=session_id,
+                cwd=self.project,
+                generation_id=turn_id,
+            )
+        )
+        self.assertFalse(
+            managed_runtime._codex_native_packet_suffix_is_verified(
+                [token_count],
+                session_id=session_id,
+                cwd=self.project,
+                generation_id=turn_id,
+            )
+        )
+
+        after_reasoning_user = list(verified_suffix)
+        after_reasoning_user.insert(
+            2,
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": session_id,
+                    "turn_id": turn_id,
+                    "item": {"type": "UserMessage"},
+                },
+            },
+        )
+        self.assertFalse(
+            managed_runtime._codex_native_packet_suffix_is_verified(
+                after_reasoning_user,
+                session_id=session_id,
+                cwd=self.project,
+                generation_id=turn_id,
+            )
+        )
+
+        wrong_turn = json.loads(json.dumps(command_completion))
+        wrong_turn["payload"]["turn_id"] = "another-turn"
+        self.assertFalse(
+            managed_runtime._codex_native_packet_suffix_is_verified(
+                [wrong_turn],
+                session_id=session_id,
+                cwd=self.project,
+                generation_id=turn_id,
+            )
+        )
+
+        forked_suffix = json.loads(json.dumps(command_completion))
+        forked_suffix["history_base"] = "unresolved"
+        self.assertFalse(
+            managed_runtime._codex_native_packet_suffix_is_verified(
+                [forked_suffix],
+                session_id=session_id,
+                cwd=self.project,
+                generation_id=turn_id,
+            )
+        )
+
+    def test_native_request_packet_carries_one_verified_dto_to_an_installed_action(self) -> None:
+        """The trusted Pre callback supplies a short-lived DTO without a host path."""
+
+        manifest_path = self.suite / "suite.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["managed"] = {
+            "protocol": 1,
+            "native_hosts": {"codex": ["0.163.0-alpha.11"]},
+            "actions": {
+                "text-report": {
+                    "skill": "text-report",
+                    "kind": "python-script-v1",
+                    "script": "bin/native-packet-report.py",
+                    "input": {"fields": {"input": {"type": "path"}}, "required": ["input"]},
+                }
+            },
+        }
+        manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+        (self.suite / "bin" / "native-packet-report.py").write_text(
+            "import argparse\n"
+            "import json\n"
+            "from pathlib import Path\n"
+            "parser = argparse.ArgumentParser()\n"
+            "parser.add_argument('command')\n"
+            "parser.add_argument('--request', required=True)\n"
+            "parser.add_argument('--output', required=True)\n"
+            "arguments = parser.parse_args()\n"
+            "request = json.loads(Path(arguments.request).read_text(encoding='utf-8'))\n"
+            "items = Path(request['input']).read_text(encoding='utf-8').splitlines()\n"
+            "Path(arguments.output).write_text('\\n'.join(items), encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        seal_suite(self.suite)
+        self.installation = install_suite(
+            source=self.suite,
+            project_root=self.project,
+            harness="codex",
+            ref=None,
+            mode="observed",
+        )
+
+        session_id = "packet-session"
+        turn_id = "packet-turn"
+        prompt_text = "@text-report " + json.dumps({"input": str(self.input_path)})
+        native_version = "0.163.0-alpha.11"
+        history = self.root / ".codex" / "sessions" / "2026" / "packet.jsonl"
+        history.parent.mkdir(parents=True)
+        initial_history = [
+            {
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "session_id": session_id,
+                    "cwd": str(self.project.resolve()),
+                    "cli_version": native_version,
+                    "source": "exec",
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "task_started",
+                    "turn_id": turn_id,
+                    "root_turn_id": turn_id,
+                    "turn_attribution": {
+                        "turn_id": turn_id,
+                        "root_turn_id": turn_id,
+                        "parent_turn_id": None,
+                    },
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": turn_id,
+                        "content_item_kinds": ["host_skills.instructions"],
+                    },
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "injected context"}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": turn_id,
+                        "content_item_kinds": ["agents_md.instructions"],
+                    },
+                },
+            },
+            {"type": "world_state", "payload": {"full": True, "state": {}}},
+            {
+                "type": "turn_context",
+                "payload": {
+                    "turn_id": turn_id,
+                    "root_turn_id": turn_id,
+                    "cwd": str(self.project.resolve()),
+                },
+            },
+            {
+                "type": "event_msg",
+                "payload": {"type": "thread_settings_applied", "thread_id": session_id},
+            },
+        ]
+        history.write_bytes(
+            b"".join((json.dumps(record) + "\n").encode("utf-8") for record in initial_history)
+        )
+        environment = {
+            **os.environ,
+            "CODEX_SESSION_ID": session_id,
+            "CODEX_THREAD_ID": session_id,
+            "CODEX_VERSION": native_version,
+        }
+
+        def receive(payload: dict[str, object], tool_use_id: str = "") -> dict[str, object]:
+            callback_environment = dict(environment)
+            if tool_use_id:
+                callback_environment["CODEX_TOOL_CALL_ID"] = tool_use_id
+            with (
+                mock.patch("selc.managed_runtime.Path.home", return_value=self.root),
+                mock.patch("selc.native_adapter.Path.home", return_value=self.root),
+            ):
+                return receive_native_hook(
+                    project_root=self.project,
+                    suite_id="managed-reports",
+                    host="codex",
+                    payload=payload,
+                    environment=callback_environment,
+                )
+
+        def callback(
+            command: str,
+            tool_use_id: str,
+            event_name: str = "PreToolUse",
+            *,
+            history_path: Path | None = None,
+            generation_id: str | None = None,
+            request_id: str | None = None,
+        ) -> dict[str, object]:
+            callback_history = history if history_path is None else history_path
+            callback_generation_id = turn_id if generation_id is None else generation_id
+            payload: dict[str, object] = {
+                "hook_event_name": event_name,
+                "cwd": str(self.project),
+                "session_id": session_id,
+                "turn_id": callback_generation_id,
+                "tool_call_id": tool_use_id,
+                "tool_name": "Bash",
+                "tool_input": {"command": command},
+                "transcript_path": str(callback_history),
+                "prefix_length": callback_history.stat().st_size,
+            }
+            if request_id is not None:
+                payload["request_id"] = request_id
+            return payload
+
+        def append_command_completion(
+            command: str,
+            tool_use_id: str,
+            output: str = "",
+            *,
+            history_path: Path | None = None,
+            generation_id: str | None = None,
+        ) -> None:
+            completion_history = history if history_path is None else history_path
+            completion_generation_id = turn_id if generation_id is None else generation_id
+            completion = {
+                "type": "event_msg",
+                "timestamp": "1970-01-01T00:00:00Z",
+                "ordinal": 1,
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": session_id,
+                    "turn_id": completion_generation_id,
+                    "started_at_ms": 0,
+                    "completed_at_ms": 1,
+                    "item": {
+                        "type": "CommandExecution",
+                        "id": tool_use_id,
+                        "command": ["/bin/zsh", "-c", command],
+                        "cwd": self.project.resolve().as_uri(),
+                        "status": "completed",
+                        "exit_code": 0,
+                        "aggregated_output": output,
+                        "duration": 1,
+                        "parsed_cmd": "read",
+                        "process_id": 1,
+                        "source": "shell",
+                    },
+                },
+            }
+            reasoning = {
+                "type": "event_msg",
+                "timestamp": "1970-01-01T00:00:00Z",
+                "ordinal": 2,
+                "payload": {
+                    "type": "item_completed",
+                    "thread_id": session_id,
+                    "turn_id": completion_generation_id,
+                    "started_at_ms": 0,
+                    "completed_at_ms": 1,
+                    "item": {"type": "Reasoning"},
+                },
+            }
+            custom_tool_output = {
+                "type": "response_item",
+                "timestamp": "1970-01-01T00:00:00Z",
+                "ordinal": 3,
+                "metadata": {},
+                "payload": {
+                    "type": "custom_tool_call_output",
+                    "id": f"output-{tool_use_id}",
+                    "call_id": f"call-{tool_use_id}",
+                    "output": [
+                        {"type": "input_text", "text": "<redacted>"},
+                        {"type": "input_text", "text": "<redacted>"},
+                    ],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": completion_generation_id,
+                        "create_time": 0.0,
+                    },
+                },
+            }
+            token_count = {
+                "type": "event_msg",
+                "timestamp": "1970-01-01T00:00:00Z",
+                "ordinal": 4,
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {},
+                        "last_token_usage": {},
+                        "model_context_window": 0,
+                    },
+                    "rate_limits": {},
+                },
+            }
+            with completion_history.open("ab") as stream:
+                for record in (completion, reasoning, custom_tool_output, token_count):
+                    stream.write((json.dumps(record) + "\n").encode("utf-8"))
+
+        def write_initial_history(history_path: Path, generation_id: str) -> None:
+            records = json.loads(json.dumps(initial_history))
+            task_started = records[1]["payload"]
+            task_started["turn_id"] = generation_id
+            task_started["root_turn_id"] = generation_id
+            task_started["turn_attribution"]["turn_id"] = generation_id
+            task_started["turn_attribution"]["root_turn_id"] = generation_id
+            records[2]["payload"]["internal_chat_message_metadata_passthrough"]["turn_id"] = (
+                generation_id
+            )
+            records[3]["payload"]["internal_chat_message_metadata_passthrough"]["turn_id"] = (
+                generation_id
+            )
+            turn_context = records[5]["payload"]
+            turn_context["turn_id"] = generation_id
+            turn_context["root_turn_id"] = generation_id
+            history_path.write_bytes(
+                b"".join((json.dumps(record) + "\n").encode("utf-8") for record in records)
+            )
+
+        def append_prompt_record(
+            history_path: Path,
+            *,
+            generation_id: str,
+            text: str,
+        ) -> None:
+            prompt_record = {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": generation_id,
+                        "content_item_kinds": ["user.text"],
+                    },
+                },
+            }
+            with history_path.open("ab") as stream:
+                stream.write((json.dumps(prompt_record) + "\n").encode("utf-8"))
+
+        prompt = {
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": str(self.project),
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "prompt": prompt_text,
+            "transcript_path": str(history),
+            "prefix_length": history.stat().st_size,
+        }
+        self.assertEqual(receive(prompt)["status"], "prompt_recorded")
+        with history.open("ab") as stream:
+            stream.write(
+                (
+                    json.dumps(
+                        {
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": prompt_text}],
+                                "internal_chat_message_metadata_passthrough": {
+                                    "turn_id": turn_id,
+                                    "content_item_kinds": ["user.text"],
+                                },
+                            },
+                        }
+                    )
+                    + "\n"
+                ).encode("utf-8")
+            )
+
+        discovery_entry = self.project / ".agents" / "skills" / "text-report" / "SKILL.md"
+        discovery_command = shlex.join(("/bin/cat", str(discovery_entry)))
+        discovery_tool = "packet-discovery"
+        self.assertEqual(
+            receive(callback(discovery_command, discovery_tool), discovery_tool)["status"],
+            "discovery_pending",
+        )
+        append_command_completion(
+            discovery_command,
+            discovery_tool,
+            discovery_entry.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            receive(
+                callback(discovery_command, discovery_tool, "PostToolUse"),
+                discovery_tool,
+            )["status"],
+            "discovery_verified",
+        )
+
+        wrapper = (
+            self.project
+            / ".selc"
+            / "installs"
+            / "managed-reports"
+            / "current"
+            / "bin"
+            / "selc-suite.py"
+        )
+        invoke = [
+            sys.executable,
+            str(wrapper),
+            "managed",
+            "invoke",
+            "--project-root",
+            str(self.project),
+            "--suite",
+            "managed-reports",
+            "--skill",
+            "text-report",
+            "--host",
+            "codex",
+            "--expected-version",
+            str(self.installation["version"]),
+            "--expected-composite",
+            str(self.installation["digest"]),
+        ]
+        invoke_tool = "packet-invoke"
+        self.assertEqual(
+            receive(callback(shlex.join(invoke), invoke_tool), invoke_tool)["status"], "recorded"
+        )
+        invoked = subprocess.run(
+            invoke,
+            env={**environment, "CODEX_TOOL_CALL_ID": invoke_tool},
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertEqual(invoked.returncode, 0, invoked.stderr or invoked.stdout)
+        subject = json.loads(invoked.stdout)["managed"]
+        invoke_command = shlex.join(invoke)
+        append_command_completion(invoke_command, invoke_tool)
+        self.assertEqual(
+            receive(callback(invoke_command, invoke_tool, "PostToolUse"), invoke_tool)["status"],
+            "post_recorded",
+        )
+
+        action = [
+            sys.executable,
+            str(wrapper),
+            "managed",
+            "action",
+            "--project-root",
+            str(self.project),
+            "--suite",
+            "managed-reports",
+            "--skill",
+            "text-report",
+            "--task-id",
+            str(subject["task_id"]),
+            "--call-id",
+            str(subject["call_id"]),
+            "--action",
+            "text-report",
+            "--request-source",
+            "native",
+            "--host",
+            "codex",
+            "--expected-version",
+            str(self.installation["version"]),
+            "--expected-composite",
+            str(self.installation["digest"]),
+        ]
+        action_tool = "packet-action"
+        self.assertEqual(
+            receive(callback(shlex.join(action), action_tool), action_tool)["status"], "recorded"
+        )
+
+        database = open_database(self.project)
+        try:
+            event = database.execute(
+                "SELECT payload_json FROM managed_native_events WHERE tool_use_id = ?",
+                (action_tool,),
+            ).fetchone()
+            receipt = database.execute(
+                "SELECT receipt_digest FROM managed_receipts WHERE tool_use_id = ?",
+                (action_tool,),
+            ).fetchone()
+        finally:
+            database.close()
+        assert event is not None
+        assert receipt is not None
+        event_payload = json.loads(event["payload_json"])
+        self.assertIn("native_request_packet", event_payload)
+        self.assertEqual(set(event_payload["native_request_packet"]), {"version", "digest"})
+        self.assertNotIn(str(history), json.dumps(event_payload))
+        packet = managed_runtime._native_request_packet_path(
+            self.project,
+            "managed-reports",
+            receipt["receipt_digest"],
+        )
+        self.assertTrue(packet.is_file())
+        packet_bytes = packet.read_bytes()
+        interrupted_temporary = packet.parent / f".{packet.name}.{'a' * 24}.tmp"
+        os.link(packet, interrupted_temporary)
+        with self.assertRaises(SelcError):
+            managed_runtime._read_native_request_packet_file(packet)
+        database = open_database(self.project)
+        try:
+            managed_runtime._cleanup_expired_native_request_packets(
+                database,
+                self.project,
+                "managed-reports",
+                self.installation,
+            )
+        finally:
+            database.close()
+        self.assertFalse(interrupted_temporary.exists())
+        self.assertEqual(managed_runtime._read_native_request_packet_file(packet), packet_bytes)
+
+        expired_garbage: list[Path] = []
+        for index in range(129):
+            digest = hashlib.sha256(f"expired-packet-{index}".encode("utf-8")).hexdigest()
+            garbage = packet.parent / f"{digest}.json"
+            garbage.write_bytes(b"{}")
+            expired_garbage.append(garbage)
+        database = open_database(self.project)
+        try:
+            managed_runtime._cleanup_expired_native_request_packets(
+                database,
+                self.project,
+                "managed-reports",
+                self.installation,
+            )
+        finally:
+            database.close()
+        self.assertTrue(any(garbage.exists() for garbage in expired_garbage))
+        for _ in range(4):
+            database = open_database(self.project)
+            try:
+                managed_runtime._cleanup_expired_native_request_packets(
+                    database,
+                    self.project,
+                    "managed-reports",
+                    self.installation,
+                )
+            finally:
+                database.close()
+        self.assertTrue(all(not garbage.exists() for garbage in expired_garbage))
+        self.assertEqual(
+            receive(callback(shlex.join(action), action_tool), action_tool)["status"],
+            "replayed",
+        )
+        self.assertEqual(packet.read_bytes(), packet_bytes)
+
+        wrong_subject = list(action)
+        wrong_subject[wrong_subject.index("--task-id") + 1] = "managed-task-wrong-subject"
+        wrong_subject_result = subprocess.run(
+            wrong_subject,
+            env={**environment, "CODEX_TOOL_CALL_ID": action_tool},
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertNotEqual(wrong_subject_result.returncode, 0)
+
+        completed = subprocess.run(
+            action,
+            env={**environment, "CODEX_TOOL_CALL_ID": action_tool},
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr or completed.stdout)
+        self.assertFalse(packet.exists())
+
+        orphan_tool = "packet-action-orphan"
+        self.assertEqual(
+            receive(callback(shlex.join(action), orphan_tool), orphan_tool)["status"], "recorded"
+        )
+        database = open_database(self.project)
+        try:
+            orphan_receipt = database.execute(
+                "SELECT * FROM managed_receipts WHERE tool_use_id = ?",
+                (orphan_tool,),
+            ).fetchone()
+            assert orphan_receipt is not None
+            orphan_packet = managed_runtime._native_request_packet_path(
+                self.project,
+                "managed-reports",
+                orphan_receipt["receipt_digest"],
+            )
+            orphan_event = database.execute(
+                "SELECT event_id, payload_json FROM managed_native_events WHERE tool_use_id = ?",
+                (orphan_tool,),
+            ).fetchone()
+            assert orphan_event is not None
+            orphan_payload = json.loads(orphan_event["payload_json"])
+            orphan_payload.pop("native_request_packet")
+            database.execute(
+                "UPDATE managed_native_events SET payload_json = ? WHERE event_id = ?",
+                (json.dumps(orphan_payload, sort_keys=True), orphan_event["event_id"]),
+            )
+            database.commit()
+            self.assertFalse(
+                managed_runtime._native_request_packet_artifact_matches_receipt(
+                    database,
+                    orphan_packet.read_bytes(),
+                    orphan_receipt,
+                    self.installation,
+                )
+            )
+            restored_payload = json.loads(
+                database.execute(
+                    "SELECT payload_json FROM managed_native_events WHERE event_id = ?",
+                    (orphan_event["event_id"],),
+                ).fetchone()["payload_json"]
+            )
+        finally:
+            database.close()
+        self.assertNotIn("native_request_packet", restored_payload)
+        orphaned = subprocess.run(
+            action,
+            env={**environment, "CODEX_TOOL_CALL_ID": orphan_tool},
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertNotEqual(orphaned.returncode, 0)
+
+        non_packet_blockers: list[Path] = []
+        for index in range(64):
+            blocker = packet.parent / f"unrelated-packet-entry-{index}"
+            blocker.mkdir()
+            non_packet_blockers.append(blocker)
+
+        recovery_tool = "packet-action-direct-recovery"
+        self.assertEqual(
+            receive(callback(shlex.join(action), recovery_tool), recovery_tool)["status"],
+            "recorded",
+        )
+        database = open_database(self.project)
+        try:
+            recovery_receipt = database.execute(
+                "SELECT * FROM managed_receipts WHERE tool_use_id = ?",
+                (recovery_tool,),
+            ).fetchone()
+            assert recovery_receipt is not None
+            recovery_packet = managed_runtime._native_request_packet_path(
+                self.project,
+                "managed-reports",
+                recovery_receipt["receipt_digest"],
+            )
+            recovery_temporary = recovery_packet.with_name(f".{recovery_packet.name}.tmp")
+            os.link(recovery_packet, recovery_temporary)
+            managed_runtime._recover_current_native_request_packet_artifact(
+                database,
+                project_root=self.project,
+                receipt=recovery_receipt,
+                installation=self.installation,
+            )
+        finally:
+            database.close()
+        self.assertTrue(recovery_packet.is_file())
+        self.assertFalse(recovery_temporary.exists())
+
+        ready_stop_tool = "packet-action-ready-stop"
+        self.assertEqual(
+            receive(callback(shlex.join(action), ready_stop_tool), ready_stop_tool)["status"],
+            "recorded",
+        )
+        database = open_database(self.project)
+        try:
+            ready_stop_receipt = database.execute(
+                "SELECT receipt_digest FROM managed_receipts WHERE tool_use_id = ?",
+                (ready_stop_tool,),
+            ).fetchone()
+        finally:
+            database.close()
+        assert ready_stop_receipt is not None
+        ready_stop_packet = managed_runtime._native_request_packet_path(
+            self.project,
+            "managed-reports",
+            ready_stop_receipt["receipt_digest"],
+        )
+        self.assertTrue(ready_stop_packet.is_file())
+        ready_stop_temporary = ready_stop_packet.with_name(f".{ready_stop_packet.name}.tmp")
+        os.link(ready_stop_packet, ready_stop_temporary)
+
+        replay = receive(callback(shlex.join(action), action_tool), action_tool)
+        self.assertEqual(replay["status"], "replayed")
+        repeated = subprocess.run(
+            action,
+            env={**environment, "CODEX_TOOL_CALL_ID": action_tool},
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertNotEqual(repeated.returncode, 0)
+
+        tampered_tool = "packet-action-tampered"
+        self.assertEqual(
+            receive(callback(shlex.join(action), tampered_tool), tampered_tool)["status"],
+            "recorded",
+        )
+        database = open_database(self.project)
+        try:
+            tampered_receipt = database.execute(
+                "SELECT receipt_digest FROM managed_receipts WHERE tool_use_id = ?",
+                (tampered_tool,),
+            ).fetchone()
+        finally:
+            database.close()
+        assert tampered_receipt is not None
+        tampered_packet = managed_runtime._native_request_packet_path(
+            self.project,
+            "managed-reports",
+            tampered_receipt["receipt_digest"],
+        )
+        tampered_packet.write_bytes(b"{}")
+        tampered = subprocess.run(
+            action,
+            env={**environment, "CODEX_TOOL_CALL_ID": tampered_tool},
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertNotEqual(tampered.returncode, 0)
+        self.assertTrue(tampered_packet.exists())
+        tampered_packet.unlink()
+        missing = subprocess.run(
+            action,
+            env={**environment, "CODEX_TOOL_CALL_ID": tampered_tool},
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertNotEqual(missing.returncode, 0)
+
+        database = open_database(self.project)
+        try:
+            existing_live_packets = managed_runtime._live_native_request_packet_receipts(
+                database,
+                suite_id="managed-reports",
+                limit=managed_runtime.MAX_LIVE_NATIVE_REQUEST_PACKETS + 1,
+            )
+        finally:
+            database.close()
+        self.assertLess(
+            len(existing_live_packets),
+            managed_runtime.MAX_LIVE_NATIVE_REQUEST_PACKETS,
+        )
+        for index in range(
+            managed_runtime.MAX_LIVE_NATIVE_REQUEST_PACKETS - len(existing_live_packets)
+        ):
+            cap_tool = f"packet-action-capacity-{index}"
+            with self.subTest(cap_tool=cap_tool):
+                self.assertEqual(
+                    receive(callback(shlex.join(action), cap_tool), cap_tool)["status"], "recorded"
+                )
+        database = open_database(self.project)
+        try:
+            live_packets = managed_runtime._live_native_request_packet_receipts(
+                database,
+                suite_id="managed-reports",
+                limit=65,
+            )
+        finally:
+            database.close()
+        self.assertEqual(len(live_packets), 64)
+        with self.assertRaises(SelcError) as captured:
+            receive(
+                callback(shlex.join(action), "packet-action-capacity-overflow"),
+                "packet-action-capacity-overflow",
+            )
+        self.assertEqual(captured.exception.code, "NATIVE_REQUEST_UNAVAILABLE")
+
+        original_history = history.read_bytes()
+        appended_user = {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "later business request"}],
+                "internal_chat_message_metadata_passthrough": {
+                    "turn_id": turn_id,
+                    "content_item_kinds": ["user.text"],
+                },
+            },
+        }
+        with history.open("ab") as stream:
+            stream.write((json.dumps(appended_user) + "\n").encode("utf-8"))
+        with self.assertRaises(SelcError) as captured:
+            receive(
+                callback(shlex.join(action), "packet-action-new-user"), "packet-action-new-user"
+            )
+        self.assertEqual(captured.exception.code, "ROOT_PROOF_UNAVAILABLE")
+
+        history.write_bytes(original_history)
+        replacement_history = history.with_name("packet-replacement.jsonl")
+        replacement_history.write_bytes(original_history)
+        original_history_link = history.with_name("packet-original-history.jsonl")
+        os.link(history, original_history_link)
+        os.replace(replacement_history, history)
+        with self.assertRaises(SelcError) as captured:
+            receive(
+                callback(shlex.join(action), "packet-action-replaced-history"),
+                "packet-action-replaced-history",
+            )
+        self.assertEqual(captured.exception.code, "ROOT_PROOF_UNAVAILABLE")
+        os.replace(original_history_link, history)
+
+        stop_garbage = packet.parent / f"{hashlib.sha256(b'stop-garbage').hexdigest()}.json"
+        stop_garbage.write_bytes(b"{}")
+        self.assertEqual(
+            receive(
+                {
+                    "hook_event_name": "Stop",
+                    "cwd": str(self.project),
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "transcript_path": str(history),
+                    "prefix_length": history.stat().st_size,
+                }
+            )["status"],
+            "stop_recorded",
+        )
+        self.assertFalse(stop_garbage.exists())
+        self.assertFalse(ready_stop_packet.exists())
+        self.assertFalse(ready_stop_temporary.exists())
+        self.assertFalse(recovery_packet.exists())
+        self.assertTrue(all(blocker.is_dir() for blocker in non_packet_blockers))
+        database = open_database(self.project)
+        try:
+            remaining_packets = managed_runtime._live_native_request_packet_receipts(
+                database,
+                suite_id="managed-reports",
+                limit=managed_runtime.MAX_LIVE_NATIVE_REQUEST_PACKETS + 1,
+                include_expired=True,
+            )
+        finally:
+            database.close()
+        self.assertEqual(remaining_packets, [])
+
+        next_turn_id = "packet-turn-after-stop"
+        next_history = history.with_name("packet-after-stop.jsonl")
+        write_initial_history(next_history, next_turn_id)
+        next_prompt = {
+            "hook_event_name": "UserPromptSubmit",
+            "cwd": str(self.project),
+            "session_id": session_id,
+            "turn_id": next_turn_id,
+            "prompt": prompt_text,
+            "transcript_path": str(next_history),
+            "prefix_length": next_history.stat().st_size,
+        }
+        self.assertEqual(receive(next_prompt)["status"], "prompt_recorded")
+        append_prompt_record(next_history, generation_id=next_turn_id, text=prompt_text)
+
+        next_discovery_tool = "packet-after-stop-discovery"
+        self.assertEqual(
+            receive(
+                callback(
+                    discovery_command,
+                    next_discovery_tool,
+                    history_path=next_history,
+                    generation_id=next_turn_id,
+                ),
+                next_discovery_tool,
+            )["status"],
+            "discovery_pending",
+        )
+        append_command_completion(
+            discovery_command,
+            next_discovery_tool,
+            discovery_entry.read_text(encoding="utf-8"),
+            history_path=next_history,
+            generation_id=next_turn_id,
+        )
+        self.assertEqual(
+            receive(
+                callback(
+                    discovery_command,
+                    next_discovery_tool,
+                    "PostToolUse",
+                    history_path=next_history,
+                    generation_id=next_turn_id,
+                ),
+                next_discovery_tool,
+            )["status"],
+            "discovery_verified",
+        )
+
+        next_invoke_tool = "packet-after-stop-invoke"
+        invoke_command = shlex.join(invoke)
+        self.assertEqual(
+            receive(
+                callback(
+                    invoke_command,
+                    next_invoke_tool,
+                    history_path=next_history,
+                    generation_id=next_turn_id,
+                ),
+                next_invoke_tool,
+            )["status"],
+            "recorded",
+        )
+        next_invoked = subprocess.run(
+            invoke,
+            env={**environment, "CODEX_TOOL_CALL_ID": next_invoke_tool},
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        self.assertEqual(next_invoked.returncode, 0, next_invoked.stderr or next_invoked.stdout)
+        next_subject = json.loads(next_invoked.stdout)["managed"]
+        append_command_completion(
+            invoke_command,
+            next_invoke_tool,
+            history_path=next_history,
+            generation_id=next_turn_id,
+        )
+        self.assertEqual(
+            receive(
+                callback(
+                    invoke_command,
+                    next_invoke_tool,
+                    "PostToolUse",
+                    history_path=next_history,
+                    generation_id=next_turn_id,
+                ),
+                next_invoke_tool,
+            )["status"],
+            "post_recorded",
+        )
+
+        next_action = list(action)
+        next_action[next_action.index("--task-id") + 1] = str(next_subject["task_id"])
+        next_action[next_action.index("--call-id") + 1] = str(next_subject["call_id"])
+        next_action_tool = "packet-after-stop-action"
+        self.assertEqual(
+            receive(
+                callback(
+                    shlex.join(next_action),
+                    next_action_tool,
+                    history_path=next_history,
+                    generation_id=next_turn_id,
+                ),
+                next_action_tool,
+            )["status"],
+            "recorded",
+        )
+
+        other_request_tool = "packet-after-stop-other-request"
+        self.assertEqual(
+            receive(
+                callback(
+                    shlex.join(next_action),
+                    other_request_tool,
+                    history_path=next_history,
+                    generation_id=next_turn_id,
+                ),
+                other_request_tool,
+            )["status"],
+            "recorded",
+        )
+        database = open_database(self.project)
+        try:
+            other_receipt = database.execute(
+                "SELECT * FROM managed_receipts WHERE tool_use_id = ?",
+                (other_request_tool,),
+            ).fetchone()
+            assert other_receipt is not None
+            other_packet = managed_runtime._native_request_packet_path(
+                self.project,
+                "managed-reports",
+                other_receipt["receipt_digest"],
+            )
+            other_packet_body = json.loads(other_packet.read_bytes())
+            other_packet_body["request_id"] = "other-request"
+            other_packet_bytes = managed_runtime.canonical_json(other_packet_body).encode("utf-8")
+            other_packet.write_bytes(other_packet_bytes)
+            other_event = database.execute(
+                "SELECT event_id, payload_json FROM managed_native_events WHERE event_id = ?",
+                (other_receipt["native_event_id"],),
+            ).fetchone()
+            assert other_event is not None
+            other_event_payload = json.loads(other_event["payload_json"])
+            other_event_payload["native_request_packet"]["digest"] = hashlib.sha256(
+                other_packet_bytes
+            ).hexdigest()
+            database.execute(
+                "UPDATE managed_receipts SET request_id = ? WHERE receipt_digest = ?",
+                ("other-request", other_receipt["receipt_digest"]),
+            )
+            database.execute(
+                "UPDATE managed_native_events SET request_id = ?, payload_json = ? WHERE event_id = ?",
+                (
+                    "other-request",
+                    managed_runtime.canonical_json(other_event_payload),
+                    other_event["event_id"],
+                ),
+            )
+            database.commit()
+        finally:
+            database.close()
+
+        database = open_database(self.project)
+        try:
+            next_receipt = database.execute(
+                "SELECT * FROM managed_receipts WHERE tool_use_id = ?",
+                (next_action_tool,),
+            ).fetchone()
+            assert next_receipt is not None
+            database.execute(
+                "UPDATE managed_receipts SET expires_at = ? WHERE receipt_digest = ?",
+                ("1970-01-01T00:00:00Z", next_receipt["receipt_digest"]),
+            )
+            database.commit()
+        finally:
+            database.close()
+        next_packet = managed_runtime._native_request_packet_path(
+            self.project,
+            "managed-reports",
+            next_receipt["receipt_digest"],
+        )
+        next_temporary = managed_runtime._native_request_packet_temporary_path(next_packet)
+        os.link(next_packet, next_temporary)
+
+        self.assertEqual(
+            receive(
+                {
+                    "hook_event_name": "Stop",
+                    "cwd": str(self.project),
+                    "session_id": session_id,
+                    "turn_id": next_turn_id,
+                    "transcript_path": str(next_history),
+                    "prefix_length": next_history.stat().st_size,
+                }
+            )["status"],
+            "stop_recorded",
+        )
+        self.assertFalse(next_packet.exists())
+        self.assertFalse(next_temporary.exists())
+        self.assertTrue(other_packet.is_file())
+        database = open_database(self.project)
+        try:
+            next_status = database.execute(
+                "SELECT status FROM managed_receipts WHERE receipt_digest = ?",
+                (next_receipt["receipt_digest"],),
+            ).fetchone()["status"]
+        finally:
+            database.close()
+        self.assertEqual(next_status, "expired")
 
     def test_codex_selectorless_dto_reuses_a_failed_task_for_a_structured_correction(self) -> None:
         self._assert_codex_dto_correction_chain(
@@ -787,7 +2264,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                                 "item": {
                                     "type": "CommandExecution",
                                     "id": "tool-automatic-publish",
-                                    "command": ["/bin/zsh", "-lc", shlex.join(publish_command)],
+                                    "command": ["/bin/zsh", "-c", shlex.join(publish_command)],
                                     "cwd": str(self.project.resolve()),
                                     "status": "completed",
                                     "exit_code": 0,
@@ -4059,6 +5536,12 @@ class ManagedRuntimeTests(unittest.TestCase):
             completed_item(cwd=file_uri + "\ud800"),
             completed_item(cwd=wrong_cwd.resolve().as_uri()),
             completed_item(cwd="https://example.test/project"),
+            completed_item(command=["/bin/zsh", "-l", command]),
+            completed_item(command=["/bin/zsh", "-ic", command]),
+            completed_item(command=["/bin/zsh", {"flag": "-c"}, command]),
+            completed_item(command=["/bin/zsh", ["-c"], command]),
+            completed_item(command=["/bin/zsh", "-c", command, "unexpected"]),
+            completed_item(command=["/bin/zsh", "-c", command + " --altered"]),
             completed_item(command=["/bin/zsh", "-lc", "printf wrong"]),
             completed_item(exit_code=1),
             completed_item(exit_code=False),
@@ -4085,7 +5568,7 @@ class ManagedRuntimeTests(unittest.TestCase):
         )
 
     def test_codex_window_ignores_matching_items_before_the_pre_prefix(self) -> None:
-        """A result from a previous native window cannot close the current one."""
+        """A `-c` completion closes only the current native publication window."""
 
         command = "python selc-suite.py managed publish"
         completed = {
@@ -4097,7 +5580,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                 "item": {
                     "type": "CommandExecution",
                     "id": "tool-codex",
-                    "command": ["/bin/zsh", "-lc", command],
+                    "command": ["/bin/zsh", "-c", command],
                     "cwd": str(self.project.resolve()),
                     "status": "completed",
                     "exit_code": 0,
@@ -4124,8 +5607,28 @@ class ManagedRuntimeTests(unittest.TestCase):
         event["prefix"] = {"length": self.transcript.stat().st_size}
         self.assertTrue(managed_runtime._history_contains_publication_result(event, "tool-codex"))
 
+    def test_publication_assessment_reduction_cannot_clear_a_sticky_unknown_context(self) -> None:
+        """Publication reconciliation never turns an existing unknown into pass."""
+
+        activated = self._activate()
+        database = open_database(self.project)
+        try:
+            database.execute(
+                "UPDATE managed_contexts SET unknown_change = 1 WHERE task_id = ?",
+                (activated["task_id"],),
+            )
+            managed_runtime.reduce_managed_assessment(database, str(activated["task_id"]))
+            unknown_change = database.execute(
+                "SELECT unknown_change FROM managed_contexts WHERE task_id = ?",
+                (activated["task_id"],),
+            ).fetchone()[0]
+        finally:
+            database.close()
+
+        self.assertEqual(unknown_change, 1)
+
     def test_publication_window_rejects_a_mutated_or_truncated_cutoff(self) -> None:
-        """A frozen Stop cutoff cannot be replaced before later reconciliation."""
+        """A frozen Stop cutoff accepts only its exact `-c` completion."""
 
         command = "python selc-suite.py managed publish"
         history_path = self.root / "codex-window.jsonl"
@@ -4143,7 +5646,7 @@ class ManagedRuntimeTests(unittest.TestCase):
                             "item": {
                                 "type": "CommandExecution",
                                 "id": "tool-codex",
-                                "command": ["/bin/zsh", "-lc", command],
+                                "command": ["/bin/zsh", "-c", command],
                                 "cwd": str(self.project.resolve()),
                                 "status": "completed",
                                 "exit_code": 0,
@@ -4274,6 +5777,20 @@ class ManagedRuntimeTests(unittest.TestCase):
                 },
             },
         ]
+        history.insert(
+            4,
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "developer",
+                    "internal_chat_message_metadata_passthrough": {
+                        "turn_id": "codex-turn",
+                        "content_item_kinds": ["generic.developer_instructions"],
+                    },
+                },
+            },
+        )
         digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         self.assertTrue(
             managed_runtime._codex_root_prefix_is_verified(
@@ -4433,7 +5950,10 @@ class ManagedRuntimeTests(unittest.TestCase):
                     "role": "developer",
                     "internal_chat_message_metadata_passthrough": {
                         "turn_id": "codex-turn",
-                        "content_item_kinds": ["host_skills.instructions"],
+                        "content_item_kinds": [
+                            "host_skills.instructions",
+                            "generic.developer_instructions",
+                        ],
                     },
                 },
             },

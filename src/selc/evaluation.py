@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -33,9 +34,31 @@ from .checkers import (
     check_artifact,
 )
 from .errors import SelcError
-from .install import current_installation, install_suite
-from .managed_runtime import _history_contains_publication_result, _trusted_posix_account_home
-from .manifest import copy_portable_suite, load_manifest, portable_tree_hash, suite_content_hash
+from .install import current_installation, install_root, install_suite
+from .managed_runtime import (
+    _discovery_read_binding,
+    _history_contains_publication_result,
+    _metadata_only_prefix,
+    _trusted_posix_account_home,
+    _validate_action_request,
+    _verify_native_history_path,
+    _workbuddy_assistant_text_is_verified,
+    _workbuddy_model_identity,
+    _workbuddy_model_step_sequence,
+    _workbuddy_native_ids_are_unique,
+    _workbuddy_parent_chain_is_complete,
+    _workbuddy_record_has_explicit_scope,
+    _workbuddy_user_message_is_verified,
+)
+from .manifest import (
+    copy_portable_suite,
+    load_manifest,
+    managed_configuration,
+    normalize_declared_skills,
+    portable_tree_hash,
+    suite_content_hash,
+)
+from .native_adapter import _managed_prompt_request
 from .util import (
     canonical_json,
     exclusive_lock,
@@ -57,10 +80,57 @@ MAX_CASES = 64
 MAX_TOTAL_EVALUATION_SECONDS = MAX_ATTEMPT_SECONDS * MAX_CASES * MAX_MATRICES
 FRAMEWORK_MIT_LICENSE_HASH = "d25592caa5a6ea2534e6d3e38f84e9786650cdb634af57a0fd039e6ac5632462"
 SUPPORTED_ADAPTERS = frozenset({"codex-cli", "codex-desktop", "workbuddy-desktop"})
-CODEX_POLICY_TEMPLATE_SCHEMA_VERSION = 1
+CODEX_POLICY_TEMPLATE_SCHEMA_VERSION = 3
+CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION = 1
+CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION = 2
+CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION = 3
 CODEX_ALPHA11_VERSION = "0.163.0-alpha.11"
 CODEX_HOOK_TRUST_SCHEMA_VERSION = 2
 CODEX_HOOK_TRUST_MODE = "normal-project-and-hook-state-inheritance-v2"
+CODEX_PREPARATION_GUIDANCE_SCHEMA_VERSION = 1
+CODEX_PREPARATION_GUIDANCE_CONTENT_KIND = "generic.developer_instructions"
+CODEX_FIXED_PREPARATION_INSTRUCTIONS = (
+    "SELC evaluation preparation instructions:\n"
+    "Read the installer-owned absolute routing entry identified by host metadata with exactly one "
+    "command: /bin/cat <absolute-routing-entry>. Do not add arguments, command chaining, "
+    "redirection, substitution, environment prefixes, newline composition, pwd, find, ls, or any "
+    "input read.\n"
+    "Run the returned immutable routing entry's literal managed invoke exactly once. Use the immutable "
+    "business body returned by that invoke only when it declares a fixed-script managed action with "
+    "--request-source native. Do not write a scratch request; the runtime reads the action input.\n"
+    "Publish once as an independent step. Stop after the first error or after a successful publish."
+)
+CODEX_FIXED_PREPARATION_SUMMARY = "fixed-routing-read-and-native-managed-action-v1"
+CODEX_EXPLICIT_ROUTING_PREPARATION_INSTRUCTION_TEMPLATE = (
+    "SELC evaluation preparation instructions:\n"
+    "Read the installer-bound absolute routing entry with exactly this command: "
+    "{routing_command}. Do not choose an account bootstrap directory or search for another entry. "
+    "Do not add arguments, command chaining, redirection, substitution, environment prefixes, newline "
+    "composition, pwd, find, ls, or any input read.\n"
+    "Run the returned immutable routing entry's literal managed invoke exactly once. Use the immutable "
+    "business body returned by that invoke only when it declares the bound fixed-script managed action "
+    "with --request-source native. Do not write a scratch request; the runtime reads the action input.\n"
+    "Publish once as an independent step. Stop after the first error or after a successful publish."
+)
+CODEX_EXPLICIT_ROUTING_PREPARATION_SUMMARY = (
+    "explicit-installed-routing-read-and-native-managed-action-v2"
+)
+CODEX_EXPLICIT_ROUTING_PARAMETER = "installed-registered-routing-entry"
+CODEX_EXPLICIT_ROUTING_RENDERER = "exact-single-cat-command-v1"
+CODEX_KNOWN_DEVELOPER_CONTENT_KINDS = frozenset(
+    {
+        "host_skills.instructions",
+        "permissions.instructions",
+        "multi_agent.usage_hint",
+        "multi_agent.mode_instructions",
+        CODEX_PREPARATION_GUIDANCE_CONTENT_KIND,
+    }
+)
+WORKBUDDY_SESSION_DIAGNOSTICS_SCHEMA_VERSION = 1
+WORKBUDDY_SESSION_DIAGNOSTICS_PARSER = "workbuddy-session-diagnostics-v1"
+WORKBUDDY_OBSERVED_SERIALIZER_VERSION = "5.9.2"
+MAX_NATIVE_SESSION_CUTOFF_BYTES = 8 * 1024 * 1024
+_INVALID_WORKBUDDY_METADATA = object()
 CODEX_MANAGED_HOOK_EVENTS = (
     ("UserPromptSubmit", "user_prompt_submit"),
     ("PreToolUse", "pre_tool_use"),
@@ -138,8 +208,10 @@ def build_codex_policy_template(host_version: str, python_read_root: Path) -> di
             "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
         },
         "policy": policy,
-        "cli": _fixed_codex_cli_profile(),
+        "cli": _fixed_codex_cli_profile(CODEX_POLICY_TEMPLATE_SCHEMA_VERSION),
         "hook_trust": _fixed_codex_hook_trust_template(),
+        "routing": _fixed_codex_routing_template(),
+        "preparation_guidance": _fixed_codex_explicit_routing_preparation_template(),
     }
 
 
@@ -396,7 +468,17 @@ def prepare_evaluation_attempt(
                 "the prepared evaluation installation differs from its bound snapshot",
                 "prepare a new isolated attempt",
             )
-        policy_binding = _prepare_policy_binding(matrix, project_root)
+        policy_binding = _prepare_policy_binding(
+            matrix,
+            project_root,
+            case=case,
+            suite_id=str(plan["suite_id"]),
+            expected_installation={
+                "suite_id": installation["suite_id"],
+                "version": installation["version"],
+                "digest": installation["digest"],
+            },
+        )
         state = {
             "schema_version": PLAN_SCHEMA_VERSION,
             "execution_type": REAL_EXECUTION_TYPE,
@@ -1219,7 +1301,26 @@ def _normalise_matrices(value: object) -> list[dict[str, Any]]:
 def _normalise_codex_policy_template(
     value: dict[str, object], host_version: str
 ) -> dict[str, object]:
-    """Validate a complete alpha.11 policy template without widening it."""
+    """Validate one supported alpha.11 template without upgrading old plans."""
+
+    schema_version = value.get("schema_version")
+    if schema_version == CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION:
+        return _normalise_codex_policy_template_schema1(value, host_version)
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
+        return _normalise_codex_policy_template_schema2(value, host_version)
+    if schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        return _normalise_codex_policy_template_schema3(value, host_version)
+    raise SelcError(
+        "INVALID_EVALUATION_PLAN",
+        "Codex policy template has an unsupported schema version",
+        "regenerate the template on this supported account",
+    )
+
+
+def _normalise_codex_policy_template_schema1(
+    value: dict[str, object], host_version: str
+) -> dict[str, object]:
+    """Preserve the exact schema 1 profile for existing frozen plans."""
 
     required = {
         "schema_version",
@@ -1239,7 +1340,7 @@ def _normalise_codex_policy_template(
         )
     account_home = _trusted_posix_account_home()
     if (
-        value.get("schema_version") != CODEX_POLICY_TEMPLATE_SCHEMA_VERSION
+        value.get("schema_version") != CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION
         or value.get("host") != "codex"
         or value.get("host_version") != host_version
         or host_version != CODEX_ALPHA11_VERSION
@@ -1250,7 +1351,7 @@ def _normalise_codex_policy_template(
             "attempt_project": {"kind": "canonical-attempt-project"},
             "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
         }
-        or value.get("cli") != _fixed_codex_cli_profile()
+        or value.get("cli") != _fixed_codex_cli_profile(CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION)
         or value.get("hook_trust") != _fixed_codex_hook_trust_template()
     ):
         raise SelcError(
@@ -1267,7 +1368,7 @@ def _normalise_codex_policy_template(
         )
     normalized_policy = _normalise_template_policy(policy)
     return {
-        "schema_version": CODEX_POLICY_TEMPLATE_SCHEMA_VERSION,
+        "schema_version": CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION,
         "host": "codex",
         "host_version": host_version,
         "account_home": str(account_home),
@@ -1276,8 +1377,149 @@ def _normalise_codex_policy_template(
             "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
         },
         "policy": normalized_policy,
-        "cli": _fixed_codex_cli_profile(),
+        "cli": _fixed_codex_cli_profile(CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION),
         "hook_trust": _fixed_codex_hook_trust_template(),
+    }
+
+
+def _normalise_codex_policy_template_schema2(
+    value: dict[str, object], host_version: str
+) -> dict[str, object]:
+    """Validate the fixed developer preparation profile without widening it."""
+
+    required = {
+        "schema_version",
+        "host",
+        "host_version",
+        "account_home",
+        "parameters",
+        "policy",
+        "cli",
+        "hook_trust",
+        "preparation_guidance",
+    }
+    if set(value) != required:
+        raise SelcError(
+            "INVALID_EVALUATION_PLAN",
+            "Codex schema 2 policy template has missing or unsupported fields",
+            "generate a new template with evolve policy-template",
+        )
+    account_home = _trusted_posix_account_home()
+    if (
+        value.get("schema_version") != CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION
+        or value.get("host") != "codex"
+        or value.get("host_version") != host_version
+        or host_version != CODEX_ALPHA11_VERSION
+        or account_home is None
+        or value.get("account_home") != str(account_home)
+        or value.get("parameters")
+        != {
+            "attempt_project": {"kind": "canonical-attempt-project"},
+            "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
+        }
+        or value.get("cli")
+        != _fixed_codex_cli_profile(CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION)
+        or value.get("hook_trust") != _fixed_codex_hook_trust_template()
+        or value.get("preparation_guidance") != _fixed_codex_preparation_guidance()
+    ):
+        raise SelcError(
+            "INVALID_EVALUATION_PLAN",
+            "Codex schema 2 policy template is not the fixed alpha.11 profile",
+            "regenerate the template on this supported account",
+        )
+    policy = value.get("policy")
+    if not isinstance(policy, dict):
+        raise SelcError(
+            "INVALID_EVALUATION_PLAN",
+            "Codex policy template has no structured policy",
+            "regenerate the template",
+        )
+    normalized_policy = _normalise_template_policy(policy)
+    return {
+        "schema_version": CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION,
+        "host": "codex",
+        "host_version": host_version,
+        "account_home": str(account_home),
+        "parameters": {
+            "attempt_project": {"kind": "canonical-attempt-project"},
+            "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
+        },
+        "policy": normalized_policy,
+        "cli": _fixed_codex_cli_profile(CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION),
+        "hook_trust": _fixed_codex_hook_trust_template(),
+        "preparation_guidance": _fixed_codex_preparation_guidance(),
+    }
+
+
+def _normalise_codex_policy_template_schema3(
+    value: dict[str, object], host_version: str
+) -> dict[str, object]:
+    """Validate the explicit installed-routing template without changing prior schemas."""
+
+    required = {
+        "schema_version",
+        "host",
+        "host_version",
+        "account_home",
+        "parameters",
+        "policy",
+        "cli",
+        "hook_trust",
+        "routing",
+        "preparation_guidance",
+    }
+    if set(value) != required:
+        raise SelcError(
+            "INVALID_EVALUATION_PLAN",
+            "Codex schema 3 policy template has missing or unsupported fields",
+            "generate a new template with evolve policy-template",
+        )
+    account_home = _trusted_posix_account_home()
+    if (
+        value.get("schema_version") != CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION
+        or value.get("host") != "codex"
+        or value.get("host_version") != host_version
+        or host_version != CODEX_ALPHA11_VERSION
+        or account_home is None
+        or value.get("account_home") != str(account_home)
+        or value.get("parameters")
+        != {
+            "attempt_project": {"kind": "canonical-attempt-project"},
+            "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
+        }
+        or value.get("cli")
+        != _fixed_codex_cli_profile(CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION)
+        or value.get("hook_trust") != _fixed_codex_hook_trust_template()
+        or value.get("routing") != _fixed_codex_routing_template()
+        or value.get("preparation_guidance") != _fixed_codex_explicit_routing_preparation_template()
+    ):
+        raise SelcError(
+            "INVALID_EVALUATION_PLAN",
+            "Codex schema 3 policy template is not the fixed explicit-routing profile",
+            "regenerate the template on this supported account",
+        )
+    policy = value.get("policy")
+    if not isinstance(policy, dict):
+        raise SelcError(
+            "INVALID_EVALUATION_PLAN",
+            "Codex policy template has no structured policy",
+            "regenerate the template",
+        )
+    normalized_policy = _normalise_template_policy(policy)
+    return {
+        "schema_version": CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION,
+        "host": "codex",
+        "host_version": host_version,
+        "account_home": str(account_home),
+        "parameters": {
+            "attempt_project": {"kind": "canonical-attempt-project"},
+            "codex_arg0": {"kind": "current-account-alpha11-bootstrap"},
+        },
+        "policy": normalized_policy,
+        "cli": _fixed_codex_cli_profile(CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION),
+        "hook_trust": _fixed_codex_hook_trust_template(),
+        "routing": _fixed_codex_routing_template(),
+        "preparation_guidance": _fixed_codex_explicit_routing_preparation_template(),
     }
 
 
@@ -1484,7 +1726,113 @@ def _template_parameter_entry(name: str, access: str) -> dict[str, object]:
     return {"path": {"type": "parameter", "name": name}, "access": access}
 
 
-def _fixed_codex_cli_profile() -> dict[str, object]:
+def _fixed_codex_cli_profile(
+    schema_version: int = CODEX_POLICY_TEMPLATE_SCHEMA_VERSION,
+) -> dict[str, object]:
+    """Return the exact CLI profile for the template's declared schema."""
+
+    if schema_version == CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION:
+        return _fixed_codex_cli_profile_schema1()
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
+        profile = _fixed_codex_cli_profile_schema1()
+        settings = dict(profile["settings"])
+        settings["developer_instructions"] = CODEX_FIXED_PREPARATION_INSTRUCTIONS
+        profile["settings"] = settings
+        return profile
+    if schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        return _fixed_codex_cli_profile_schema1()
+    raise SelcError(
+        "INVALID_EVALUATION_PLAN",
+        "Codex policy template has an unsupported schema version",
+        "regenerate the template on this supported account",
+    )
+
+
+def _fixed_codex_routing_template() -> dict[str, object]:
+    """Declare the only dynamic value that schema 3 may render into guidance."""
+
+    return {
+        "schema_version": 1,
+        "parameter": CODEX_EXPLICIT_ROUTING_PARAMETER,
+        "renderer": CODEX_EXPLICIT_ROUTING_RENDERER,
+    }
+
+
+def _fixed_codex_explicit_routing_preparation_template() -> dict[str, object]:
+    """Describe the schema-3 literal before an installed entry is available."""
+
+    return {
+        "schema_version": CODEX_PREPARATION_GUIDANCE_SCHEMA_VERSION,
+        "role": "developer",
+        "content_kind": CODEX_PREPARATION_GUIDANCE_CONTENT_KIND,
+        "instruction_template": CODEX_EXPLICIT_ROUTING_PREPARATION_INSTRUCTION_TEMPLATE,
+        "summary": CODEX_EXPLICIT_ROUTING_PREPARATION_SUMMARY,
+    }
+
+
+def _render_codex_explicit_routing_instructions(routing_command: str) -> str:
+    """Render one schema-3 developer fragment from a verified two-argument command."""
+
+    try:
+        argv = shlex.split(routing_command, posix=True)
+    except ValueError as error:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the installed routing command is not a literal shell argv",
+            "prepare a new evaluation attempt",
+        ) from error
+    if (
+        len(argv) != 2
+        or argv[0] != "/bin/cat"
+        or not Path(argv[1]).is_absolute()
+        or routing_command != shlex.join(argv)
+    ):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the installed routing command is not the one allowed cat invocation",
+            "prepare a new evaluation attempt",
+        )
+    return CODEX_EXPLICIT_ROUTING_PREPARATION_INSTRUCTION_TEMPLATE.format(
+        routing_command=routing_command
+    )
+
+
+def _bound_codex_explicit_routing_preparation_guidance(
+    template: dict[str, object], routing: object
+) -> dict[str, object]:
+    """Return the exact private schema-3 fragment summary for a routing binding."""
+
+    if (
+        template.get("routing") != _fixed_codex_routing_template()
+        or template.get("preparation_guidance")
+        != _fixed_codex_explicit_routing_preparation_template()
+        or not isinstance(routing, dict)
+    ):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the schema 3 routing template is incomplete",
+            "prepare a new evaluation attempt",
+        )
+    command = routing.get("command")
+    if not isinstance(command, str):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the schema 3 routing command is unavailable",
+            "prepare a new evaluation attempt",
+        )
+    instructions = _render_codex_explicit_routing_instructions(command)
+    return {
+        "schema_version": CODEX_PREPARATION_GUIDANCE_SCHEMA_VERSION,
+        "role": "developer",
+        "content_kind": CODEX_PREPARATION_GUIDANCE_CONTENT_KIND,
+        "digest": hashlib.sha256(instructions.encode("utf-8")).hexdigest(),
+        "summary": CODEX_EXPLICIT_ROUTING_PREPARATION_SUMMARY,
+    }
+
+
+def _fixed_codex_cli_profile_schema1() -> dict[str, object]:
+    """Return the original schema 1 profile without a preparation fragment."""
+
     return {
         "approval_policy": "never",
         "ignore_user_config": True,
@@ -1500,6 +1848,18 @@ def _fixed_codex_cli_profile() -> dict[str, object]:
             "project_doc_max_bytes": 0,
             "project_root_markers": [],
         },
+    }
+
+
+def _fixed_codex_preparation_guidance() -> dict[str, object]:
+    """Bind the independent summary for the fixed developer fragment."""
+
+    return {
+        "schema_version": CODEX_PREPARATION_GUIDANCE_SCHEMA_VERSION,
+        "role": "developer",
+        "content_kind": CODEX_PREPARATION_GUIDANCE_CONTENT_KIND,
+        "digest": hashlib.sha256(CODEX_FIXED_PREPARATION_INSTRUCTIONS.encode("utf-8")).hexdigest(),
+        "summary": CODEX_FIXED_PREPARATION_SUMMARY,
     }
 
 
@@ -1523,7 +1883,14 @@ def _fixed_codex_hook_trust_template() -> dict[str, object]:
     }
 
 
-def _prepare_policy_binding(matrix: dict[str, Any], project_root: Path) -> dict[str, object]:
+def _prepare_policy_binding(
+    matrix: dict[str, Any],
+    project_root: Path,
+    *,
+    case: dict[str, Any] | None = None,
+    suite_id: str | None = None,
+    expected_installation: dict[str, object] | None = None,
+) -> dict[str, object]:
     """Bind the only runtime policy parameters before a host can start."""
 
     if _qualification_support(matrix) != "supported":
@@ -1561,12 +1928,182 @@ def _prepare_policy_binding(matrix: dict[str, Any], project_root: Path) -> dict[
         "cli": template["cli"],
         "hook_trust": template["hook_trust"],
     }
-    return {
+    schema_version = template.get("schema_version")
+    bound_routing: dict[str, object] | None = None
+    bound_guidance: dict[str, object] | None = None
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
+        configuration["preparation_guidance"] = template["preparation_guidance"]
+    elif schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        bound_routing = _prepare_explicit_routing_binding(
+            project_root,
+            case=case,
+            suite_id=suite_id,
+            expected_installation=expected_installation,
+        )
+        bound_guidance = _bound_codex_explicit_routing_preparation_guidance(
+            template,
+            bound_routing,
+        )
+        configuration["routing"] = bound_routing
+        configuration["preparation_guidance"] = bound_guidance
+    binding = {
         "status": "bound",
         "template_hash": template_hash,
         "mapping": mapping,
         "cli_configuration": configuration,
         "cli_configuration_hash": json_hash(configuration),
+    }
+    if bound_routing is not None and bound_guidance is not None:
+        binding["routing"] = bound_routing
+        binding["preparation_guidance"] = bound_guidance
+    return binding
+
+
+def _prepare_explicit_routing_binding(
+    project_root: Path,
+    *,
+    case: dict[str, Any] | None,
+    suite_id: str | None,
+    expected_installation: dict[str, object] | None,
+) -> dict[str, object]:
+    """Derive one schema-3 routing command from frozen request and installation state.
+
+    The explicit developer instruction may contain an absolute route, but that
+    route is private attempt evidence. It is always reconstructed from the
+    frozen request and the current installer-owned registration; no request
+    state or caller argument can substitute the route or selected skill.
+    """
+
+    if not isinstance(case, dict) or not isinstance(suite_id, str) or not suite_id:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "schema 3 requires a frozen case and suite identity",
+            "prepare a new evaluation attempt",
+        )
+    try:
+        installation = current_installation(project_root, suite_id)
+        current_root = install_root(project_root) / suite_id / "current"
+        if not current_root.is_symlink() or portable_tree_hash(current_root) != installation.get(
+            "digest"
+        ):
+            raise SelcError(
+                "ATTEMPT_TAMPERED",
+                "the current installation does not match its registered contents",
+                "repair the isolated installation before launching",
+            )
+        if expected_installation is not None and (
+            expected_installation.get("suite_id") != suite_id
+            or expected_installation.get("version") != installation.get("version")
+            or expected_installation.get("digest") != installation.get("digest")
+        ):
+            raise SelcError(
+                "ATTEMPT_TAMPERED",
+                "the current installation differs from the prepared schema 3 binding",
+                "prepare a new evaluation attempt",
+            )
+        manifest = load_manifest(current_root)
+        declared_skills = {entry["name"] for entry in normalize_declared_skills(manifest["skills"])}
+        actions = managed_configuration(manifest, current_root)
+    except (KeyError, OSError, SelcError, TypeError) as error:
+        if isinstance(error, SelcError):
+            raise
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the installed schema 3 routing source is unavailable",
+            "repair the isolated installation before launching",
+        ) from error
+
+    request_text = case.get("request")
+    if not isinstance(request_text, str) or not request_text:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the frozen schema 3 request is unavailable",
+            "prepare a new evaluation attempt",
+        )
+    try:
+        request = _managed_prompt_request("codex", {"prompt": request_text})
+    except SelcError as error:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the frozen schema 3 request has an unsupported shape",
+            "prepare a new evaluation attempt",
+        ) from error
+    skill = request.get("skill")
+    business_input = request.get("input")
+    if (
+        set(request) != {"skill", "input", "raw_prompt_digest"}
+        or not isinstance(skill, str)
+        or skill not in declared_skills
+        or not isinstance(business_input, dict)
+    ):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "schema 3 requires one explicit declared skill and JSON input",
+            "use the frozen @skill JSON request without automatic selection",
+        )
+    selected_actions = [
+        (action_id, action) for action_id, action in actions.items() if action.get("skill") == skill
+    ]
+    if (
+        len(selected_actions) != 1
+        or selected_actions[0][1].get("kind") != "python-script-v1"
+        or not isinstance(selected_actions[0][1].get("script"), str)
+    ):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "schema 3 requires one declared fixed-script action for the selected skill",
+            "repair the frozen request or installed managed declaration",
+        )
+    action_id, action = selected_actions[0]
+    try:
+        _validate_action_request(action, business_input)
+    except SelcError as error:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the frozen schema 3 JSON input does not match the declared fixed action",
+            "repair the frozen request before preparing an attempt",
+        ) from error
+    if not _request_uses_attempt_input(business_input, project_root / "evaluation-input.json"):
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the frozen schema 3 request does not select this attempt input",
+            "prepare a new evaluation attempt with the bound input path",
+        )
+
+    routing_path = project_root / ".agents" / "skills" / skill / "SKILL.md"
+    command = shlex.join(("/bin/cat", str(routing_path)))
+    discovery = _discovery_read_binding(project_root, suite_id, installation, command)
+    if discovery is None or discovery.get("skill") != skill:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the selected schema 3 routing entry is not installer-owned",
+            "repair the isolated installation before launching",
+        )
+    return {
+        "schema_version": 1,
+        "skill": skill,
+        "action": action_id,
+        "action_kind": action["kind"],
+        "action_script": action["script"],
+        "entry_path": str(routing_path),
+        "command": command,
+        "installation": {
+            "suite_id": suite_id,
+            "version": installation["version"],
+            "composite": installation["digest"],
+        },
+        "entry": {
+            "hash": discovery["entry_hash"],
+            "size": discovery["entry_size"],
+            "device": discovery["entry_device"],
+            "inode": discovery["entry_inode"],
+        },
+        "reader": {
+            "hash": discovery["reader_hash"],
+            "size": discovery["reader_size"],
+            "device": discovery["reader_device"],
+            "inode": discovery["reader_inode"],
+        },
     }
 
 
@@ -1574,10 +2111,10 @@ def _qualification_support(matrix: dict[str, Any]) -> str:
     """Return the evaluator's derived native-attribution support state.
 
     WorkBuddy has a prepared external runner and existing business compatibility
-    coverage, but this evaluator has no bounded WorkBuddy native reconstruction
-    parser.  Its plan entries therefore remain executable preparation records
-    whose collection is intentionally unverified rather than routed through the
-    Codex-only parser.
+    coverage. Its bounded native session parser reports diagnostics only because
+    the session format cannot prove the complete effective policy. Plan entries
+    therefore remain executable preparation records whose collection is
+    intentionally unverified rather than routed through Codex qualification.
     """
 
     if matrix.get("host") == "codex" and not _has_supported_codex_hook_trust_template(matrix):
@@ -2184,7 +2721,13 @@ def _assert_attempt_identity(
             "attempt installation does not match the exact bound portable snapshot",
             "prepare a new attempt",
         )
-    expected_policy_binding = _prepare_policy_binding(matrix, Path(expected_paths["project_root"]))
+    expected_policy_binding = _prepare_policy_binding(
+        matrix,
+        Path(expected_paths["project_root"]),
+        case=case,
+        suite_id=str(plan["suite_id"]),
+        expected_installation=installation,
+    )
     if state.get("policy_binding") != expected_policy_binding:
         raise SelcError(
             "ATTEMPT_TAMPERED",
@@ -2233,10 +2776,13 @@ def _reconstruct_attempt(state: dict[str, Any]) -> dict[str, Any]:
         )
         if qualification_reason == "native-attribution-unverified-for-workbuddy":
             qualification_reason = "native-attribution-unverified-workbuddy"
-        return {
+        result: dict[str, Any] = {
             "status": "unknown",
             "reason": f"qualification-{qualification_reason}",
         }
+        if matrix.get("host") == "workbuddy":
+            result["diagnostics"] = _workbuddy_session_diagnostics(state, matrix)
+        return result
     if matrix.get("adapter") == "codex-cli":
         launch_failure = _codex_cli_launch_trust_failure(state, matrix)
         if launch_failure is not None:
@@ -2378,7 +2924,7 @@ def _reconstruct_attempt(state: dict[str, Any]) -> dict[str, Any]:
         checked = check_artifact(request, builtin_registry())
     except (KeyError, TypeError, ValueError):
         return {"status": "unknown", "reason": "checker-reconstruction-failed"}
-    return {
+    result = {
         "status": checked.status,
         "checker_status": checked.status,
         "one_shot_result": row["first_result"],
@@ -2401,6 +2947,10 @@ def _reconstruct_attempt(state: dict[str, Any]) -> dict[str, Any]:
             "validated_mapping": native_context["validated_policy_mapping"],
         },
     }
+    preparation_guidance = native_context.get("preparation_guidance")
+    if isinstance(preparation_guidance, dict):
+        result["preparation_guidance"] = preparation_guidance
+    return result
 
 
 def _production_row_matches(
@@ -2548,19 +3098,45 @@ def _read_attempt_native_context(
     if project_root is None:
         return None
     try:
-        expected_binding = _prepare_policy_binding(matrix, project_root)
+        expected_binding = _prepare_policy_binding(
+            matrix,
+            project_root,
+            case=state.get("case") if isinstance(state.get("case"), dict) else None,
+            suite_id=str(state.get("installation", {}).get("suite_id", ""))
+            if isinstance(state.get("installation"), dict)
+            else None,
+            expected_installation=state.get("installation")
+            if isinstance(state.get("installation"), dict)
+            else None,
+        )
     except SelcError:
         return None
     policy_binding = state.get("policy_binding")
     if policy_binding != expected_binding or expected_binding.get("status") != "bound":
         return None
-    parsed = _native_session_facts(raw, expected_prompt, resolved_path, project_root)
-    if parsed is None:
-        return None
-    model, surface, session_id, turn_id, host_version, policy, tool_call_ids = parsed
     template = matrix.get("tools_policy_template")
     if not isinstance(template, dict):
         return None
+    parsed = _native_session_facts(
+        raw,
+        expected_prompt,
+        resolved_path,
+        project_root,
+        template,
+        expected_binding,
+    )
+    if parsed is None:
+        return None
+    (
+        model,
+        surface,
+        session_id,
+        turn_id,
+        host_version,
+        policy,
+        tool_call_ids,
+        preparation_guidance,
+    ) = parsed
     validated_mapping = _match_codex_native_policy(policy, template, expected_binding)
     if validated_mapping is None:
         return None
@@ -2571,7 +3147,7 @@ def _read_attempt_native_context(
         or host_version != matrix["host_version"]
     ):
         return None
-    return {
+    context = {
         "model": model,
         "host_version": host_version,
         "surface": surface,
@@ -2591,11 +3167,769 @@ def _read_attempt_native_context(
         "tool_call_ids": json.dumps(sorted(tool_call_ids)),
         "raw": raw,
     }
+    if preparation_guidance is not None:
+        context["preparation_guidance"] = preparation_guidance
+    return context
+
+
+def _workbuddy_session_diagnostics(
+    state: dict[str, Any], matrix: dict[str, Any]
+) -> dict[str, object]:
+    """Read limited WorkBuddy 5.9.2 session facts without qualifying a run.
+
+    This parser accepts only a preserved native JSONL cutoff and the existing
+    locator identity.  It intentionally returns no effective permission or
+    initial-tools policy because ordinary WorkBuddy session records do not
+    contain the session's complete policy.
+    """
+
+    if matrix.get("host") != "workbuddy":
+        return _workbuddy_unavailable_diagnostics(matrix, "workbuddy-host-unavailable")
+    if matrix.get("host_version") != WORKBUDDY_OBSERVED_SERIALIZER_VERSION:
+        return _workbuddy_unavailable_diagnostics(matrix, "workbuddy-serializer-unavailable")
+
+    session_root = _resolved_directory(state.get("session_root"))
+    if session_root is None:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-evidence-unrecorded")
+    evidence_path = session_root / "native-evidence.json"
+    if not evidence_path.is_file() or evidence_path.is_symlink():
+        return _workbuddy_unavailable_diagnostics(matrix, "native-evidence-unrecorded")
+    try:
+        evidence = read_json(evidence_path)
+    except (OSError, SelcError):
+        return _workbuddy_unavailable_diagnostics(matrix, "native-evidence-invalid")
+
+    raw_path_value = evidence.get("raw_session_path")
+    raw_hash = evidence.get("raw_session_sha256")
+    cutoff = evidence.get("raw_session_cutoff_bytes")
+    expected_path_hash = evidence.get("raw_session_path_hash")
+    expected_device = evidence.get("raw_session_device")
+    expected_inode = evidence.get("raw_session_inode")
+    if (
+        evidence.get("attempt_id") != _attempt_id(state)
+        or not isinstance(raw_path_value, str)
+        or not _is_digest(raw_hash)
+        or type(cutoff) is not int
+        or cutoff < 1
+        or cutoff > MAX_NATIVE_SESSION_CUTOFF_BYTES
+        or not _is_digest(expected_path_hash)
+        or type(expected_device) is not int
+        or type(expected_inode) is not int
+    ):
+        return _workbuddy_unavailable_diagnostics(matrix, "native-evidence-invalid")
+
+    raw_path = Path(raw_path_value)
+    if not raw_path.is_absolute() or raw_path.suffix != ".jsonl" or not raw_path.stem:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-evidence-invalid")
+    try:
+        resolved_path = raw_path.resolve(strict=True)
+        raw_lstat = raw_path.lstat()
+        raw_stat = resolved_path.stat()
+    except OSError:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-evidence-invalid")
+    if (
+        raw_path != resolved_path
+        or stat.S_ISLNK(raw_lstat.st_mode)
+        or not stat.S_ISREG(raw_lstat.st_mode)
+        or not stat.S_ISREG(raw_stat.st_mode)
+        or raw_stat.st_size < cutoff
+    ):
+        return _workbuddy_unavailable_diagnostics(matrix, "native-evidence-invalid")
+
+    session_id = raw_path.stem
+    project_root = _resolved_directory(state.get("project_root"))
+    if project_root is None:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-evidence-invalid")
+    try:
+        _verify_native_history_path(
+            project_root,
+            {"session_id": session_id},
+            "workbuddy",
+            resolved_path,
+        )
+    except SelcError:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-evidence-invalid")
+
+    path_hash = hashlib.sha256(str(resolved_path).encode("utf-8")).hexdigest()
+    if (
+        expected_path_hash != path_hash
+        or expected_device != raw_stat.st_dev
+        or expected_inode != raw_stat.st_ino
+    ):
+        return _workbuddy_unavailable_diagnostics(matrix, "native-evidence-invalid")
+    raw = _read_native_session_prefix(resolved_path, cutoff, raw_stat)
+    if raw is None or hashlib.sha256(raw).hexdigest() != raw_hash:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-evidence-invalid")
+
+    parsed_lines = _strict_jsonl_records(raw)
+    if parsed_lines is None:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+    records = [record for _line, record in parsed_lines]
+    if not _workbuddy_records_match_session_scope(records, session_id, project_root):
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+    metadata_lines: list[bytes] = []
+    metadata_records: list[dict[str, object]] = []
+    for line, record in parsed_lines:
+        if record.get("type") != "session-meta":
+            break
+        metadata_lines.append(line)
+        metadata_records.append(record)
+    if not metadata_records or not _metadata_only_prefix(
+        b"".join(metadata_lines),
+        host="workbuddy",
+        session_id=session_id,
+        cwd=project_root,
+    ):
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+
+    metadata_host_kind = _workbuddy_metadata_host_kind(metadata_records)
+    if metadata_host_kind is _INVALID_WORKBUDDY_METADATA:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+    host_kind = metadata_host_kind
+
+    request_path = _resolved_file(state.get("request_path"))
+    if request_path is None:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+    try:
+        request = read_json(request_path)
+        expected_prompt = request["request"]
+    except (KeyError, OSError, SelcError):
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+    if not isinstance(expected_prompt, str):
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+
+    record_ids = _workbuddy_record_ids(records)
+    if record_ids is None:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+    records_by_id = {str(record["id"]): record for record in record_ids}
+    result_by_call_id = _workbuddy_call_result_index(records)
+    if result_by_call_id is None:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+
+    raw_prompt_digest = hashlib.sha256(expected_prompt.encode("utf-8")).hexdigest()
+    request_boundaries = _workbuddy_verified_request_boundaries(
+        records,
+        session_id=session_id,
+        cwd=project_root,
+        raw_prompt_digest=raw_prompt_digest,
+    )
+    if len(request_boundaries) != 1:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+    user_record, request_id = request_boundaries[0]
+    user_id = str(user_record["id"])
+
+    model_attribution = _workbuddy_model_attribution(
+        records,
+        records_by_id=records_by_id,
+        result_by_call_id=result_by_call_id,
+        session_id=session_id,
+        cwd=project_root,
+        request_id=request_id,
+        user_id=user_id,
+    )
+    if model_attribution is None:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+    model, request_model_id, request_model_name = model_attribution
+    expected_model = matrix.get("model")
+    if not isinstance(expected_model, str) or model != expected_model:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+
+    observed_tools = _workbuddy_observed_tools(
+        records,
+        records_by_id=records_by_id,
+        session_id=session_id,
+        cwd=project_root,
+        request_id=request_id,
+        user_id=user_id,
+        model=model,
+        result_by_call_id=result_by_call_id,
+    )
+    if observed_tools is None:
+        return _workbuddy_unavailable_diagnostics(matrix, "native-session-records-unverified")
+
+    diagnostics = _workbuddy_unavailable_diagnostics(
+        matrix,
+        "workbuddy-effective-policy-unavailable",
+    )
+    diagnostics.update(
+        {
+            "model": model,
+            "request_model_id": request_model_id,
+            "request_model_name": request_model_name,
+            "session_id": session_id,
+            "request_id": request_id,
+            "host_kind": host_kind,
+            "host_kind_source": "session-meta.meta.codebuddy.ai/hostKind"
+            if host_kind is not None
+            else "unavailable",
+            "app_version": matrix["host_version"],
+            "app_version_source": "matrix.host_version",
+            "model_attribution_verified": True,
+            "parent_chain_verified": True,
+            "observed_tool_names": [tool["name"] for tool in observed_tools],
+            "observed_tools": observed_tools,
+            "native_evidence": {
+                "source": "session/native-evidence.json",
+                "cutoff_digest": raw_hash,
+                "cutoff_bytes": cutoff,
+                "path_hash": path_hash,
+                "device": raw_stat.st_dev,
+                "inode": raw_stat.st_ino,
+            },
+        }
+    )
+    return diagnostics
+
+
+def _workbuddy_unavailable_diagnostics(
+    matrix: dict[str, Any], unavailable_reason: str
+) -> dict[str, object]:
+    """Return an explicitly unqualified WorkBuddy diagnostic result."""
+
+    return {
+        "schema_version": WORKBUDDY_SESSION_DIAGNOSTICS_SCHEMA_VERSION,
+        "parser": WORKBUDDY_SESSION_DIAGNOSTICS_PARSER,
+        "model": None,
+        "request_model_id": None,
+        "request_model_name": None,
+        "session_id": None,
+        "request_id": None,
+        "host_kind": None,
+        "host_kind_source": "unavailable",
+        "app_version": matrix.get("host_version")
+        if isinstance(matrix.get("host_version"), str)
+        else None,
+        "app_version_source": "matrix.host_version"
+        if isinstance(matrix.get("host_version"), str)
+        else "unavailable",
+        "surface": None,
+        "surface_source": "unavailable",
+        "matrix_surface": matrix.get("surface") if isinstance(matrix.get("surface"), str) else None,
+        "matrix_surface_source": "matrix"
+        if isinstance(matrix.get("surface"), str)
+        else "unavailable",
+        "model_attribution_verified": False,
+        "parent_chain_verified": False,
+        "observed_tool_names": [],
+        "observed_tools": [],
+        "permission_mode": None,
+        "initial_tool_names": None,
+        "qualification_support": "unverified",
+        "reason": "workbuddy-effective-policy-unavailable",
+        "unavailable_reasons": _workbuddy_unavailable_reasons(unavailable_reason),
+    }
+
+
+def _workbuddy_unavailable_reasons(unavailable_reason: str) -> list[str]:
+    reasons = [unavailable_reason]
+    if unavailable_reason != "workbuddy-effective-policy-unavailable":
+        reasons.append("workbuddy-effective-policy-unavailable")
+    return reasons
+
+
+def _read_native_session_prefix(
+    path: Path, cutoff: int, expected_stat: os.stat_result
+) -> bytes | None:
+    """Read exactly one bounded regular-file cutoff without following links."""
+
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        opened_stat = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(opened_stat.st_mode)
+            or opened_stat.st_dev != expected_stat.st_dev
+            or opened_stat.st_ino != expected_stat.st_ino
+            or opened_stat.st_size < cutoff
+        ):
+            return None
+        chunks: list[bytes] = []
+        remaining = cutoff
+        while remaining:
+            chunk = os.read(descriptor, min(64 * 1024, remaining))
+            if not chunk:
+                return None
+            chunks.append(chunk)
+            remaining -= len(chunk)
+    finally:
+        os.close(descriptor)
+    try:
+        final_stat = path.stat()
+    except OSError:
+        return None
+    if final_stat.st_dev != expected_stat.st_dev or final_stat.st_ino != expected_stat.st_ino:
+        return None
+    return b"".join(chunks)
+
+
+def _strict_jsonl_records(raw: bytes) -> list[tuple[bytes, dict[str, object]]] | None:
+    """Decode complete UTF-8 JSONL lines while preserving their original bytes."""
+
+    if not raw or not raw.endswith(b"\n"):
+        return None
+    parsed: list[tuple[bytes, dict[str, object]]] = []
+    for line in raw.splitlines(keepends=True):
+        if not line.endswith(b"\n") or line in {b"\n", b"\r\n"}:
+            return None
+        try:
+            record = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(record, dict):
+            return None
+        parsed.append((line, record))
+    return parsed or None
+
+
+def _workbuddy_metadata_host_kind(
+    metadata_records: list[dict[str, object]],
+) -> str | None | object:
+    """Read only the observed nested host-kind field from session metadata."""
+
+    host_kinds: set[str] = set()
+    for record in metadata_records:
+        metadata = record.get("meta")
+        if metadata is None:
+            continue
+        if not isinstance(metadata, dict):
+            return _INVALID_WORKBUDDY_METADATA
+        if "codebuddy.ai/hostKind" not in metadata:
+            continue
+        host_kind = metadata["codebuddy.ai/hostKind"]
+        if not isinstance(host_kind, str) or not host_kind:
+            return _INVALID_WORKBUDDY_METADATA
+        host_kinds.add(host_kind)
+    if len(host_kinds) > 1:
+        return _INVALID_WORKBUDDY_METADATA
+    return next(iter(host_kinds), None)
+
+
+def _workbuddy_record_ids(
+    records: list[dict[str, object]],
+) -> list[dict[str, object]] | None:
+    """Reject duplicate or malformed native record IDs before building an index."""
+
+    identified_records: list[dict[str, object]] = []
+    for record in records:
+        if "id" not in record:
+            continue
+        identifier = record["id"]
+        if not isinstance(identifier, str) or not identifier:
+            return None
+        identified_records.append(record)
+    if not _workbuddy_native_ids_are_unique([], identified_records):
+        return None
+    return identified_records
+
+
+def _workbuddy_records_match_session_scope(
+    records: list[dict[str, object]], session_id: str, cwd: Path
+) -> bool:
+    """Reject records that claim a different native session or project."""
+
+    expected_cwd = str(cwd)
+    for record in records:
+        record_session = record.get("sessionId")
+        record_cwd = record.get("cwd")
+        if record_session is not None and record_session != session_id:
+            return False
+        if record_cwd is not None and record_cwd != expected_cwd:
+            return False
+    return True
+
+
+def _workbuddy_call_result_index(
+    records: list[dict[str, object]],
+) -> dict[str, dict[str, object]] | None:
+    """Index one completed result per call after validating observed result shapes."""
+
+    calls_by_id: dict[str, dict[str, object]] = {}
+    results_by_call_id: dict[str, dict[str, object]] = {}
+    for record in records:
+        record_type = record.get("type")
+        if record_type not in {"function_call", "function_call_result"}:
+            continue
+        call_id = record.get("callId")
+        record_id = record.get("id")
+        if (
+            not isinstance(record_id, str)
+            or not record_id
+            or not isinstance(call_id, str)
+            or not call_id
+        ):
+            return None
+        if record_type == "function_call":
+            if call_id in calls_by_id:
+                return None
+            calls_by_id[call_id] = record
+            continue
+        if (
+            record.get("status") != "completed"
+            or call_id in results_by_call_id
+            or not isinstance(record.get("output"), (dict, list))
+        ):
+            return None
+        results_by_call_id[call_id] = record
+    if set(results_by_call_id) - set(calls_by_id):
+        return None
+    return results_by_call_id
+
+
+def _workbuddy_verified_request_boundaries(
+    records: list[dict[str, object]],
+    *,
+    session_id: str,
+    cwd: Path,
+    raw_prompt_digest: str,
+) -> list[tuple[dict[str, object], str]]:
+    """Find the one current user request that exactly binds the frozen prompt."""
+
+    boundaries: list[tuple[dict[str, object], str]] = []
+    for record in records:
+        provider = record.get("providerData")
+        request_id = provider.get("conversationRequestId") if isinstance(provider, dict) else None
+        if (
+            not isinstance(request_id, str)
+            or not request_id
+            or not isinstance(record.get("id"), str)
+        ):
+            continue
+        if _workbuddy_user_message_is_verified(
+            record,
+            session_id=session_id,
+            cwd=cwd,
+            request_id=request_id,
+            raw_prompt_digest=raw_prompt_digest,
+            message_id=record["id"],
+        ):
+            boundaries.append((record, request_id))
+    return boundaries
+
+
+def _workbuddy_model_attribution(
+    records: list[dict[str, object]],
+    *,
+    records_by_id: dict[str, dict[str, object]],
+    result_by_call_id: dict[str, dict[str, object]],
+    session_id: str,
+    cwd: Path,
+    request_id: str,
+    user_id: str,
+) -> tuple[str, str, str] | None:
+    """Aggregate one consistent model identity across the current request's steps."""
+
+    actual_models: set[str] = set()
+    request_models: set[tuple[str, str]] = set()
+    for record in records:
+        provider = record.get("providerData")
+        if not isinstance(provider, dict) or provider.get("conversationRequestId") != request_id:
+            continue
+        record_type = record.get("type")
+        if record_type == "message" and record.get("role") == "user":
+            continue
+        if record_type not in {"reasoning", "message", "function_call"}:
+            continue
+        if not _workbuddy_record_has_explicit_scope(record, session_id, cwd):
+            return None
+        identity = _workbuddy_model_identity(record, request_id)
+        if identity is None:
+            return None
+        _message_id, actual_model = identity
+        actual_models.add(actual_model)
+        request_model_id = provider.get("requestModelId")
+        request_model_name = provider.get("requestModelName")
+        if (request_model_id is None) != (request_model_name is None):
+            return None
+        if request_model_id is not None:
+            if (
+                not isinstance(request_model_id, str)
+                or not request_model_id
+                or not isinstance(request_model_name, str)
+                or not request_model_name
+            ):
+                return None
+            request_models.add((request_model_id, request_model_name))
+        if record_type != "message" or record.get("role") != "assistant":
+            continue
+        if (
+            not _workbuddy_assistant_parent_is_verified(
+                record,
+                records_by_id=records_by_id,
+                result_by_call_id=result_by_call_id,
+                session_id=session_id,
+                cwd=cwd,
+                request_id=request_id,
+            )
+            or not _workbuddy_parent_chain_is_complete(
+                records_by_id,
+                record,
+                session_id,
+                str(cwd),
+                request_id,
+            )
+            or not _workbuddy_record_has_ancestor(records_by_id, record, user_id)
+        ):
+            return None
+    if len(actual_models) != 1 or len(request_models) != 1:
+        return None
+    model = next(iter(actual_models))
+    request_model_id, request_model_name = next(iter(request_models))
+    return model, request_model_id, request_model_name
+
+
+def _workbuddy_assistant_parent_is_verified(
+    record: dict[str, object],
+    *,
+    records_by_id: dict[str, dict[str, object]],
+    result_by_call_id: dict[str, dict[str, object]],
+    session_id: str,
+    cwd: Path,
+    request_id: str,
+) -> bool:
+    """Accept the observed reasoning or completed-result assistant parents."""
+
+    parent_id = record.get("parentId")
+    parent = records_by_id.get(parent_id) if isinstance(parent_id, str) else None
+    assistant_identity = _workbuddy_model_identity(record, request_id)
+    assistant_step = _workbuddy_model_step_sequence(record)
+    if parent is None or assistant_identity is None or assistant_step is None:
+        return False
+
+    if parent.get("type") == "reasoning":
+        reasoning_identity = _workbuddy_model_identity(parent, request_id)
+        reasoning_step = _workbuddy_model_step_sequence(parent)
+        return (
+            _workbuddy_assistant_text_is_verified(
+                record,
+                session_id=session_id,
+                cwd=cwd,
+                request_id=request_id,
+                reasoning_id=parent_id,
+                reasoning_identity=reasoning_identity,
+                reasoning_step_sequence=reasoning_step,
+            )
+            is not None
+        )
+
+    parent_context = _workbuddy_completed_result_parent_context(
+        records_by_id,
+        result_by_call_id,
+        parent,
+        session_id=session_id,
+        cwd=cwd,
+        request_id=request_id,
+    )
+    if parent_context is None:
+        return False
+    parent_identity, parent_step = parent_context
+    return (
+        record.get("type") == "message"
+        and record.get("role") == "assistant"
+        and record.get("status") == "completed"
+        and _workbuddy_record_has_explicit_scope(record, session_id, cwd)
+        and assistant_identity[1] == parent_identity[1]
+        and assistant_identity[0] != parent_identity[0]
+        and assistant_step > parent_step
+    )
+
+
+def _workbuddy_completed_result_parent_context(
+    records_by_id: dict[str, dict[str, object]],
+    result_by_call_id: dict[str, dict[str, object]],
+    result: dict[str, object],
+    *,
+    session_id: str,
+    cwd: Path,
+    request_id: str,
+) -> tuple[tuple[str, str], int] | None:
+    """Bind a next step to one indexed, completed current-request result."""
+
+    call_id = result.get("callId")
+    call_record_id = result.get("parentId")
+    call = records_by_id.get(call_record_id) if isinstance(call_record_id, str) else None
+    if (
+        result.get("type") != "function_call_result"
+        or result.get("status") != "completed"
+        or not isinstance(call_id, str)
+        or not call_id
+        or result_by_call_id.get(call_id) is not result
+        or not _workbuddy_record_has_explicit_scope(result, session_id, cwd)
+        or not isinstance(result.get("providerData"), dict)
+        or result["providerData"].get("conversationRequestId") != request_id
+        or call is None
+        or call.get("type") != "function_call"
+        or call.get("callId") != call_id
+        or not _workbuddy_record_has_explicit_scope(call, session_id, cwd)
+    ):
+        return None
+    call_identity = _workbuddy_model_identity(call, request_id)
+    call_step = _workbuddy_model_step_sequence(call)
+    if call_identity is None or call_step is None:
+        return None
+    return call_identity, call_step
+
+
+def _workbuddy_record_has_ancestor(
+    records_by_id: dict[str, dict[str, object]], record: dict[str, object], ancestor_id: str
+) -> bool:
+    """Confirm a parent chain reaches the exact prompt-bound user record."""
+
+    current = record
+    visited: set[str] = set()
+    while True:
+        parent_id = current.get("parentId")
+        if not isinstance(parent_id, str) or not parent_id or parent_id in visited:
+            return False
+        if parent_id == ancestor_id:
+            return True
+        visited.add(parent_id)
+        parent = records_by_id.get(parent_id)
+        if parent is None:
+            return False
+        current = parent
+
+
+def _workbuddy_observed_tools(
+    records: list[dict[str, object]],
+    *,
+    records_by_id: dict[str, dict[str, object]],
+    session_id: str,
+    cwd: Path,
+    request_id: str,
+    user_id: str,
+    model: str,
+    result_by_call_id: dict[str, dict[str, object]],
+) -> list[dict[str, str]] | None:
+    """List only completed current-request tool calls from the native cutoff."""
+
+    completed_result_call_ids: set[str] = set()
+    observed: list[dict[str, str]] = []
+    observed_names: set[str] = set()
+    for call in records:
+        if call.get("type") != "function_call":
+            continue
+        provider = call.get("providerData")
+        if not isinstance(provider, dict) or provider.get("conversationRequestId") != request_id:
+            continue
+        identity = _workbuddy_model_identity(call, request_id)
+        call_id = call.get("callId")
+        tool_name = call.get("name")
+        parent_id = call.get("parentId")
+        parent = records_by_id.get(parent_id) if isinstance(parent_id, str) else None
+        parent_identity = (
+            _workbuddy_model_identity(parent, request_id) if parent is not None else None
+        )
+        call_step = _workbuddy_model_step_sequence(call)
+        parent_step = _workbuddy_model_step_sequence(parent) if parent is not None else None
+        parent_is_reasoning = parent is not None and parent.get("type") == "reasoning"
+        parent_is_completed_assistant = (
+            parent is not None
+            and parent.get("type") == "message"
+            and parent.get("role") == "assistant"
+            and parent.get("status") == "completed"
+        )
+        same_step_parent_is_valid = (
+            (parent_is_reasoning or parent_is_completed_assistant)
+            and parent_identity == identity
+            and parent_step == call_step
+        )
+        result_parent_context = (
+            _workbuddy_completed_result_parent_context(
+                records_by_id,
+                result_by_call_id,
+                parent,
+                session_id=session_id,
+                cwd=cwd,
+                request_id=request_id,
+            )
+            if parent is not None and parent.get("type") == "function_call_result"
+            else None
+        )
+        result_parent_is_valid = (
+            identity is not None
+            and result_parent_context is not None
+            and result_parent_context[0][1] == identity[1]
+            and result_parent_context[0][0] != identity[0]
+            and call_step is not None
+            and call_step > result_parent_context[1]
+        )
+        if (
+            not _workbuddy_record_has_explicit_scope(call, session_id, cwd)
+            or identity is None
+            or identity[1] != model
+            or not isinstance(call_id, str)
+            or not isinstance(tool_name, str)
+            or not tool_name
+            or call_step is None
+            or not (same_step_parent_is_valid or result_parent_is_valid)
+            or not _workbuddy_parent_chain_is_complete(
+                records_by_id,
+                call,
+                session_id,
+                str(cwd),
+                request_id,
+            )
+            or not _workbuddy_record_has_ancestor(records_by_id, call, user_id)
+        ):
+            return None
+        result = result_by_call_id.get(call_id)
+        if (
+            result is None
+            or result.get("parentId") != call.get("id")
+            or not _workbuddy_record_has_explicit_scope(result, session_id, cwd)
+            or not isinstance(result.get("providerData"), dict)
+            or result["providerData"].get("conversationRequestId") != request_id
+        ):
+            return None
+        completed_result_call_ids.add(call_id)
+        if tool_name not in observed_names:
+            observed_names.add(tool_name)
+            observed.append(
+                {
+                    "name": tool_name,
+                    "source": "function_call",
+                    "scope": "current-request",
+                }
+            )
+    for result in records:
+        if result.get("type") != "function_call_result":
+            continue
+        provider = result.get("providerData")
+        if (
+            _workbuddy_record_has_explicit_scope(result, session_id, cwd)
+            and isinstance(provider, dict)
+            and provider.get("conversationRequestId") == request_id
+            and result.get("callId") not in completed_result_call_ids
+        ):
+            return None
+    return observed
 
 
 def _native_session_facts(
-    raw: bytes, expected_prompt: str, raw_path: Path, project_root: Path
-) -> tuple[str, str, str, str, str, dict[str, object], set[str]] | None:
+    raw: bytes,
+    expected_prompt: str,
+    raw_path: Path,
+    project_root: Path,
+    template: dict[str, object],
+    policy_binding: dict[str, object] | None = None,
+) -> (
+    tuple[
+        str,
+        str,
+        str,
+        str,
+        str,
+        dict[str, object],
+        set[str],
+        dict[str, object] | None,
+    ]
+    | None
+):
     """Parse the supported Codex JSONL serializer without recursive key searches.
 
     Evaluation accepts only a raw file from the native Codex session store.  A
@@ -2615,9 +3949,10 @@ def _native_session_facts(
         return None
     session_id, source, host_version = metadata
     matching_turns: set[str] = set()
+    matching_user_indexes: list[int] = []
     contexts: dict[str, dict[str, object]] = {}
     tool_records: dict[str, list[tuple[str, str]]] = {}
-    for record in records:
+    for record_index, record in enumerate(records):
         record_type = record.get("type")
         payload = record.get("payload")
         if not isinstance(payload, dict):
@@ -2631,6 +3966,7 @@ def _native_session_facts(
             content = payload.get("content")
             if turn_id and _user_content_matches(content, expected_prompt):
                 matching_turns.add(turn_id)
+                matching_user_indexes.append(record_index)
         elif record_type == "turn_context":
             turn_id = payload.get("turn_id")
             if isinstance(turn_id, str) and turn_id:
@@ -2650,9 +3986,18 @@ def _native_session_facts(
                 and isinstance(payload.get("status"), str)
             ):
                 tool_records.setdefault(turn_id, []).append((name, call_id))
-    if len(matching_turns) != 1:
+    if len(matching_turns) != 1 or len(matching_user_indexes) != 1:
         return None
     turn_id = next(iter(matching_turns))
+    preparation_verified, preparation_guidance = _codex_native_preparation_is_verified(
+        records,
+        turn_id,
+        matching_user_indexes[0],
+        template,
+        policy_binding,
+    )
+    if not preparation_verified:
+        return None
     context = contexts.get(turn_id)
     if (
         context is None
@@ -2689,7 +4034,92 @@ def _native_session_facts(
         host_version,
         policy,
         {call_id for _name, call_id in matching_tools},
+        preparation_guidance,
     )
+
+
+def _codex_native_preparation_is_verified(
+    records: list[dict[str, object]],
+    turn_id: str,
+    user_record_index: int,
+    template: dict[str, object],
+    policy_binding: dict[str, object] | None,
+) -> tuple[bool, dict[str, object] | None]:
+    """Bind the schema-specific developer fragment at its observed vector index."""
+
+    schema_version = template.get("schema_version")
+    if schema_version not in {
+        CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION,
+        CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION,
+        CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION,
+    }:
+        return False, None
+    expected_instructions: str | None = None
+    expected_guidance: dict[str, object] | None = None
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
+        expected_instructions = CODEX_FIXED_PREPARATION_INSTRUCTIONS
+        expected_guidance = _fixed_codex_preparation_guidance()
+    elif schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        try:
+            routing = policy_binding.get("routing") if isinstance(policy_binding, dict) else None
+            expected_guidance = _bound_codex_explicit_routing_preparation_guidance(
+                template, routing
+            )
+            command = routing.get("command") if isinstance(routing, dict) else None
+            if not isinstance(command, str):
+                return False, None
+            expected_instructions = _render_codex_explicit_routing_instructions(command)
+        except SelcError:
+            return False, None
+    generic_fragments = 0
+    for record_index, record in enumerate(records):
+        if record.get("type") != "response_item":
+            continue
+        payload = record.get("payload")
+        if (
+            not isinstance(payload, dict)
+            or payload.get("type") != "message"
+            or payload.get("role") != "developer"
+        ):
+            continue
+        metadata = payload.get("internal_chat_message_metadata_passthrough")
+        if not isinstance(metadata, dict):
+            continue
+        kinds = metadata.get("content_item_kinds")
+        if not isinstance(kinds, list) or not all(isinstance(kind, str) for kind in kinds):
+            return False, None
+        generic_indexes = [
+            index
+            for index, kind in enumerate(kinds)
+            if kind == CODEX_PREPARATION_GUIDANCE_CONTENT_KIND
+        ]
+        if not generic_indexes:
+            continue
+        if schema_version == CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION:
+            return False, None
+        if (
+            metadata.get("turn_id") != turn_id
+            or record_index >= user_record_index
+            or not set(kinds).issubset(CODEX_KNOWN_DEVELOPER_CONTENT_KINDS)
+        ):
+            return False, None
+        content = payload.get("content")
+        if not isinstance(content, list) or len(content) != len(kinds):
+            return False, None
+        for generic_index in generic_indexes:
+            item = content[generic_index]
+            if (
+                not isinstance(item, dict)
+                or item.get("type") != "input_text"
+                or item.get("text") != expected_instructions
+            ):
+                return False, None
+            generic_fragments += 1
+    if schema_version == CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION:
+        return True, None
+    if generic_fragments != 1 or expected_guidance is None:
+        return False, None
+    return True, expected_guidance
 
 
 def _match_codex_native_policy(
@@ -3924,8 +5354,19 @@ def _fixed_codex_cli_command(
             "the Codex CLI policy template is not bound to this attempt",
             "prepare a new evaluation attempt",
         )
+    schema_version = template.get("schema_version")
+    if schema_version not in {
+        CODEX_LEGACY_POLICY_TEMPLATE_SCHEMA_VERSION,
+        CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION,
+        CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION,
+    }:
+        raise SelcError(
+            "ATTEMPT_TAMPERED",
+            "the Codex CLI template schema is invalid",
+            "prepare a new evaluation plan",
+        )
     profile = template.get("cli")
-    if profile != _fixed_codex_cli_profile():
+    if profile != _fixed_codex_cli_profile(schema_version):
         raise SelcError(
             "ATTEMPT_TAMPERED",
             "the Codex CLI profile differs from the frozen policy template",
@@ -3933,10 +5374,42 @@ def _fixed_codex_cli_command(
         )
     mapping = policy_binding.get("mapping")
     configuration = policy_binding.get("cli_configuration")
+    expected_configuration = {
+        "template_hash": matrix.get("tools_policy_template_hash"),
+        "mapping": mapping,
+        "cli": profile,
+        "hook_trust": template.get("hook_trust"),
+    }
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
+        expected_configuration["preparation_guidance"] = template.get("preparation_guidance")
+    elif schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        expected_binding = _prepare_policy_binding(
+            matrix,
+            Path(project_root),
+            case=state.get("case") if isinstance(state.get("case"), dict) else None,
+            suite_id=str(state.get("installation", {}).get("suite_id", ""))
+            if isinstance(state.get("installation"), dict)
+            else None,
+            expected_installation=state.get("installation")
+            if isinstance(state.get("installation"), dict)
+            else None,
+        )
+        if policy_binding != expected_binding:
+            raise SelcError(
+                "ATTEMPT_TAMPERED",
+                "the schema 3 routing binding changed before launch",
+                "prepare a new evaluation attempt",
+            )
+        routing = policy_binding.get("routing")
+        expected_configuration["routing"] = routing
+        expected_configuration["preparation_guidance"] = (
+            _bound_codex_explicit_routing_preparation_guidance(template, routing)
+        )
     if (
         not isinstance(mapping, dict)
         or mapping.get("attempt_project") != project_root
         or not isinstance(configuration, dict)
+        or configuration != expected_configuration
         or policy_binding.get("cli_configuration_hash") != json_hash(configuration)
     ):
         raise SelcError(
@@ -3972,9 +5445,25 @@ def _fixed_codex_cli_command(
         f"model_provider={json.dumps(settings['model_provider'])}",
         "-c",
         f"web_search={json.dumps(settings['web_search'])}",
-        "--enable",
-        "hooks",
     ]
+    if schema_version == CODEX_PREPARATION_POLICY_TEMPLATE_SCHEMA_VERSION:
+        command.extend(
+            (
+                "-c",
+                f"developer_instructions={json.dumps(settings['developer_instructions'])}",
+            )
+        )
+    elif schema_version == CODEX_EXPLICIT_ROUTING_POLICY_TEMPLATE_SCHEMA_VERSION:
+        routing = policy_binding.get("routing")
+        if not isinstance(routing, dict):
+            raise SelcError(
+                "ATTEMPT_TAMPERED",
+                "the schema 3 routing binding is unavailable",
+                "prepare a new evaluation attempt",
+            )
+        instructions = _render_codex_explicit_routing_instructions(str(routing.get("command", "")))
+        command.extend(("-c", f"developer_instructions={json.dumps(instructions)}"))
+    command.extend(("--enable", "hooks"))
     disabled_features = profile.get("disable_features")
     if disabled_features != list(CODEX_DISABLED_FEATURES):
         raise SelcError(
